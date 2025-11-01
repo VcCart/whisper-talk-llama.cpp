@@ -95,31 +95,27 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
 if (EMSCRIPTEN)
     add_subdirectory(whisper.wasm)
-    add_subdirectory(stream.wasm)
+
     add_subdirectory(command.wasm)
-    add_subdirectory(bench.wasm)
-    add_subdirectory(wchess)
+
+							
 elseif(CMAKE_JS_VERSION)
     add_subdirectory(addon.node)
 else()
-    add_subdirectory(cli)
-    add_subdirectory(bench)
-    add_subdirectory(server)
     add_subdirectory(quantize)
-    add_subdirectory(vad-speech-segments)
+						   
+							
+							  
+										 
     if (WHISPER_SDL2)
-        add_subdirectory(stream)
-        add_subdirectory(command)
+
+								 
         add_subdirectory(talk-llama)
-        add_subdirectory(lsp)
+
         if (GGML_SYCL)
             add_subdirectory(sycl)
         endif()
     endif (WHISPER_SDL2)
 
-    add_subdirectory(deprecation-warning)
-endif()
 
-if (WHISPER_SDL2)
-    add_subdirectory(wchess)
-endif (WHISPER_SDL2)
+endif()
