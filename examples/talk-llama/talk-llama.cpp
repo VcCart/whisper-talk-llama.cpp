@@ -877,36 +877,52 @@ std::string ParseCommandAndGetKeyword(std::string textHeardTrimmed, const std::s
     // Удаляем лишние пробелы в начале и конце строки
 	trim(sanitizedInput);
 	
-    // Если команда - "google", ищем соответствующие префиксы
+// ✅ ПАТЧ: безопасный поиск позиции аргумента команды
+    // Если команда - "google", ищем соответствующие префиксы (безопасно)
     if (command == "google") {
         static const std::unordered_set<std::string> prefixNeedles = {
            "Погугли", "погугли", "гугли", "гугл", "угли", "углe", "По гугле", "По угли"
         };
 
-        // Ищем начальные команды в строке
+        // Ищем начальные команды в строке — безопасно, без выхода за границы
         for (const auto& prefix : prefixNeedles) {
-            if (sanitizedInput.compare(0, prefix.length(), prefix) == 0) {
-                pos = prefix.length() + 1;
-				startsWithPrefix = true;
-				break;
-			}
-		}	
-	}	
-	
-    // Если команда не начинается с префикса, ищем точную команду
-    if (!startsWithPrefix || pos == std::string::npos) {
-        pos = sanitizedInput.find(command);
-        if (pos != std::string::npos) {
-            pos = pos + command.size() + 1;
-        } else {
-			pos = sanitizedInput.find("Call");
-            if (pos != std::string::npos) {
-                pos = pos + command.size() + 1;
-            } else {
-                pos = 0; // Команда не найдена
+            if (sanitizedInput.size() >= prefix.size() &&
+                sanitizedInput.compare(0, prefix.length(), prefix) == 0) {
+                // установим базовую позицию сразу за префиксом
+                size_t base = prefix.length();
+                // продвигаемся через любые пробелы или двоеточие, чтобы найти начало ключевого слова
+                while (base < sanitizedInput.size() && (std::isspace((unsigned char)sanitizedInput[base]) || sanitizedInput[base] == ':' ))
+                    ++base;
+                pos = base;
+                startsWithPrefix = true;
+                break;
             }
-		}
+        }
     }
+
+    // Если команда не начинается с префикса — ищем расположение самого ключевого слова команды
+    if (!startsWithPrefix) {
+        size_t found = sanitizedInput.find(command);
+        if (found != std::string::npos) {
+            size_t base = found + command.size();
+            // пропускаем разделители
+            while (base < sanitizedInput.size() && (std::isspace((unsigned char)sanitizedInput[base]) || sanitizedInput[base] == ':' ))
+                ++base;
+            pos = base;
+        } else {
+            // резервный поиск с учётом написания с большой буквы (Call)
+            size_t foundCall = sanitizedInput.find("Call");
+            if (foundCall != std::string::npos) {
+                size_t base = foundCall + 4; // length of "Call"
+                while (base < sanitizedInput.size() && (std::isspace((unsigned char)sanitizedInput[base]) || sanitizedInput[base] == ':' ))
+                    ++base;
+                pos = base;
+            } else {
+                pos = 0; // команда не найдена — вернём базовую 0 (означает "всё после начала")
+            }
+        }
+    }
+
 	
 // Если команда - "call", обрабатываем вызов бота
 if (command == "call")
@@ -2685,7 +2701,38 @@ if (llama_decode(ctx_llama, batch)) {
 				if (text_heard[0] == '!') text_heard.erase(0, 1);
 				if (text_heard[0] == '[') text_heard.erase(0, 1);
 				trim(text_heard);
-				if (text_heard == "!" || text_heard == "." || text_heard == "Sil" || text_heard == "Bye" || text_heard == "Okay" || text_heard == "Okay." || text_heard == "Thank you." || text_heard == "Thank you" || text_heard == "Thanks." || text_heard == "Bye." || text_heard == "Thank you for listening." || text_heard == "К" || text_heard == "Спасибо" || text_heard == "Пока" || text_heard == params.bot_name || text_heard == "*Звук!*" || text_heard == "Р" || text_heard.find("Редактор субтитров")!= std::string::npos || text_heard.find("можешь это сделать")!= std::string::npos || text_heard.find("Как дела?")!= std::string::npos || text_heard.find("Это")!= std::string::npos || text_heard.find("Добро пожаловать")!= std::string::npos || text_heard.find("Спасибо за внимание")!= std::string::npos || text_heard.find("Будьте здоровы")!= std::string::npos || text_heard.find("Продолжение следует")!= std::string::npos || text_heard.find("End of")!= std::string::npos || text_heard.find("The End")!= std::string::npos || text_heard.find("THE END")!= std::string::npos || text_heard.find("The film was made")!= std::string::npos || text_heard.find("Translated by")!= std::string::npos || text_heard.find("Thanks for watching")!= std::string::npos || text_heard.find("The second part of the video")!= std::string::npos || text_heard.find("Thank you for watching")!= std::string::npos || text_heard.find("*click*")!= std::string::npos || text_heard.find("Субтитры")!= std::string::npos || text_heard.find("До свидания")!= std::string::npos || text_heard.find("До новых встреч")!= std::string::npos || text_heard.find("ПЕСНЯ")!= std::string::npos || text_heard.find("Silence")!= std::string::npos || text_heard.find("Поехали")!= std::string::npos || text_heard == "You're" || text_heard == "you're" || text_heard == "You're not" || text_heard == "See?" || text_heard == "you" || text_heard == "You" || text_heard == "Yeah" || text_heard == "Well" || text_heard == "Hey" || text_heard == "Oh" || text_heard == "Right" || text_heard == "Real" || text_heard == "Huh" || text_heard == "I" || text_heard == "I'm" || text_heard.find("*звук!")!= std::string::npos || text_heard == "В" || text_heard == "а" || text_heard == "*") text_heard = "";
+				// 🔧 ПАТЧ: смягчённая фильтрация распознанного текста
+                // Удаляем очевидный шум / стандартные завершающие фразы, НО НЕ удаляем одиночные символы и '*'.
+                // Это даёт модели шанс среагировать на короткие фразы и односложные слова.
+                if (
+                    text_heard == "!" || text_heard == "." ||
+                    text_heard == "Sil" || text_heard == "Bye" || text_heard == "Okay" || text_heard == "Okay." ||
+                    text_heard == "Thank you." || text_heard == "Thank you" || text_heard == "Thanks." || text_heard == "Bye." ||
+                    text_heard == "Thank you for listening." || text_heard == "Спасибо" || text_heard == "Пока" ||
+                    text_heard == params.bot_name || text_heard == "*Звук!*" ||
+                    text_heard.find("Редактор субтитров") != std::string::npos ||
+                    text_heard.find("Спасибо за внимание") != std::string::npos ||
+                    text_heard.find("Продолжение следует") != std::string::npos ||
+                    text_heard.find("End of") != std::string::npos ||
+                    text_heard.find("The End") != std::string::npos ||
+                    text_heard.find("Translated by") != std::string::npos ||
+                    text_heard.find("Thanks for watching") != std::string::npos ||
+                    text_heard.find("Thank you for watching") != std::string::npos ||
+                    text_heard.find("*click*") != std::string::npos ||
+                    text_heard.find("Субтитры") != std::string::npos ||
+                    text_heard.find("До свидания") != std::string::npos ||
+                    text_heard.find("До новых встреч") != std::string::npos ||
+                    text_heard.find("ПЕСНЯ") != std::string::npos ||
+                    text_heard.find("Silence") != std::string::npos
+                ) {
+                    // оставляем это как «шум» и очищаем
+                    text_heard = "";
+                } else {
+                    // Не удаляем короткие или односимвольные распознавания: даём модели шанс ответить.
+                    // Небольшие дополнения: нормализуем пробельные символы, удаляем только длинный «мусор»
+                    // (остальные случаи позволим дальше обрабатываться)
+                }
+
 				text_heard = std::regex_replace(text_heard, std::regex("\\s+$"), ""); // trailing whitespace
 				//printf("Number of tokens in embd: %zu\n", embd.size());
 				//printf("n_past_prev: %d\n", n_past_prev);
@@ -3034,17 +3081,32 @@ audio.clear(); // Очищаем аудио-буфер
     continue;
 }
 
-// ОСТАНОВКА
-else if (user_command == "stop") 
+    // ОСТАНОВКА
+    // Обработчик user_command == "stop" — теперь инициируем прерывание генерации
+    if (user_command == "stop")
     {
-        printf(" [Stopped!]\n");					
+        // Логируем
+        fprintf(stdout, "[user] requested STOP\n");
+
+        // 1) Очищаем локальные буферы/аудио
         text_heard = "";
         text_heard_trimmed = "";
         audio.clear();
-        allow_xtts_file(params.xtts_control_path, 0);
-                        user_typed = "";
+        user_typed = "";
         user_typed_this = false;
-    continue;
+
+        // 2) Запрещаем воспроизведение XTTS (результат: любые TTS-процессы должны прекратиться)
+        allow_xtts_file(params.xtts_control_path, 0);
+
+        // 3) Инициируем программный эквивалент нажатия горячей клавиши Ctrl+Space — 
+        //    главная генерация читает g_hotkey_pressed под мьютексом и корректно прерывается.
+        {
+            std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
+            g_hotkey_pressed = "Ctrl+Space";
+        }
+
+        // Продолжаем цикл — генерация должна обнаружить флаг и прекратиться быстро
+        continue;
     }
 
 
@@ -3457,12 +3519,27 @@ if (!llama_start_generation_time) llama_start_generation_time = get_current_time
         // Добавляем токен в контекст для следующей итерации
         embd.push_back(id);
 
-        // Преобразуем токен в строку
+        // 🔧 ПАТЧ: если модель выводит только одиночную "*", заменяем на fallback-текст
         out_token_str = llama_token_to_piece(ctx_llama, id);
-        text_to_speak += out_token_str;  // Добавляем к тексту для озвучки
 
-        printf("%s", out_token_str.c_str());  // Выводим токен в консоль
-        tokens_in_reply++;  // Увеличиваем счётчик токенов в ответе
+        // Если это первый/второй токен ответа и он равен "*" или состоит только из нежелательных одиночных символов,
+        // заменим его на быстрый дружелюбный fallback, чтобы в консоли и TTS не распечаталась одна звёздочка.
+        if ((tokens_in_reply <= 1) &&
+            (out_token_str == "*" || out_token_str == "\u2605")) // второй проверкой можно добавить другие вариации
+        {
+            std::string fallback = (params.language == "ru") ? "Извините, не понимаю. Повторите, пожалуйста." : "Sorry, I didn't get that. Please repeat.";
+            // подменяем out_token_str и добавляем в буфер для озвучки
+            out_token_str = fallback;
+            text_to_speak += out_token_str;
+            // печатаем fallback безопасно
+            printf("%s", out_token_str.c_str());
+            tokens_in_reply++;
+        } else {
+            text_to_speak += out_token_str;  // Добавляем к тексту для озвучки
+            printf("%s", out_token_str.c_str());  // Выводим токен в консоль
+            tokens_in_reply++;  // Увеличиваем счётчик токенов в ответе
+        }
+
 
         // Проверка на зацикливание последовательности
         if (params.seqrep)  // Если включена проверка на повторения
