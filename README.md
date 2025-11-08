@@ -1,6 +1,6 @@
 # talk-llama.cpp fork whisper.cpp
 
-## Added / Добавлено:
+## Добавлено:
     XTTSv2 support — добавлена поддержка XTTSv2  
     UTF8 and Russian — UTF8 и русский язык  
     Доработано: потоковая генерация, потоковый XTTS, агрессивный VAD  
@@ -8,36 +8,36 @@
     Прерывание генерации/синтеза речи при разговоре пользователя
     Add SDL2 / добавлена библиотека SDL2
 
-## Used / Используется: 
+## Дополнительно может использоваться: 
 - XTTSv2 server in streaming-mode
 - langchain google-serper
 
-## News / Новости
-- [2025.11.01] Собственные доработки, которых очень много, и описывать их пока лень.
+## Новости
+- [2025.11.01] Собственные доработки, которых очень много.
 - [2025.10.31] Все изменеия из https://github.com/Mozer/talk-llama-fast/
 - [2025.10.31] initial commit
 
-## Notes / Заметки
-   -  В talk-llama.cpp работает был добавлен сдвиг контекста под whisper.cpp > 1.8.0. Диалог может вестись почти бесконечно — модель остаётся адекватной, серьёзных зацикливаний или проблем не наблюдается. 
+## Заметки
+   -  В talk-llama.cpp был изменен сдвиг контекста под whisper.cpp > 1.8.0., и изменена работа с кэшем. Диалог может вестись почти бесконечно — модель остаётся адекватной, серьёзных зацикливаний или повсеместных проблем не наблюдается. 
    -  Llama запоминает начальный промпт и последние N токенов контекста, но всё, что находится между ними, теряется. 
    -  Дополнительная видеопамять (VRAM) не расходуется — вы можете вести практически бесконечный диалог без потери скорости.  
    -  talk-llama.cpp тестировался на llm модели saiga_yandexgpt_8b_Q4_K_S.gguf и Whisper модели whisper-ggml-large-v3-q4.bin
-   -  В качестве тестовой видеокарты использовалась: gtx 1070ti всего 8 ГБ. Лёгкую квантованную версию llama вполне нормально загружает. Процессор Xeon 2698v3; 
+   -  В качестве тестовой видеокарты использовалсась карта всего 8 ГБ на архитектуре Pascal. Лёгкую квантованную версию llama вполне нормально загружает. Процессор желателен с AVX2 инструкциями; 
    -  XTTS можно запустить с флагом --lowvram или даже на CPU вместо GPU (-d=cpu, но это будет медленно). 
    -  Для использования с колонками (а не наушниками): Вы можете попробовать отключить прерывание речи бота из-за шума, установив --vad_start_thold 0.  
    -  Опционально: есть команда «пробуждения» — --wake-command "Эмма," (запятая после имени обязательна). Теперь только фразы, начинающиеся с имени «Эмма», будут отправляться в чат от вашего имени. Это частично поможет при работе с колонками или в шумном помещении.
 
-## Languages / Языки
-Программа Мультиязычная, зависит от подгуженных моделей.
+## Языки
+Программа Мультиязычная, зависит от подгуженных моделей Whisper и LLM.
 
-## Requirements / Примерные системные требования
+## Примерные системные требования
 - Windows 10/11 x64
 - python, cuda
-- Recomended 16 GB RAM
+- Recomended 12-16 GB RAM
 - Recommended: nvidia GPU with 8 GB vram. Minimum: nvidia with 6 GB. 
-- Для AMD, macos, linux - нужно компилировать. Не собиралось и неизвестно сработает ли.  
+- Для AMD, macos, linux - Не собиралось, не тестировалось и неизвестно заработает ли.  
 
-## Installation
+## Установка
 ### For Windows 10/11 x64 with CUDA.
 - CUDA для разработки на Nvidia:
 https://developer.nvidia.com/cudnn-archive
@@ -49,7 +49,12 @@ https://developer.nvidia.com/cuda-toolkit-archive
 Теперь установим xtts-api-server и TTS (ССылки я поправлю позже). Примечание: XTTS с DeepSpeed требует PyTorch 2.1, но некоторые пакеты в требуют PyTorch 2.2. 
 Все компоненты тестировались на Python 3.11 в окружении Miniforge3 с разными версиями PyTorch. Установка состоит в основном из: XTTS и Git.
 
-Установите [miniconda](https://github.com/conda-forge/miniforge). Во время установки обязательно отметьте галочкой пункт «Add Miniconda to my PATH environment variable» («Добавить Miniconda3 в переменную среды PATH») — это важно.
+
+Для установки и запуска Xtts-Api-Server нужно Python окружение.
+Подойдет Python 3.10 - 3.12 в зависимости от версии xtts2 
+
+Установите [miniforge](https://github.com/conda-forge/miniforge). Во время установки обязательно отметьте галочкой пункт («Добавить Miniconda3/Miniforge3 в переменную среды PATH») — это важно.
+
 
 Откройте папку \xtts, куда вы распаковали архив whisper-talk-llama-1.82.zip. В этой папке откройте командную строку (cmd) и выполняйте команды построчно:
 ```
@@ -58,18 +63,18 @@ conda activate xtts
 conda install python=3.11
 conda install git
 
-pip install git+https://github.com/VcCart/xtts-api-server
-pip install torch==2.1.1+cu118 torchaudio==2.1.1+cu118 --index-url https://download.pytorch.org/whl/cu118
-Или
-pip install torch==2.1.1+cu121 torchaudio==2.1.1+cu121 --index-url https://download.pytorch.org/whl/cu121
+pip install torch==2.2.1+cu121 torchaudio==2.2.1+cu121 --index-url https://download.pytorch.org/whl/cu121
+pip install git+https://github.com/Mozer/xtts-api-server pydub
+pip install git+https://github.com/Mozer/tts
+pip install https://github.com/S95Sedan/Deepspeed-Windows/releases/download/v14.0%2Bpy311/deepspeed-0.14.0+ce78a63-cp311-cp311-win_amd64.whl
 conda deactivate
 ```
-- Если при установке xtts-api-server возникают ошибки, сверьтесь с инструкциями (не моей версией XTTS — в них устанавливается оригинальный XTTS, а не модифицированный): [xtts-api-server](https://github.com/daswer123/xtts-api-server?tab=readme-ov-file#installation)
+- Если при установке xtts-api-server возникают ошибки, сверьтесь с инструкциями (в них устанавливается оригинальный XTTS, а не модифицированный): [xtts-api-server](https://github.com/daswer123/xtts-api-server?tab=readme-ov-file#installation)
 При первой установке xtts-api-server система может запросить установку [visual-cpp-build-tools](https://visualstudio.microsoft.com/ru/visual-cpp-build-tools/). Стандартная Страница загрузки от Microsoft может измениться, поэтому можно поискать установщик через поисковик в интернете.
 Воозможно, потребуется установить [VisualCppRedist](https://github.com/abbodi1406/vcredist).
 - Download [ffmpeg full](https://www.gyan.dev/ffmpeg/builds/), put into your PATH environment (how to: https://phoenixnap.com/kb/ffmpeg-windows). Then download h264 codec .dll of required version from https://github.com/cisco/openh264/releases and put to /system32 or /ffmpeg/bin dir. In my case for Windows 11 it was openh264-1.8.0-win64.dll. 
 
-## Running / Запуск
+## Запуск
 - В папке /xtts/ дважды щёлкните по файлу xtts_start.bat, чтобы запустить сервер XTTS.
 ПРИМЕЧАНИЕ: При первом запуске XTTS скачает DeepSpeed с GitHub. Если загрузка DeepSpeed завершится ошибкой вида «Warning: Retrying (Retry... ReadTimeoutError...)», включите VPN для загрузки DeepSpeed (27 МБ) и чекпоинта XTTS (1,8 ГБ), после чего можно отключить VPN. Чекпоинт XTTS можно скачать и без VPN. Однако если вы прервёте загрузку, чекпоинт будет повреждён — в этом случае вам нужно вручную удалить папку \xtts_models\ и перезапустить XTTS.
 **ПРИМЕЧАНИЕ:** если в имени `.bat`-файла есть кириллические (русские) символы, сохраните его в кодировке **OEM 866** (Notepad++ поддерживает эту кодировку).
@@ -204,13 +209,6 @@ cmake.exe -DWHISPER_NO_AVX2=1 -DWHISPER_SDL2=ON -DWHISPER_CUBLAS=0 -DGGML_CUDA=1
 - Reset (удали все, Ctrl+R) - will delete all context except for a initial prompt
 - Google something (погугли что-то)
 - Сall NAME (позови Алису)
-
-## Known bugs / Баги
-- if you have missing cuda .dll errors - see this [issue](https://github.com/Mozer/talk-llama-fast/issues/5)
-- if whisper doesn't hear your voice - see this [issue](https://github.com/Mozer/talk-llama-fast/issues/5)
-- Rope-контекст не реализован. Используется сдвиг контекста (включён по умолчанию).  
-- Иногда Whisper «галлюцинирует» — такие галлюцинации нужно добавлять в список стоп-слов. Проверьте поле `misheard text` в `talk-llama.cpp`
-- Sometimes when you type fast the first letter of you message is not printed / Иногда при быстром наборе текста первая буква вашего сообщения не отображается.
 
 ## Licenses / Лицензии
 - talk-llama-fast - MIT License - OK for commercial use
