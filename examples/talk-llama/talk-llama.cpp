@@ -176,7 +176,7 @@ struct whisper_params {
     std::string heard_ok    = "";
     std::string language    = "ru";
     std::string model_wsp   = "whisper-ggml-medium-q4_0.bin";
-    std::string model_llama = "saiga_yandexgpt_8b_Q4_K_M.gguf";
+    std::string model_llama = "saiga_yandexgpt_8b_Q4_K_S.gguf";
     std::string speak       = "speak";
 	std::string speak_file  = "to_speak.txt"; // not used
     std::string xtts_control_path = "xtts_play_allowed.txt";
