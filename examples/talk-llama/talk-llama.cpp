@@ -3081,23 +3081,44 @@ audio.clear(); // Очищаем аудио-буфер
     continue;
 }
 
-    // ОСТАНОВКА
-// Обработчик команды "stop" — теперь с защитой от ложных срабатываний
+// ----------------------------
+// ОСТАНОВКА
+// Обработчик команды "stop" — с интеллектуальной фильтрацией ложных срабатываний
+// ----------------------------
 if (user_command == "stop")
 {
-    // --- Фильтрация ложных STOP-команд ---
-    // Проверяем, действительно ли речевой ввод содержал чёткое слово "стоп" или "stop"
+    // Преобразуем фразу в нижний регистр для сопоставления
     std::string lower_text = LowerCase(text_heard_trimmed);
-    bool confirmed_stop =
-        (lower_text == "стоп" || lower_text == "stop" ||
-         lower_text.find("остановись") != std::string::npos ||
-         lower_text.find("останови") != std::string::npos ||
-         lower_text.find("хватит") != std::string::npos ||
-         lower_text.find("прекрати") != std::string::npos);
 
-    // Если это ложное срабатывание — просто игнорируем и продолжаем
+    // Подсчёт количества слов
+    int word_count = std::count_if(lower_text.begin(), lower_text.end(),
+                                   [](unsigned char c){ return c == ' '; }) + 1;
+
+    // Определяем, является ли это короткой фразой с командой остановки
+    bool is_strict_stop = (
+        lower_text == "стоп" ||
+        lower_text == "stop" ||
+        lower_text == "остановись" ||
+        lower_text == "останови" ||
+        lower_text == "хватит" ||
+        lower_text == "прекрати"
+    );
+
+    // Если это длинная фраза, где встречается "остановись" или "хватит" — это не команда
+    bool is_in_sentence = (
+        !is_strict_stop && (
+            lower_text.find("остановись") != std::string::npos ||
+            lower_text.find("останови") != std::string::npos ||
+            lower_text.find("хватит") != std::string::npos ||
+            lower_text.find("прекрати") != std::string::npos
+        )
+    );
+
+    // Решение: команда "STOP" считается подтверждённой только если фраза короткая и точная
+    bool confirmed_stop = (is_strict_stop && word_count <= 3 && !is_in_sentence);
+
     if (!confirmed_stop) {
-        //printf("[skip false STOP trigger: '%s']\n", lower_text.c_str());
+        // Ложное срабатывание: не останавливаем генерацию
         user_command.clear();
         continue;
     }
@@ -3105,25 +3126,26 @@ if (user_command == "stop")
     // --- Реальный STOP-запрос ---
     fprintf(stdout, "[user] requested STOP\n");
 
-    // 1) Безопасно очищаем аудио и состояние
+    // 1) Безопасно очищаем буферы и ввод
     text_heard.clear();
     text_heard_trimmed.clear();
     audio.clear();
     user_typed.clear();
     user_typed_this = false;
 
-    // 2) Останавливаем XTTS, чтобы прекратить озвучивание
+    // 2) Прерываем озвучку XTTS
     allow_xtts_file(params.xtts_control_path, 0);
 
-    // 3) Устанавливаем флаг остановки генерации
+    // 3) Устанавливаем флаг остановки генерации (аналог Ctrl+Space)
     {
         std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
         g_hotkey_pressed = "Ctrl+Space";
     }
 
-    // Продолжаем цикл — генерация должна корректно завершиться
+    // Продолжаем цикл — модель корректно завершит текущую генерацию
     continue;
 }
+
 
 
 
