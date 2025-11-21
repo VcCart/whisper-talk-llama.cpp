@@ -3082,32 +3082,49 @@ audio.clear(); // Очищаем аудио-буфер
 }
 
     // ОСТАНОВКА
-    // Обработчик user_command == "stop" — теперь инициируем прерывание генерации
-    if (user_command == "stop")
-    {
-        // Логируем
-        fprintf(stdout, "[user] requested STOP\n");
+// Обработчик команды "stop" — теперь с защитой от ложных срабатываний
+if (user_command == "stop")
+{
+    // --- Фильтрация ложных STOP-команд ---
+    // Проверяем, действительно ли речевой ввод содержал чёткое слово "стоп" или "stop"
+    std::string lower_text = LowerCase(text_heard_trimmed);
+    bool confirmed_stop =
+        (lower_text == "стоп" || lower_text == "stop" ||
+         lower_text.find("остановись") != std::string::npos ||
+         lower_text.find("останови") != std::string::npos ||
+         lower_text.find("хватит") != std::string::npos ||
+         lower_text.find("прекрати") != std::string::npos);
 
-        // 1) Очищаем локальные буферы/аудио
-        text_heard = "";
-        text_heard_trimmed = "";
-        audio.clear();
-        user_typed = "";
-        user_typed_this = false;
-
-        // 2) Запрещаем воспроизведение XTTS (результат: любые TTS-процессы должны прекратиться)
-        allow_xtts_file(params.xtts_control_path, 0);
-
-        // 3) Инициируем программный эквивалент нажатия горячей клавиши Ctrl+Space — 
-        //    главная генерация читает g_hotkey_pressed под мьютексом и корректно прерывается.
-        {
-            std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
-            g_hotkey_pressed = "Ctrl+Space";
-        }
-
-        // Продолжаем цикл — генерация должна обнаружить флаг и прекратиться быстро
+    // Если это ложное срабатывание — просто игнорируем и продолжаем
+    if (!confirmed_stop) {
+        //printf("[skip false STOP trigger: '%s']\n", lower_text.c_str());
+        user_command.clear();
         continue;
     }
+
+    // --- Реальный STOP-запрос ---
+    fprintf(stdout, "[user] requested STOP\n");
+
+    // 1) Безопасно очищаем аудио и состояние
+    text_heard.clear();
+    text_heard_trimmed.clear();
+    audio.clear();
+    user_typed.clear();
+    user_typed_this = false;
+
+    // 2) Останавливаем XTTS, чтобы прекратить озвучивание
+    allow_xtts_file(params.xtts_control_path, 0);
+
+    // 3) Устанавливаем флаг остановки генерации
+    {
+        std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
+        g_hotkey_pressed = "Ctrl+Space";
+    }
+
+    // Продолжаем цикл — генерация должна корректно завершиться
+    continue;
+}
+
 
 
 // Скажи сколько время
