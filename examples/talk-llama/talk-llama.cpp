@@ -103,37 +103,37 @@ static std::string llama_token_to_piece(const struct llama_context * ctx, llama_
  * @return float* — указатель на динамический массив. 
  * Вызывающий обязан вызвать delete[] для освобождения памяти.
  */
-float* parse_float_list(const std::string& s) {
-    // Временный вектор для накопления значений
-    std::vector<float> temp;
+/**
+ * @brief Парсит строку с числами, разделёнными запятыми, и возвращает вектор float
+ * @param s - входная строка, например "1.2,3.4,5.6"
+ * @return std::vector<float> — вектор с распарсенными значениями
+ */
+std::vector<float> parse_float_list(const std::string& s) {
+    std::vector<float> result;
+    
+    if (s.empty()) {
+        std::cerr << "Error: Empty input string." << std::endl;
+        return result; // возвращаем пустой вектор
+    }
+    
     std::stringstream ss(s);
     std::string item;
-
+    
     try {
         // Разделяем строку по запятым
         while (std::getline(ss, item, ',')) {
             if (!item.empty()) {
                 // Преобразуем подстроку в float
-                temp.push_back(std::stof(item));
+                result.push_back(std::stof(item));
             }
         }
     } catch (const std::exception& e) {
         // Если в строке не float или другая ошибка преобразования
         std::cerr << "Error parsing float list: " << e.what() << '\n';
-        return nullptr;
+        result.clear(); // возвращаем пустой вектор при ошибке
     }
-
-    if (temp.empty()) {
-        std::cerr << "Error: Empty float list." << std::endl;
-        return nullptr;
-    }
-
-    // Выделяем динамический массив под результат
-    float* arr = new float[temp.size()];
-    // Копируем данные из вектора в массив
-    std::copy(temp.begin(), temp.end(), arr);
-
-    return arr; // вызывающий удаляет через delete[]
+    
+    return result; // вектор сам управляет памятью
 }
 
 // command-line parameters
@@ -144,13 +144,6 @@ struct whisper_params {
     int32_t max_tokens = 64;
     int32_t audio_ctx  = 0;
     int32_t n_gpu_layers = 999;
-					 
-					  
-						 
-						
-						
-						
-	
 	float vad_thold  = 0.6f;
     float vad_start_thold  = 0.000270f; // 0 to turn off, you can see your current energy_last (loudness level) when running with --print-energy param
     float vad_last_ms  = 1250;
@@ -191,7 +184,7 @@ struct whisper_params {
     std::string prompt      = "";
 	std::string instruct_preset = "";
 	std::string split_mode = "none";
-    float * tensor_split = nullptr; // чтобы можно было delete[]
+    std::vector<float> tensor_split;
 
 	std::map<std::string, std::string> instruct_preset_data = {
 		{"system_prompt_prefix", ""},
@@ -224,7 +217,8 @@ void whisper_print_usage(int argc, char ** argv, const whisper_params & params);
 
 // Улучшенный код: добавлены блоки try-catch для обработки ошибок, добавлены проверки на выход за пределы argv.
 bool whisper_params_parse(int argc, char **argv, whisper_params &params) {
-    params.tensor_split = nullptr;
+    
+    params.tensor_split.clear();
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         try {
@@ -362,17 +356,10 @@ bool whisper_params_parse(int argc, char **argv, whisper_params &params) {
             } 
 
             else if (arg == "--tensor-split") {
-                // 🔥 БЕЗОПАСНАЯ ОЧИСТКА: проверяем, что указатель валиден
-                if (params.tensor_split != nullptr) {
-                    delete[] params.tensor_split;
-                    params.tensor_split = nullptr;
+                params.tensor_split = parse_float_list(argv[++i]);
+                if (params.tensor_split.empty()) {
+                    throw std::invalid_argument("Failed to parse tensor-split list or empty list");
                 }
-
-                float* temp = parse_float_list(argv[++i]);
-                if (!temp) {
-                    throw std::invalid_argument("Failed to parse tensor-split list");
-                }
-                params.tensor_split = temp;
             }
 
             else if (arg == "--xtts-voice") {
@@ -444,13 +431,12 @@ bool whisper_params_parse(int argc, char **argv, whisper_params &params) {
                 return false;
             }
         } 
-        catch (const std::exception &e) {
-            std::cerr << "Error parsing argument: " << e.what() << std::endl;
-            delete[] params.tensor_split; // 🔥 КРИТИЧЕСКИЙ ПАТЧ: очищаем перед выходом
-            params.tensor_split = nullptr;
-            whisper_print_usage(argc, argv, params);
-            return false;
-        }
+            catch (const std::exception &e) {
+                std::cerr << "Error parsing argument: " << e.what() << std::endl;
+                // 🔥 КРИТИЧЕСКИЙ ПАТЧ: теперь очистка не нужна - вектор сам управляет памятью
+                whisper_print_usage(argc, argv, params);
+                return false;
+            }
     }
     return true;
 }
@@ -1957,18 +1943,16 @@ int run(int argc, char ** argv) {
 	if (params.split_mode == "layer") lmparams.split_mode = LLAMA_SPLIT_MODE_LAYER;
 	else lmparams.split_mode = LLAMA_SPLIT_MODE_NONE;
 	
-    lmparams.tensor_split = params.tensor_split;
+    lmparams.tensor_split = params.tensor_split.empty() ? nullptr : params.tensor_split.data();
 
     struct llama_model * model_llama = llama_model_load_from_file(params.model_llama.c_str(), lmparams);
     if (!model_llama) {
         fprintf(stderr, "No llama.cpp model specified. Please provide using -ml <modelfile>\n");
         return 1;
     }
-    // ✅ КРИТИЧНЫЙ ПАТЧ: ОСВОБОЖДЕНИЕ tensor_split ТОЛЬКО ПОСЛЕ УСПЕШНОЙ ЗАГРУЗКИ МОДЕЛИ
-    if (params.tensor_split != nullptr) {
-        delete[] params.tensor_split;
-        params.tensor_split = nullptr;
-    }
+    // 🔥 КРИТИЧЕСКИЙ ПАТЧ: Очистка не требуется - вектор сам управляет памятью
+    // Просто очищаем вектор, если он больше не нужен
+    params.tensor_split.clear();
 
     const llama_vocab * vocab_llama = llama_model_get_vocab(model_llama);
 	
