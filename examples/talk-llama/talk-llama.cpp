@@ -2246,39 +2246,6 @@ else // не передан
     // чтобы вручную penalize часто повторяющиеся токены,
     // но сам по себе этот блок уже предотвращает потерю контекста.
 
-
-
-	/*
-    // Блок отладки: выводит токены в консоль и записывает в файл
-    // Полезно для проверки, как именно модель интерпретирует входной текст
-	printf("\n-DBG-embd_inp-\n");
-    FILE *out_file = fopen("embd_inp.txt", "w");  // Открываем файл для записи
-	if (out_file == NULL) {
-		perror("Error opening file");
-        // Обработка ошибки открытия файла (если нужно)
-	} else {
-		for (int i = 0; i < (int)embd_inp.size(); i++) {
-            std::string token_str = llama_token_to_piece(ctx_llama, embd_inp[i]); // Получаем строковое представление токена
-            int token_id = embd_inp[i];  // Предполагаем, что embd_inp содержит ID токенов
-			
-            // Выводим информацию в консоль
-			fprintf(stdout, "%s(%d)", token_str.c_str(), token_id);
-			if (i < (int)embd_inp.size() - 1) {
-                fprintf(stdout, " ");  // Добавляем пробел между токенами
-			}
-			
-            // Записываем информацию в файл
-			fprintf(out_file, "%s(%d)", token_str.c_str(), token_id);
-			if (i < (int)embd_inp.size() - 1) {
-				fprintf(out_file, " ");
-			}
-		}
-		fclose(out_file);
-	}
-	printf("\n'\n");
-	printf("\n---\n");
-	*/
-					
     // Если путь к файлу сессии указан
     if (!path_session.empty()) {
     // Сообщаем о попытке загрузить сохранённую сессию
@@ -2294,7 +2261,8 @@ else // не передан
             size_t n_token_count_out = 0;
 
         // Загружаем состояние модели из файла сессии
-            if (!llama_state_load_file(ctx_llama, path_session.c_str(), session_tokens.data(), session_tokens.capacity(), &n_token_count_out)) {
+        // Используем .size(), так как мы только что установили его через resize()
+            if (!llama_state_load_file(ctx_llama, path_session.c_str(), session_tokens.data(), session_tokens.size(), &n_token_count_out)) {
             // Если загрузка не удалась — выводим сообщение об ошибке
                 fprintf(stderr, "%s: error: failed to load session file '%s'\n", __func__, path_session.c_str());
                 return 1;
@@ -2304,9 +2272,8 @@ else // не передан
             session_tokens.resize(n_token_count_out);
 
         // Копируем токены из сессии в входной буфер
-            for (size_t i = 0; i < session_tokens.size(); i++) {
-                embd_inp[i] = session_tokens[i];
-            }
+        // assign автоматически выделяет нужный объем памяти и копирует данные
+        embd_inp.assign(session_tokens.begin(), session_tokens.end());
 
         // Сообщаем о успешной загрузке сессии и выводим количество токенов
             fprintf(stderr, "%s: loaded a session with prompt size of %d tokens\n", __func__, (int) session_tokens.size());
@@ -2828,18 +2795,23 @@ if (llama_decode(ctx_llama, batch)) {
                     if (text_heard_trimmed.size())
                     {
                         rand_intro_text = tts_intros[rand() % tts_intros.size()];
-                        std::string intro_text = rand_intro_text; // копируем для лямбды
+                        
+                        // 🔧 ПАТЧ: Сначала работаем с общими массивами под защитой мьютекса
+                        std::string intro_for_tts;
+                        {
+                            std::lock_guard<std::mutex> lock(g_tts_mutex);
+                            int idx = thread_i;
+                            text_to_speak_arr[idx] = rand_intro_text;
+                            thread_i = (idx + 1) % 150;
+                            intro_for_tts = rand_intro_text; // Копируем ДЛЯ потока под защитой
+                        }
 
-                        threads.emplace_back([intro_text, current_voice, params]() {
-                            if (!intro_text.empty()) {
-                                send_tts_async(intro_text, current_voice, params.language, params.xtts_url);
-                            }
-                        });
-
-                        // Если нужно сохранить в массив (например, для логгирования), делайте это ДО запуска потока:
-                        int idx = thread_i;
-                        text_to_speak_arr[idx] = rand_intro_text;
-                        thread_i = (idx + 1) % 150;
+                        // 🔧 ПАТЧ: Теперь безопасно запускаем поток с локальной копией
+                        if (!intro_for_tts.empty()) {
+                            threads.emplace_back([intro_for_tts, current_voice, params]() {
+                                send_tts_async(intro_for_tts, current_voice, params.language, params.xtts_url);
+                            });
+                        }
                     }
                 }
 				
@@ -2936,8 +2908,13 @@ if (user_command == "regenerate" ||
 						if (!past_prev_arr.empty())
 						{
                         // Возвращаем контекст к предыдущему состоянию
-							n_past_prev = past_prev_arr.back();
-							past_prev_arr.pop_back();
+							if (!past_prev_arr.empty()) {
+                                n_past_prev = past_prev_arr.back();
+                                past_prev_arr.pop_back();
+                            } else {
+                                // безопасный fallback
+                                n_past_prev = 0;
+                            }
 
 							int rollback_num = embd_inp.size()-n_past_prev;
 
@@ -2959,21 +2936,24 @@ if (user_command == "regenerate" ||
 								text_heard_trimmed = "";								
 								text_to_speak_arr[thread_i] = "Regenerating";								
 
-                                // Захватываем нужные значения ПО ЗНАЧЕНИЮ до запуска потока
-                                int prev_idx = (thread_i - 1 + 150) % 150;
-                                std::string text_to_respeak;
+                                // 🔧 ПАТЧ: Безопасное получение текста для повторного озвучивания
+                                std::string text_to_respeak_safe; // Локальная переменная вне мьютекса
+
                                 {
+                                    // 🔧 ПАТЧ: Все операции с общими массивами внутри одного мьютекса
                                     std::lock_guard<std::mutex> lock(g_tts_mutex);
-                                    text_to_respeak = text_to_speak_arr[prev_idx];
-                                    text_to_speak_arr[prev_idx] = ""; // опционально: очистка
+                                    int prev_idx = (thread_i - 1 + 150) % 150;
+                                    text_to_respeak_safe = text_to_speak_arr[prev_idx]; // Копируем под защитой
+                                    text_to_speak_arr[prev_idx] = ""; // Очищаем под защитой
                                 }
 
-                                if (!text_to_respeak.empty()) {
-                                    threads.emplace_back([text_to_respeak, current_voice, params]() {
-                                        send_tts_async(text_to_respeak, current_voice, params.language, params.xtts_url);
+                                // 🔧 ПАТЧ: Теперь безопасно запускаем поток с локальной копией
+                                if (!text_to_respeak_safe.empty()) {
+                                    threads.emplace_back([text_to_respeak_safe, current_voice, params]() {
+                                        send_tts_async(text_to_respeak_safe, current_voice, params.language, params.xtts_url);
                                     });
                                 }
-								thread_i++;
+                                thread_i++;
 							}
 						}						
 					}
@@ -3038,23 +3018,30 @@ if (user_command == "regenerate" ||
 								new_command_allowed = 0;
 											
                             // Асинхронное воспроизведение "Deleted" через TTS
-								text_to_speak_arr[thread_i] = "Deleted";								
-                               // 1. Безопасно читаем нужное значение из массива
-                                std::string text_to_respeak;
-                                {
-                                    std::lock_guard<std::mutex> lock(g_tts_mutex);
-                                    int idx = (thread_i - 1 + 150) % 150;
-                                    text_to_respeak = text_to_speak_arr[idx];
-                                    text_to_speak_arr[idx] = ""; // опционально: очистка
-                                }
+                            // 🔧 ПАТЧ: Сохраняем текст "Deleted" в массив под защитой мьютекса
+                            std::string text_for_deleted_tts = "Deleted";
+                            std::string text_to_respeak_safe;
 
-                                // 2. Запускаем поток с захватом по значению — безопасно!
-                                if (!text_to_respeak.empty()) {
-                                    threads.emplace_back([text_to_respeak, current_voice, params]() {
-                                        send_tts_async(text_to_respeak, current_voice, params.language, params.xtts_url);
-                                    });
-                                }
-								thread_i++;						
+                            {
+                                std::lock_guard<std::mutex> lock(g_tts_mutex);
+                                
+                                // Сохраняем новый текст
+                                text_to_speak_arr[thread_i] = text_for_deleted_tts;
+                                
+                                // Безопасно читаем предыдущее значение
+                                int idx = (thread_i - 1 + 150) % 150;
+                                text_to_respeak_safe = text_to_speak_arr[idx];
+                                text_to_speak_arr[idx] = ""; // Очищаем под защитой
+                                
+                                thread_i = (thread_i + 1) % 150;
+                            }
+
+                            // 🔧 ПАТЧ: Запускаем поток с локальными копиями
+                            if (!text_to_respeak_safe.empty()) {
+                                threads.emplace_back([text_to_respeak_safe, current_voice, params]() {
+                                    send_tts_async(text_to_respeak_safe, current_voice, params.language, params.xtts_url);
+                                });
+                            }					
 							}
 						}
 						else 
@@ -3246,21 +3233,44 @@ else if (text_heard_trimmed.find("время") != std::string::npos ||
 // Обработчик команды "google"
 else if (user_command == "google")
 {
-    //  Удобная обёртка для безопасного озвучивания коротких фраз (ПАТЧ: без глобальных массивов)
+//  Удобная обёртка для безопасного озвучивания коротких фраз (ПАТЧ: с защитой мьютексом)
     auto speak_safe = [&](const std::string& msg) {
         if (msg.empty()) return;
-        // Захватываем ВСЁ по значению — никаких глобальных массивов и ссылок
+        
+        // 🔒 ЗАЩИЩАЕМ все операции с общими данными
         std::string msg_copy = msg;
-        int current_reply_part = reply_part++;
+        int current_reply_part;
+        int current_idx;
+        
+        {
+            std::lock_guard<std::mutex> lock(g_tts_mutex);
+            
+            // Безопасные операции под защитой мьютекса
+            current_reply_part = reply_part++;
+            current_idx = thread_i;
+            
+            // Сохраняем в массивы для совместимости с остальным кодом
+            text_to_speak_arr[current_idx] = msg_copy;
+            reply_part_arr[current_idx] = current_reply_part;
+            
+            // Обновляем индекс с циклическим буфером
+            thread_i = (thread_i + 1) % 150;
+        }
+        
         try {
             threads.emplace_back([msg_copy, current_voice, params, current_reply_part]() {
                 send_tts_async(msg_copy, current_voice, params.language, params.xtts_url, current_reply_part);
-                // Нет обращения к text_to_speak_arr / reply_part_arr — безопасно!
             });
-            // Обновляем thread_i только для логгирования/совместимости (не используется в TTS)
-            if (++thread_i >= 150) thread_i = 0;
         } catch (const std::exception& e) {
             fprintf(stderr, "[google] TTS thread spawn failed: %s\n", e.what());
+            
+            // 🔒 Откатываем изменения при ошибке (под защитой мьютекса)
+            {
+                std::lock_guard<std::mutex> lock(g_tts_mutex);
+                text_to_speak_arr[current_idx] = "";
+                reply_part_arr[current_idx] = 0;
+                // ⚠️ Внимание: не откатываем thread_i и reply_part для простоты
+            }
         }
     };
 
@@ -3274,46 +3284,69 @@ else if (user_command == "google")
         user_typed.clear();
         user_typed_this = false;
     } else {
-        // Короткая аудио-квитанция
-        speak_safe("Ищу информацию по запросу: " + q);
 
-        // Запрос к поисковому серверу
-        const std::string url = params.google_url + "google?q=" + UrlEncode(q);
-        std::string resp = send_curl(url);
 
-        if (resp.empty()) {
-            fprintf(stdout, "[google] empty response for (%s) — check backend\n", q.c_str());
-            speak_safe("Извините, не удалось найти информацию по запросу: " + q);
-            // Не прерываем цикл — просто не будем формировать спец-промпт
+
+        // 🔧 ПАТЧ: Безопасная аудио-квитанция
+{
+    std::string google_search_msg = "Ищу информацию по запросу: " + q;
+    std::lock_guard<std::mutex> lock(g_tts_mutex);
+    int idx = thread_i;
+    text_to_speak_arr[idx] = google_search_msg;
+    thread_i = (idx + 1) % 150;
+    
+    // Запускаем TTS с локальной копией
+    threads.emplace_back([google_search_msg, current_voice, params]() {
+        send_tts_async(google_search_msg, current_voice, params.language, params.xtts_url);
+    });
+}
+
+// Запрос к поисковому серверу
+const std::string url = params.google_url + "google?q=" + UrlEncode(q);
+std::string resp = send_curl(url);
+
+if (resp.empty()) {
+    fprintf(stdout, "[google] empty response for (%s) — check backend\n", q.c_str());
+    
+    // 🔧 ПАТЧ: Безопасное сообщение об ошибке
+    {
+        std::string error_msg = "Извините, не удалось найти информацию по запросу: " + q;
+        std::lock_guard<std::mutex> lock(g_tts_mutex);
+        int idx = thread_i;
+        text_to_speak_arr[idx] = error_msg;
+        thread_i = (idx + 1) % 150;
+        
+        threads.emplace_back([error_msg, current_voice, params]() {
+            send_tts_async(error_msg, current_voice, params.language, params.xtts_url);
+        });
+    }
+    // Не прерываем цикл — просто не будем формировать спец-промпт
+} else {
+    fprintf(stdout, "[google] resp (%s): %s\n", q.c_str(), resp.c_str());
+
+    // Подрезаем ответ «по границе предложения»
+    auto truncate_smart = [](std::string s, size_t hard = 600, size_t prefer = 420) {
+        if (s.size() <= hard) return s;
+        size_t cut = s.find_last_of(".!?");
+        if (cut != std::string::npos && cut >= std::min(prefer, hard)) {
+            s.erase(cut + 1);
         } else {
-            fprintf(stdout, "[google] resp (%s): %s\n", q.c_str(), resp.c_str());
-
-            // Подрезаем ответ «по границе предложения»
-            auto truncate_smart = [](std::string s, size_t hard = 600, size_t prefer = 420) {
-                if (s.size() <= hard) return s;
-                size_t cut = s.find_last_of(".!?");
-                if (cut != std::string::npos && cut >= std::min(prefer, hard)) {
-                    s.erase(cut + 1);
-                } else {
-                    s.erase(std::min(hard, s.size()));
-                    s += "...";
-                }
-                return s;
-            };
-            resp = truncate_smart(resp);
-
-            // Формируем реплику пользователя для LLaMA (пусть ниже добавится Person:/Bot:)
-            std::string llm_prompt =
-                params.person + ": " + params.bot_name +
-                ", пожалуйста, кратко изложи основное из текста, найденного по запросу \"" + q + "\": " + resp;
-
-            // КЛЮЧЕВОЕ МЕСТО: кладём это в text_heard как «то, что сказал пользователь».
-            // Ниже по коду у тебя автоматически добавится "\n<BotName>:" и сработает генерация.
-            text_heard = llm_prompt;
-
-            // Это удобно, чтобы в консоли печатался заголовок бота без дубля текста
-            user_typed_this = true;
+            s.erase(std::min(hard, s.size()));
+            s += "...";
         }
+        return s;
+    };
+    resp = truncate_smart(resp);
+
+    // Формируем реплику пользователя для LLaMA
+    std::string llm_prompt =
+        params.person + ": " + params.bot_name +
+        ", пожалуйста, кратко изложи основное из текста, найденного по запросу \"" + q + "\": " + resp;
+
+    text_heard = llm_prompt;
+    user_typed_this = true;
+}
+
     }
 
     // Чистим одноразовые буферы, НО НЕ ДЕЛАЕМ continue;
@@ -3388,15 +3421,14 @@ else if (user_command == "call") {
     
     // 🔥 ОПТИМИЗАЦИЯ: Убрана первичная токенизация. Проверяем только пустоту строки.
     if (text_heard.empty() || force_speak) {
-        audio.clear();
-        {   // Сброс под защитой мьютекса
-            std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
-            g_hotkey_pressed = "";
+            audio.clear();
+            {   // Сброс под защитой мьютекса
+                std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
+                g_hotkey_pressed = "";
+            }
+            force_speak = false; // Сбрасываем флаг ПЕРЕД continue, чтобы он не залип
+            continue;
         }
-        continue;
-    }
-
-    force_speak = false;
     trim(text_heard);
 
     text_heard_prev = text_heard;
@@ -3484,13 +3516,29 @@ if (n_past + (int)embd.size() > n_ctx) {
     if (n_discard > 0) {
         if (n_keep + n_discard <= (int)embd_inp.size() && n_keep + n_discard <= n_past) {
             // 1. Удаляем токены из локального буфера
-            embd_inp.erase(embd_inp.begin() + n_keep, embd_inp.begin() + n_keep + n_discard);
-            // 2a. Удаляем записи KV-кэша (новый API через memory wrapper)
-            llama_memory_seq_rm(llama_get_memory(ctx_llama), 0, n_keep, n_keep + n_discard);
+            embd_inp.erase(
+                embd_inp.begin() + n_keep,
+                embd_inp.begin() + n_keep + n_discard
+            );
 
+            // 🔴 ПАТЧ: СИНХРОННО удаляем токены из session_tokens
+            if (!session_tokens.empty() && (int)session_tokens.size() >= n_keep + n_discard) {
+                session_tokens.erase(
+                    session_tokens.begin() + n_keep,
+                    session_tokens.begin() + n_keep + n_discard
+                );
+            }
+
+            // 2a. Удаляем записи KV-кэша
+            llama_memory_seq_rm(
+                llama_get_memory(ctx_llama),
+                0,
+                n_keep,
+                n_keep + n_discard
+            );
             // 2b. Сдвигаем оставшиеся записи KV-кэша
-            // delta = -n_discard означает «сдвинуть всё после (n_keep+n_discard) влево на n_discard».
             llama_memory_seq_add(llama_get_memory(ctx_llama), 0, n_keep + n_discard, n_past, -n_discard);
+
             // 3. Добавляем последние n_prev токенов в embd
             const int keep_recent = std::min((int)embd_inp.size() - n_keep, n_prev);
             if (keep_recent > 0) {
@@ -3504,6 +3552,12 @@ if (n_past + (int)embd.size() > n_ctx) {
         // fallback: сброс контекста до n_keep
         printf(" [Context shift not possible or bounds error, falling back to reset]");
         embd_inp.resize(n_keep);
+        
+        // 🔴 ПАТЧ: Синхронизируем session_tokens
+        if (!session_tokens.empty()) {
+            session_tokens.resize(n_keep);
+        }
+        
         const int keep_recent = std::min((int)embd_inp.size() - n_keep, n_prev);
         if (keep_recent > 0) {
             embd.insert(embd.begin(), embd_inp.end() - keep_recent, embd_inp.end());
@@ -3511,18 +3565,23 @@ if (n_past + (int)embd.size() > n_ctx) {
     }
     // ✅ ЕДИНСТВЕННОЕ МЕСТО ОБНОВЛЕНИЯ n_past — после ВСЕХ изменений embd_inp
     n_past = embd_inp.size();
-    n_session_consumed = n_past;
+    n_session_consumed = n_past; // 🔴 ВАЖНО: обновляем счетчик сессии
     // Проверка и восстановление BOS-токена, если нужно
     const llama_token bos_token = llama_token_bos(vocab_llama);
     if (!embd_inp.empty() && embd_inp[0] != bos_token) {
         embd_inp.insert(embd_inp.begin(), bos_token);
-        n_past = embd_inp.size(); // Обновляем снова, если добавили BOS
+        
+        // 🔴 ПАТЧ: Синхронизируем session_tokens
+        if (!session_tokens.empty()) {
+            session_tokens.insert(session_tokens.begin(), bos_token);
+        }
+        
+        n_past = embd_inp.size();
         n_session_consumed = n_past;
         printf(" [BOS token was missing, added it back. n_past adjusted.]");
     }
     printf(" [Final context size: %zu. n_past: %d]", embd_inp.size(), n_past);
-    path_session = "";
-												
+    path_session = ""; // Отключаем сессию после shift
 }
 
 } 
@@ -3530,7 +3589,15 @@ if (n_past + (int)embd.size() > n_ctx) {
 // Попытка повторного использования совпадающего префикса из загруженной сессии
 if (n_session_consumed < (int) session_tokens.size()) {
     size_t i = 0;
-    for ( ; i < embd.size(); i++) {
+    // 🔴 ПАТЧ: Добавляем безопасные границы
+    int max_check = std::min((int)embd.size(), (int)session_tokens.size() - n_session_consumed);
+    
+    for ( ; i < (size_t)max_check; i++) {
+        // 🔴 ПАТЧ: Дополнительная проверка индекса
+        if (n_session_consumed >= (int)session_tokens.size()) {
+            break;
+        }
+        
         if (embd[i] != session_tokens[n_session_consumed]) {
             session_tokens.resize(n_session_consumed);
             break;
@@ -3868,49 +3935,58 @@ if (text_len >= 2 && new_tokens >=2 && !person_name_is_found &&
             }										
         }
 
-        // XTTS в отдельных потоках
-        // Сохраняем текст и номер части ответа для асинхронной обработки
-        // Убираем запись в глобальные массивы — она не нужна!
-        int current_reply_part = reply_part++; // захватываем значение ДО инкремента
-        try 
-        {
-            // Захватываем ВСЁ по значению — никаких глобальных массивов!
-            threads.emplace_back([text_to_speak, current_voice, params, current_reply_part]() {
-                send_tts_async(text_to_speak, current_voice, params.language, params.xtts_url, current_reply_part);
-            });
-            // Обновляем thread_i только если он всё ещё нужен (например, для логгирования)
-            // Но для TTS он НЕ нужен → можно даже убрать, но пока оставим для совместимости
-            thread_i = (thread_i + 1) % 150;
-            text_to_speak = "";
+// XTTS в отдельных потоках
+// Сохраняем текст и номер части ответа для асинхронной обработки
+int current_reply_part = reply_part++; // захватываем значение ДО инкремента
+int current_idx; // индекс в массиве для этого текста
 
-            // Если задержка перед XTTS включена, делаем паузу
-            // Это помогает ускорить инференс xtts/wav2lip
-            if (params.sleep_before_xtts) 
-                std::this_thread::sleep_for(std::chrono::milliseconds(params.sleep_before_xtts));
-            
-            // Проверяем уровень энергии, если пользователь говорит
-            // (не вызывает распознавание whisper, только громкий шум останавливает всё)
-            if (!params.push_to_talk || (params.push_to_talk && g_hotkey_pressed == "Alt"))
-            {
-                // Получаем аудио данные (неблокирующий вызов, 2000 мс)
-                audio.get(2000, pcmf32_cur);
-                // Проверяем активность голоса (VAD - Voice Activity Detection)
-                int vad_result = ::vad_simple_int(pcmf32_cur, WHISPER_SAMPLE_RATE, params.vad_last_ms, 
-                params.vad_thold, params.freq_thold, params.print_energy, 
-                params.vad_start_thold);
-                
-                // Если обнаружена речь
-                if (vad_result == 1)
-                {
-                    llama_interrupted = 1;                    // Устанавливаем флаг прерывания
-                    llama_interrupted_time = get_current_time_ms();  // Запоминаем время прерывания
-                    printf(" [Speech!]\n");                   // Сообщаем о прерывании
-                    allow_xtts_file(params.xtts_control_path, 0); // Останавливаем XTTS
-                    done = true;                              // Останавливаем генерацию LLaMA
-                    break;                                    // Выходим из цикла
-                }
-            }
+{
+    // БЛОКИРУЕМ доступ к глобальным массивам
+    std::lock_guard<std::mutex> lock(g_tts_mutex);
+    current_idx = thread_i; // сохраняем текущий индекс
+    text_to_speak_arr[current_idx] = text_to_speak; // записываем текст в массив
+    reply_part_arr[current_idx] = current_reply_part; // записываем номер части
+    thread_i = (thread_i + 1) % 150; // увеличиваем индекс с циклическим буфером
+}
+
+try 
+{
+    // Захватываем ВСЁ по значению — никаких глобальных массивов!
+    threads.emplace_back([text_to_speak, current_voice, params, current_reply_part]() {
+        send_tts_async(text_to_speak, current_voice, params.language, params.xtts_url, current_reply_part);
+    });
+    
+    // Очищаем локальную переменную
+    text_to_speak = "";
+
+    // Если задержка перед XTTS включена, делаем паузу
+    // Это помогает ускорить инференс xtts/wav2lip
+    if (params.sleep_before_xtts) 
+        std::this_thread::sleep_for(std::chrono::milliseconds(params.sleep_before_xtts));
+    
+    // Проверяем уровень энергии, если пользователь говорит
+    // (не вызывает распознавание whisper, только громкий шум останавливает всё)
+    if (!params.push_to_talk || (params.push_to_talk && g_hotkey_pressed == "Alt"))
+    {
+        // Получаем аудио данные (неблокирующий вызов, 2000 мс)
+        audio.get(2000, pcmf32_cur);
+        // Проверяем активность голоса (VAD - Voice Activity Detection)
+        int vad_result = ::vad_simple_int(pcmf32_cur, WHISPER_SAMPLE_RATE, params.vad_last_ms, 
+        params.vad_thold, params.freq_thold, params.print_energy, 
+        params.vad_start_thold);
+        
+        // Если обнаружена речь
+        if (vad_result == 1)
+        {
+            llama_interrupted = 1;                    // Устанавливаем флаг прерывания
+            llama_interrupted_time = get_current_time_ms();  // Запоминаем время прерывания
+            printf(" [Speech!]\n");                   // Сообщаем о прерывания
+            allow_xtts_file(params.xtts_control_path, 0); // Останавливаем XTTS
+            done = true;                              // Останавливаем генерацию LLaMA
+            break;                                    // Выходим из цикла
         }
+    }
+}
 
                 // Обработка исключений при создании потока
                 catch (const std::exception& ex) {
@@ -4111,32 +4187,59 @@ if (text_len >= 2 && new_tokens >=2 && !person_name_is_found &&
 }
 
 // ### ОБРАБОТКА АУДИОВХОДА И СИГНАЛОВ (VAD) ###
-// Проверяем SDL события (ввод с клавиатуры, закрытие окна и т.д.)
+
+            // Проверяем SDL события (ввод с клавиатуры, закрытие окна и т.д.)
             is_running = sdl_poll_events();
 
             // Если приложение не запущено (закрыто), выходим из цикла
             if (!is_running) {
                 break;
             }
-        }
-				
+            }
+
             // Финальная часть предложения, если осталась
             text_to_speak = ::replace(text_to_speak, "\"", "'");
             if (text_to_speak.size())  // Если есть текст для озвучки
             {
-                text_to_speak_arr[thread_i] = text_to_speak;
-            reply_part_arr[thread_i] = reply_part;
-            reply_part++;
-            try 
-            {		
-                threads.emplace_back([text_to_speak, current_voice, params, reply_part]() {
-                    send_tts_async(text_to_speak, current_voice, params.language, params.xtts_url, reply_part);
-                });
-                thread_i = (thread_i + 1) % 150;
-                text_to_speak = "";
-            }
+                int current_reply_part_final;
+                int current_idx_final;
+                std::string text_to_speak_final = text_to_speak; // 🔧 ПАТЧ: Создаём локальную копию
+                
+                // 🔒 ВСЕ операции с разделяемыми данными в одной критической секции
+                {
+                    std::lock_guard<std::mutex> lock(g_tts_mutex);
+                    
+                    current_idx_final = thread_i;
+                    current_reply_part_final = reply_part;
+                    
+                    // Сохраняем данные в массивы
+                    text_to_speak_arr[current_idx_final] = text_to_speak_final;
+                    reply_part_arr[current_idx_final] = current_reply_part_final;
+                    
+                    // Атомарно обновляем счетчики
+                    reply_part++;
+                    thread_i = (thread_i + 1) % 150;
+                }
+                
+                try 
+                {		
+                    // 🔧 ПАТЧ: Захватываем локальные копии, а не оригинальные переменные
+                    threads.emplace_back([text_to_speak_final, current_voice, params, current_reply_part_final]() {
+                        send_tts_async(text_to_speak_final, current_voice, params.language, params.xtts_url, current_reply_part_final);
+                    });
+                    
+                    text_to_speak = ""; // Очищаем оригинальную переменную
+                }
                 catch (const std::exception& ex) {
                     std::cerr << "[Exception]: Failed to emplace fin thread: " << ex.what() << '\n'; 
+                    
+                    // 🔧 ПАТЧ: Откатываем изменения под защитой мьютекса
+                    {
+                        std::lock_guard<std::mutex> lock(g_tts_mutex);
+                        text_to_speak_arr[current_idx_final] = "";
+                        reply_part_arr[current_idx_final] = 0;
+                    }
+                    // Внимание: не откатываем reply_part и thread_i для простоты
                 }
             }
 
