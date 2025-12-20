@@ -3042,14 +3042,19 @@ else if (user_command == "reset")
 
             int rollback_num = embd_inp.size()-n_past_prev;
 
-            if (rollback_num)
-            {
-                printf(" [Resetting context of %zd tokens.]\n", embd_inp.size());
+                if (rollback_num)
+                            {
+                                printf(" [Resetting context of %zd tokens.]\n", embd_inp.size());
 
-// Пересоздаём контекст модели
-                ctx_llama = llama_init_from_model(model_llama, lcparams);
+                                // 🔥 ФИКС: Обязательно освобождаем старый контекст перед созданием нового!
+                                if (ctx_llama) {
+                                    llama_free(ctx_llama);
+                                }
 
-// Токенизируем начальный промпт заново
+                                // Пересоздаём контекст модели
+                                ctx_llama = llama_init_from_model(model_llama, lcparams);
+
+                // Токенизируем начальный промпт заново
                 embd_inp = ::llama_tokenize(ctx_llama, prompt_llama, true);
                 //n_past = 0;
                 // NEW prompt eval
@@ -3108,71 +3113,86 @@ audio.clear(); // Очищаем аудио-буфер
 }
 
 // ----------------------------
-// ОСТАНОВКА
-// Обработчик команды "stop" — с интеллектуальной фильтрацией ложных срабатываний
+// ОСТАНОВКА stop
 // ----------------------------
 if (user_command == "stop")
 {
-    // Преобразуем фразу в нижний регистр для сопоставления
     std::string lower_text = LowerCase(text_heard_trimmed);
-
-    // Подсчёт количества слов
-    int word_count = std::count_if(lower_text.begin(), lower_text.end(),
-                                   [](unsigned char c){ return c == ' '; }) + 1;
-
-    // Определяем, является ли это короткой фразой с командой остановки
-    bool is_strict_stop = (
-        lower_text == "стоп" ||
-        lower_text == "stop" ||
-        lower_text == "остановись" ||
-        lower_text == "останови" ||
-        lower_text == "хватит" ||
-        lower_text == "прекрати"
-    );
-
-    // Если это длинная фраза, где встречается "остановись" или "хватит" — это не команда
-    bool is_in_sentence = (
-        !is_strict_stop && (
-            lower_text.find("остановись") != std::string::npos ||
-            lower_text.find("останови") != std::string::npos ||
-            lower_text.find("хватит") != std::string::npos ||
-            lower_text.find("прекрати") != std::string::npos
-        )
-    );
-
-    // Решение: команда "STOP" считается подтверждённой только если фраза короткая и точная
-    bool confirmed_stop = (is_strict_stop && word_count <= 3 && !is_in_sentence);
-
-    if (!confirmed_stop) {
-        // Ложное срабатывание: не останавливаем генерацию
+    
+    // Расширенный список стоп-команд с учетом разных вариантов
+    static const std::vector<std::string> stop_commands = {
+        "стоп", "stop", "остановись", "останови", "хватит", "прекрати",
+        "стоп пожалуйста", "stop please", "хватит пожалуйста", "прекрати пожалуйста"
+    };
+    
+    // Фразы с именем бота (например, "Эмма, стоп")
+    static const std::vector<std::string> stop_with_bot = {
+        params.bot_name + " стоп",
+        params.bot_name + " stop", 
+        params.bot_name + " остановись",
+        params.bot_name + " хватит"
+    };
+    
+    bool is_stop_command = false;
+    
+    // 1. Проверяем точное совпадение с базовыми командами
+    for (const auto& cmd : stop_commands) {
+        if (lower_text == cmd) {
+            is_stop_command = true;
+            break;
+        }
+    }
+    
+    // 2. Проверяем команды с именем бота
+    if (!is_stop_command) {
+        for (const auto& cmd : stop_with_bot) {
+            if (lower_text.find(cmd) != std::string::npos) {
+                is_stop_command = true;
+                break;
+            }
+        }
+    }
+    
+    // 3. Проверяем короткие фразы, которые начинаются со стоп-слова
+    if (!is_stop_command && lower_text.length() < 20) {
+        for (const auto& cmd : stop_commands) {
+            if (cmd.length() < lower_text.length() && 
+                lower_text.find(cmd) == 0) {
+                // Начинается со стоп-слова и короткая
+                is_stop_command = true;
+                break;
+            }
+        }
+    }
+    
+    if (!is_stop_command) {
+        // Не стоп-команда — продолжаем обычную обработку
         user_command.clear();
         continue;
     }
-
+    
     // --- Реальный STOP-запрос ---
-    fprintf(stdout, "[user] requested STOP\n");
-
+    fprintf(stdout, "[user] requested STOP: \"%s\"\n", text_heard_trimmed.c_str());
+    
     // 1) Безопасно очищаем буферы и ввод
     text_heard.clear();
     text_heard_trimmed.clear();
     audio.clear();
     user_typed.clear();
     user_typed_this = false;
-
+    
     // 2) Прерываем озвучку XTTS
     allow_xtts_file(params.xtts_control_path, 0);
-
-    // 3) Устанавливаем флаг остановки генерации (аналог Ctrl+Space)
+    
+    // 3) Устанавливаем флаг остановки генерации
     {
         std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
         g_hotkey_pressed = "Ctrl+Space";
     }
-
+    
     // Продолжаем цикл — модель корректно завершит текущую генерацию
     continue;
 }
-
-
 
 
 // Скажи сколько время
@@ -3327,17 +3347,14 @@ else if (user_command == "call") {
     
 // ### ЦИКЛ ГЕНЕРАЦИИ ТЕКСТА (LLaMA) ###
     llama_start_time = get_current_time_ms();
-    const std::vector<llama_token> tokens = llama_tokenize(ctx_llama, text_heard.c_str(), false);
-
-    if (text_heard.empty() || tokens.empty() || force_speak) {
-        //fprintf(stdout, "%s: Heard nothing, skipping ...\n", __func__);
+    
+    // 🔥 ОПТИМИЗАЦИЯ: Убрана первичная токенизация. Проверяем только пустоту строки.
+    if (text_heard.empty() || force_speak) {
         audio.clear();
-       
         {   // Сброс под защитой мьютекса
             std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
             g_hotkey_pressed = "";
         }
-
         continue;
     }
 
@@ -3354,16 +3371,14 @@ else if (user_command == "call") {
     std::string text_heard_with_instruct = text_heard;
 
     if (params.translate) bot_name_current_ru = translit_en_ru(params.bot_name);
-    int n_comas = 0; // comas counter
-    //printf("text_heard_prev: %s\n", text_heard_prev);
-    
+    int n_comas = 0; 
     
     if (last_output_has_username && !user_typed_this) // last model output has user name
     {
-        text_heard.insert(0, 1, ' '); // missing space
-        text_heard_with_instruct.insert(0, 1, ' '); // missing space
+        text_heard.insert(0, 1, ' '); 
+        text_heard_with_instruct.insert(0, 1, ' '); 
     }
-    else if (!last_output_has_EOT) // no EOT ( <end_of_turn>)
+    else if (!last_output_has_EOT) // no EOT
     {
         text_heard.insert(0, "\n"+params.person + chat_symb + " ");
         text_heard_with_instruct.insert(0, params.instruct_preset_data["bot_message_suffix"] +"\n"+ params.instruct_preset_data["user_message_prefix"]+"\n"+params.person + chat_symb + " ");
@@ -3379,25 +3394,26 @@ else if (user_command == "call") {
 
     if (user_typed_this) 
     {
-        // Стало:
         fprintf(stdout, "%s%s%s", "\033[1m", (params.bot_name + chat_symb).c_str(), "\033[0m");
-        { // Сброс горячей клавиши — под мьютексом, чтобы избежать гонок с keyboard_shortcut_func()
+        { 
             std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
             g_hotkey_pressed = "";
         }
     }
     else fprintf(stdout, "%s%s%s", "\033[1m", text_heard.c_str(), "\033[0m");
 
-    if (params.instruct_preset.size()) text_heard = text_heard_with_instruct; // don't print instruct, using another string var	
+    if (params.instruct_preset.size()) text_heard = text_heard_with_instruct; 
     fflush(stdout);
     int split_after = params.split_after;
     
-    embd = ::llama_tokenize(ctx_llama, text_heard, false); // not sure why 2 times llama_tokenize
+    // 🔥 ЕДИНСТВЕННАЯ ТОКЕНИЗАЦИЯ: сразу в embd
+    embd = ::llama_tokenize(ctx_llama, text_heard, false); 
     input_tokens_count = embd.size();
 
     // Append the new input tokens to the session_tokens vector
     if (!path_session.empty()) {
-        session_tokens.insert(session_tokens.end(), tokens.begin(), tokens.end());
+        // 🔥 ФИКС: Используем embd (актуальные токены), а не удаленный вектор tokens
+        session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
     }
     
     // ✅ ЗАМЕНЯЕМ НА ЭТОТ БЛОК — только защита от переполнения индекса
@@ -4207,9 +4223,12 @@ if (text_len >= 2 && new_tokens >=2 && !person_name_is_found &&
     // Освобождаем бэкенд LLaMA (завершаем работу библиотеки LLaMA)
     llama_backend_free();
 	
-    // Ожидаем завершения потока ввода с клавиатуры
-    // Метод join() блокирует основной поток до завершения input_thread
-    input_thread.join();    // поток ввода с клавиатуры
+// 🔥 ФИКС: Поток ввода висит на readline/cin, его нельзя завершить извне.
+    // Вместо join() делаем detach(), чтобы программа могла закрыться немедленно.
+    // ОС сама очистит ресурсы при завершении процесса.
+    if (input_thread.joinable()) {
+        input_thread.detach(); 
+    }
     
     // Ожидаем завершения потока обработки горячих клавиш
     // Метод join() блокирует основной поток до завершения shortcut_thread
