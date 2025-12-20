@@ -98,22 +98,18 @@ static std::string llama_token_to_piece(const struct llama_context * ctx, llama_
 }
 
 /**
- * @brief Парсит строку с числами, разделёнными запятыми, и возвращает массив float*
- * @param s - входная строка, например "1.2,3.4,5.6"
- * @return float* — указатель на динамический массив. 
- * Вызывающий обязан вызвать delete[] для освобождения памяти.
- */
-/**
- * @brief Парсит строку с числами, разделёнными запятыми, и возвращает вектор float
- * @param s - входная строка, например "1.2,3.4,5.6"
- * @return std::vector<float> — вектор с распарсенными значениями
+ * @brief Парсит строку с числами с плавающей точкой, разделёнными запятыми.
+ *        Используется для параметров командной строки, таких как --tensor-split.
+ * @param s - входная строка в формате "0.5,0.5" или "0.4,0.3,0.3"
+ * @return std::vector<float> — вектор распарсенных значений.
+ *         Возвращает пустой вектор при ошибке парсинга или пустом вводе.
  */
 std::vector<float> parse_float_list(const std::string& s) {
     std::vector<float> result;
     
     if (s.empty()) {
-        std::cerr << "Error: Empty input string." << std::endl;
-        return result; // возвращаем пустой вектор
+        std::cerr << "Error: Empty input string for float list." << std::endl;
+        return result;
     }
     
     std::stringstream ss(s);
@@ -123,17 +119,29 @@ std::vector<float> parse_float_list(const std::string& s) {
         // Разделяем строку по запятым
         while (std::getline(ss, item, ',')) {
             if (!item.empty()) {
-                // Преобразуем подстроку в float
-                result.push_back(std::stof(item));
+                // Удаляем лишние пробелы
+                item.erase(0, item.find_first_not_of(' '));
+                item.erase(item.find_last_not_of(' ') + 1);
+                
+                if (!item.empty()) {
+                    // Преобразуем подстроку в float
+                    result.push_back(std::stof(item));
+                }
             }
         }
+        
+        // Дополнительная проверка: если не нашли ни одного числа
+        if (result.empty()) {
+            std::cerr << "Warning: No valid float numbers found in string: '" << s << "'" << std::endl;
+        }
+        
     } catch (const std::exception& e) {
         // Если в строке не float или другая ошибка преобразования
-        std::cerr << "Error parsing float list: " << e.what() << '\n';
-        result.clear(); // возвращаем пустой вектор при ошибке
+        std::cerr << "Error parsing float list from '" << s << "': " << e.what() << '\n';
+        result.clear();
     }
     
-    return result; // вектор сам управляет памятью
+    return result;
 }
 
 // command-line parameters
@@ -356,9 +364,42 @@ bool whisper_params_parse(int argc, char **argv, whisper_params &params) {
             } 
 
             else if (arg == "--tensor-split") {
-                params.tensor_split = parse_float_list(argv[++i]);
+                // 🔧 ПАТЧ 1.2: Безопасная обработка tensor-split аргумента
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
+                
+                std::string tensor_split_str = argv[++i];
+                
+                // Проверка на пустую строку
+                if (tensor_split_str.empty()) {
+                    std::cerr << "Error: empty tensor-split list" << std::endl;
+                    return false;
+                }
+                
+                // Парсинг списка float
+                params.tensor_split = parse_float_list(tensor_split_str);
+                
+                // Проверка результата парсинга
                 if (params.tensor_split.empty()) {
-                    throw std::invalid_argument("Failed to parse tensor-split list or empty list");
+                    std::cerr << "Error: failed to parse tensor-split list: '" << tensor_split_str << "'" << std::endl;
+                    return false;
+                }
+                
+                // Дополнительная валидация значений
+                float sum = 0.0f;
+                for (float val : params.tensor_split) {
+                    if (val < 0.0f || val > 1.0f) {
+                        std::cerr << "Error: tensor-split values must be between 0.0 and 1.0, got: " << val << std::endl;
+                        return false;
+                    }
+                    sum += val;
+                }
+                
+                // Проверка суммы (обычно должна быть близка к 1.0 для распределения между GPU)
+                if (fabs(sum - 1.0f) > 0.001f) {
+                    std::cerr << "Warning: tensor-split values sum to " << sum << " (expected ~1.0)" << std::endl;
                 }
             }
 
@@ -759,12 +800,10 @@ void allow_xtts_file(std::string& path, int xtts_play_allowed) {
         std::ofstream writeStream(fileName);
         if (!writeStream.is_open()) {
             std::cerr << "ERROR: allow_xtts_file: Failed to create file: " << fileName << std::endl;
-            return; // 👈 КРИТИЧНО: НЕ МОЖЕМ ПРОДОЛЖИТЬ — TTS будет работать неправильно!
+            return;
         }
-        printf("Notice: %s file not found. Creating it.", path.c_str());
         writeStream << xtts_play_allowed;
         writeStream.flush();
-        writeStream.close();
     } else {
         // Файл существует — читаем текущее значение
         std::getline(readStream, singleLine);
@@ -783,11 +822,10 @@ void allow_xtts_file(std::string& path, int xtts_play_allowed) {
             std::ofstream writeStream(fileName);
             if (!writeStream.is_open()) {
                 std::cerr << "ERROR: allow_xtts_file: Failed to write to file: " << fileName << std::endl;
-                return; // 👈 КРИТИЧНО: НЕ МОЖЕМ ПРОДОЛЖИТЬ — TTS будет работать неправильно!
+                return;
             }
             writeStream << xtts_play_allowed;
             writeStream.flush();
-            writeStream.close();
         }
     }
 }
@@ -3484,12 +3522,6 @@ if (n_past + (int)embd.size() > n_ctx) {
     }
     printf(" [Final context size: %zu. n_past: %d]", embd_inp.size(), n_past);
     path_session = "";
-												
-													 
-																		   
-																						 
-							   
-											
 												
 }
 
