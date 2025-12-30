@@ -1448,6 +1448,7 @@ void send_tts_async(std::string text,
     if (text.empty()) {
         return;
     }
+
     // 1) Унификация переводов строки и начальная обрезка
     //   - Все \r\n, \r, \n превращаем в пробел
     //   - Это позволяет не учитывать спецсимволы в дальнейших регулярках
@@ -1462,232 +1463,186 @@ void send_tts_async(std::string text,
         text = replace(text, "\n", " ");
     }
     trim(text);
-    if (text.empty()) {
-        return; // защита на случай, если осталась пустая строка
+    if (text.empty()) return;
+
+    // Удаление HTML-тегов и базовая нормализация HTML-сущностей
+    // ВАЖНО: НЕ удаляем глобально '=' и '/' — это ломает URL и обычный текст.
+    try {
+        static const std::regex re_html_tag(R"(<[^>]*>)", std::regex::ECMAScript);
+        text = std::regex_replace(text, re_html_tag, " ");
+    } catch (const std::regex_error& e) {
+        fprintf(stderr, "Regex error (HTML removal): %s\n", e.what());
+        text = replace(text, "<", " ");
+        text = replace(text, ">", " ");
     }
 
-// Удаление HTML-тегов и базовая нормализация HTML-сущностей
-// ВАЖНО: НЕ удаляем глобально '=' и '/' — это ломает URL и обычный текст.
-// Вместо этого: выпиливаем только теги <...> и декодируем несколько частых сущностей.
-try {
-    static const std::regex re_html_tag(R"(<[^>]*>)", std::regex::ECMAScript);
-    text = std::regex_replace(text, re_html_tag, " ");
-} catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (HTML removal): %s\n", e.what());
-    // Резерв: грубо выбросить угловые скобки
-    text = replace(text, "<", " ");
-    text = replace(text, ">", " ");
-}
+    // Декодируем самые частые HTML-сущности, но очень локально и безопасно.
+    text = replace(text, "&nbsp;", " ");
+    text = replace(text, "&amp;", "&");
+    text = replace(text, "&lt;", "<");
+    text = replace(text, "&gt;", ">");
+    text = replace(text, "&quot;", "\"");
+    text = replace(text, "&#39;", "'");
 
-// Декодируем самые частые HTML-сущности, но очень локально и безопасно.
-text = replace(text, "&nbsp;", " ");
-text = replace(text, "&amp;", "&");
-text = replace(text, "&lt;", "<");
-text = replace(text, "&gt;", ">");
-text = replace(text, "&quot;", "\"");
-text = replace(text, "&#39;", "'");
+    trim(text);
+    if (text.empty()) return;
 
-trim(text);
-if (text.empty()) return;
-    
-// Markdown: снимаем оформление, сохраняем полезное содержимое
-try {
-    static const std::regex re_code_block(R"(```(.*?)```)", std::regex::ECMAScript);
-    static const std::regex re_code_inline(R"(`([^`]*)`)", std::regex::ECMAScript);
-    static const std::regex re_img_md(R"(!\[[^\]]*\]\([^)\s]+(?:\s+"[^"]*")?\))", std::regex::ECMAScript);
-    static const std::regex re_link_md(R"(\[([^\]]*)\]\(([^)\s]+(?:\s+"[^"]*")?)\))", std::regex::ECMAScript);
-    static const std::regex re_bold1(R"(\*\*([^*]+)\*\*)", std::regex::ECMAScript);
-    static const std::regex re_bold2(R"(__([^_]+)__)", std::regex::ECMAScript);
-    static const std::regex re_ital1(R"(\*([^*]+)\*)", std::regex::ECMAScript);
-    static const std::regex re_ital2(R"(_([^_]+)_)", std::regex::ECMAScript);
-    static const std::regex re_del(R"(~~([^~]+)~~)", std::regex::ECMAScript);
-    static const std::regex re_multi_stars(R"(\*{2,})", std::regex::ECMAScript);
-    static const std::regex re_multi_unders(R"(_{2,})", std::regex::ECMAScript);
-    static const std::regex re_multi_tildes(R"(~{2,})", std::regex::ECMAScript);
+    // Markdown: снимаем оформление, сохраняем полезное содержимое
+    try {
+        static const std::regex re_code_block(R"(```(.*?)```)", std::regex::ECMAScript);
+        static const std::regex re_code_inline(R"(`([^`]*)`)", std::regex::ECMAScript);
+        static const std::regex re_img_md(R"(!\[[^\]]*\]\([^)\s]+(?:\s+"[^"]*")?\))", std::regex::ECMAScript);
+        static const std::regex re_link_md(R"(\[([^\]]*)\]\(([^)\s]+(?:\s+"[^"]*")?)\))", std::regex::ECMAScript);
+        static const std::regex re_bold1(R"(\*\*([^*]+)\*\*)", std::regex::ECMAScript);
+        static const std::regex re_bold2(R"(__([^_]+)__)", std::regex::ECMAScript);
+        static const std::regex re_ital1(R"(\*([^*]+)\*)", std::regex::ECMAScript);
+        static const std::regex re_ital2(R"(_([^_]+)_)", std::regex::ECMAScript);
+        static const std::regex re_del(R"(~~([^~]+)~~)", std::regex::ECMAScript);
+        static const std::regex re_multi_stars(R"(\*{2,})", std::regex::ECMAScript);
+        static const std::regex re_multi_unders(R"(_{2,})", std::regex::ECMAScript);
+        static const std::regex re_multi_tildes(R"(~{2,})", std::regex::ECMAScript);
 
-    // Блоки и инлайн-код — оставляем содержимое
-    text = std::regex_replace(text, re_code_block, "$1");
-    text = std::regex_replace(text, re_code_inline, "$1");
+        // Блоки и инлайн-код — оставляем содержимое
+        text = std::regex_replace(text, re_code_block, "$1");
+        text = std::regex_replace(text, re_code_inline, "$1");
 
-    // Изображения — полностью в пробел
-    text = std::regex_replace(text, re_img_md, " ");
+        // Изображения — полностью в пробел
+        text = std::regex_replace(text, re_img_md, " ");
 
-    // Ссылки — оставляем URL
-    text = std::regex_replace(text, re_link_md, "$2");
+        // Ссылки — оставляем URL
+        text = std::regex_replace(text, re_link_md, "$2");
 
-    // Снимаем жирный/курсив/зачёркнутый
-    text = std::regex_replace(text, re_bold1, "$1");
-    text = std::regex_replace(text, re_bold2, "$1");
-    text = std::regex_replace(text, re_ital1, "$1");
-    text = std::regex_replace(text, re_ital2, "$1");
-    text = std::regex_replace(text, re_del, "$1");
+        // Снимаем жирный/курсив/зачёркнутый
+        text = std::regex_replace(text, re_bold1, "$1");
+        text = std::regex_replace(text, re_bold2, "$1");
+        text = std::regex_replace(text, re_ital1, "$1");
+        text = std::regex_replace(text, re_ital2, "$1");
+        text = std::regex_replace(text, re_del, "$1");
 
-    // Добиваем висячие маркеры
-    text = std::regex_replace(text, re_multi_stars, " ");
-    text = std::regex_replace(text, re_multi_unders, " ");
-    text = std::regex_replace(text, re_multi_tildes, " ");
-} catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (Markdown removal): %s\n", e.what());
-    
-    // Резерв
-    text = replace(text, "```", " ");
-    text = replace(text, "`", " ");
-    text = replace(text, "![", " ");
-    text = replace(text, "](", " ");
-    text = replace(text, "**", " ");
-    text = replace(text, "__", " ");
-    text = replace(text, "~~", " ");
-}
-trim(text);
-if (text.empty()) return;
+        // Добиваем висячие маркеры
+        text = std::regex_replace(text, re_multi_stars, " ");
+        text = std::regex_replace(text, re_multi_unders, " ");
+        text = std::regex_replace(text, re_multi_tildes, " ");
+    } catch (const std::regex_error& e) {
+        fprintf(stderr, "Regex error (Markdown removal): %s\n", e.what());
+        text = replace(text, "```", " ");
+        text = replace(text, "`", " ");
+        text = replace(text, "![", " ");
+        text = replace(text, "](", " ");
+        text = replace(text, "**", " ");
+        text = replace(text, "__", " ");
+        text = replace(text, "~~", " ");
+    }
+    trim(text);
+    if (text.empty()) return;
 
-
-
-// Удаление содержимого в {…} с поддержкой вложенности (итеративно)
-//   - Работает в несколько проходов, пока внутри фигурных скобок что-то есть
-//   - Вложенные скобки обрабатываются за счёт повторных итераций
-try {
-    // Регулярное выражение для нахождения самой внутренней пары {…} (без вложенных скобок внутри)
-    static const std::regex re_curly(R"(\{[^{}]*\})", std::regex::ECMAScript);
-
-    bool changed = true;
-    while (changed) {
-        changed = false;
-
-        std::string t1 = std::regex_replace(text, re_curly, " ");
-        if (t1 != text) {
-            text.swap(t1);
-            changed = true;
+    // Удаление содержимого в {…} с поддержкой вложенности (итеративно)
+    try {
+        static const std::regex re_curly(R"(\{[^{}]*\})", std::regex::ECMAScript);
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            std::string t1 = std::regex_replace(text, re_curly, " ");
+            if (t1 != text) {
+                text.swap(t1);
+                changed = true;
+            }
         }
-        // Квадратные скобки больше не обрабатываются — полностью удалены
+    } catch (const std::regex_error& e) {
+        fprintf(stderr, "Regex error (curly braces removal): %s\n", e.what());
+        text = replace(text, "{", " ");
+        text = replace(text, "}", " ");
     }
-} catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (curly braces removal): %s\n", e.what());
-    // Резервная замена без регулярок (без вложенности) — просто удаляем все { и }
-    text = replace(text, "{", " ");
-    text = replace(text, "}", " ");
-}
 
-trim(text);
-if (text.empty()) {
-    return;
-}
+    trim(text);
+    if (text.empty()) return;
 
-// ----------------------------
-// Удаление одиночных "мусорных" символов (решётка, вертикальная черта, слеш-обратный)
-// и кавычек — это помогает TTS (меньше "шумных" символов).
-// ----------------------------
-try {
-    static const std::regex re_noise(R"([#\|\\])", std::regex::ECMAScript);
-    static const std::regex re_quotes(R"(["'])", std::regex::ECMAScript);
+    // Удаление одиночных "мусорных" символов и кавычек
+    try {
+        static const std::regex re_noise(R"([#\|\\])", std::regex::ECMAScript);
+        static const std::regex re_quotes(R"(["'])", std::regex::ECMAScript);
+        text = std::regex_replace(text, re_noise, " ");
+        text = std::regex_replace(text, re_quotes, " ");
+    } catch (const std::regex_error& e) {
+        fprintf(stderr, "Regex error (single-char removal): %s\n", e.what());
+        text = replace(text, "#", " ");
+        text = replace(text, "|", " ");
+        text = replace(text, "\\", " ");
+        text = replace(text, "\"", " ");
+        text = replace(text, "'", " ");
+    }
+    trim(text);
+    if (text.empty()) return;
 
-    text = std::regex_replace(text, re_noise, " ");
-    text = std::regex_replace(text, re_quotes, " ");
-} catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (single-char removal): %s\n", e.what());
-    text = replace(text, "#", " ");
-    text = replace(text, "|", " ");
-    text = replace(text, "\\", " ");
-    text = replace(text, "\"", " ");
-    text = replace(text, "'", " ");
-}
-trim(text);
-if (text.empty()) return;
+    // Нормализация пунктуации: схлопываем повторы, многоточия в точку
+    try {
+        static const std::regex re_commas(R"(,{2,})", std::regex::ECMAScript);
+        static const std::regex re_semis(R"(;{2,})", std::regex::ECMAScript);
+        static const std::regex re_dashes(R"([\-–—]{2,})", std::regex::ECMAScript);
+        static const std::regex re_bangs(R"(!{2,})", std::regex::ECMAScript);
+        static const std::regex re_qmarks(R"(\?{2,})", std::regex::ECMAScript);
+        static const std::regex re_all_dots(R"(\.{2,})", std::regex::ECMAScript); 
+        static const std::regex re_ellipsis_spaces(R"(\s*\.\s*\.\s*\.\s*)", std::regex::ECMAScript);
+        static const std::regex re_comma_before_stop(R"(\s*,\s*([.!?]))", std::regex::ECMAScript);
+        static const std::regex re_leading_comma(R"(^\s*,\s*)", std::regex::ECMAScript);
 
-//  Нормализация пунктуации: схлопываем повторы, все многоточия превращаем в точку
-try {
-    static const std::regex re_commas(R"(,{2,})", std::regex::ECMAScript);
-    static const std::regex re_semis(R"(;{2,})", std::regex::ECMAScript);
-    static const std::regex re_dashes(R"([\-–—]{2,})", std::regex::ECMAScript);
-    static const std::regex re_bangs(R"(!{2,})", std::regex::ECMAScript);
-    static const std::regex re_qmarks(R"(\?{2,})", std::regex::ECMAScript);
-    static const std::regex re_all_dots(R"(\.{2,})", std::regex::ECMAScript); // Все повторяющиеся точки
-    static const std::regex re_ellipsis_spaces(R"(\s*\.\s*\.\s*\.\s*)", std::regex::ECMAScript);
-    static const std::regex re_comma_before_stop(R"(\s*,\s*([.!?]))", std::regex::ECMAScript);
-    static const std::regex re_leading_comma(R"(^\s*,\s*)", std::regex::ECMAScript);
+        text = std::regex_replace(text, re_commas, ", ");
+        text = std::regex_replace(text, re_semis, "; ");
+        text = std::regex_replace(text, re_dashes, "- ");
+        text = std::regex_replace(text, re_bangs, "!");
+        text = std::regex_replace(text, re_qmarks, "? ");
+        text = std::regex_replace(text, re_all_dots, ".");
+        text = std::regex_replace(text, re_ellipsis_spaces, ".");
+        text = std::regex_replace(text, re_comma_before_stop, "$1");
+        text = std::regex_replace(text, re_leading_comma, "");
+    } catch (const std::regex_error& e) {
+        fprintf(stderr, "Regex error (punctuation normalization): %s\n", e.what());
+        while (text.find(",,") != std::string::npos) { text = replace(text, ",,", ","); }
+    }
+    trim(text);
+    if (text.empty()) return;
 
-    text = std::regex_replace(text, re_commas, ", ");
-    text = std::regex_replace(text, re_semis, "; ");
-    text = std::regex_replace(text, re_dashes, "- ");
-    text = std::regex_replace(text, re_bangs, "!");
-    text = std::regex_replace(text, re_qmarks, "? ");
-    
-    // Все виды многоточий и повторяющихся точек превращаем в одну точку
-    text = std::regex_replace(text, re_all_dots, ".");
-    text = std::regex_replace(text, re_ellipsis_spaces, ".");
-    
-    text = std::regex_replace(text, re_comma_before_stop, "$1");
-    text = std::regex_replace(text, re_leading_comma, "");
-} catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (punctuation normalization): %s\n", e.what());
-    while (text.find(",,") != std::string::npos) { text = replace(text, ",,", ","); }
-}
-trim(text);
-if (text.empty()) return;
-
-// Нормализуем все последовательности пробельных символов до одного пробела
+    // Нормализуем последовательности пробелов до одного
     try {
         static const std::regex re_spaces(R"(\s+)", std::regex::ECMAScript);
         text = std::regex_replace(text, re_spaces, " ");
     } catch (const std::regex_error& e) {
         fprintf(stderr, "Regex error (space normalization): %s\n", e.what());
-        // Резервная замена, если регулярки не работают
-        text = replace(text, "\r", " ");
-        text = replace(text, "\n", " ");
         text = replace(text, "\t", " ");
-        // Повторная нормализация пробелов простым способом
-        std::string temp;
-        bool last_was_space = false;
+        // (Резервный цикл обработки пробелов оставлен для надежности)
+        std::string temp; bool last_was_space = false;
         for (char c : text) {
             if (std::isspace(static_cast<unsigned char>(c))) {
-                if (!last_was_space) {
-                    temp += ' ';
-                    last_was_space = true;
-                }
-            } else {
-                temp += c;
-                last_was_space = false;
-            }
+                if (!last_was_space) { temp += ' '; last_was_space = true; }
+            } else { temp += c; last_was_space = false; }
         }
         text = temp;
     }
     trim(text);
     if (text.empty()) return;
 
-  // Удаляем префикс вида "Эмма: "
-    // Проверяем, начинается ли текст с имени говорящего и двоеточия.
+    // Удаляем префикс вида "Эмма: "
     if (text.find(speaker_wav + ":") == 0) {
-        size_t pos = speaker_wav.length() + 1; // Позиция после ":"
-        if (pos < text.length() && text[pos] == ' ') pos++; // Пропускаем пробел, если есть
-        text = text.substr(pos); // Берём подстроку после префикса
-        trim(text); // Обрезаем пробелы по краям снова
+        size_t pos = speaker_wav.length() + 1;
+        if (pos < text.length() && text[pos] == ' ') pos++;
+        text = text.substr(pos);
+        trim(text);
     }
 
-
-    // Финальная нормализация имени спикера и заключительная проверка текста
-    speaker_wav = replace(speaker_wav, ":",  "");
+    // Финальная нормализация имени спикера
+    speaker_wav = replace(speaker_wav, ":", "");
     speaker_wav = replace(speaker_wav, "\\", "");
     speaker_wav = replace(speaker_wav, "\r", "");
     speaker_wav = replace(speaker_wav, "\"", "");
     trim(speaker_wav);
+    if (speaker_wav.size() < 2) speaker_wav = "default";
 
-    // Минимальная длина имени спикера
-    if (speaker_wav.size() < 2) {
-        speaker_wav = "default";
-    }
-
-    // Заключительная проверка текста
     trim(text);
     if (text.empty()) return;
 
-
-    // ----------------------------
-    // Подготовка JSON и отправка через cURL (как в исходнике, без изменений логики)
-    // ----------------------------
-    // локальная лямбда для экранирования специальных символов в JSON
+    // Подготовка JSON
     auto escape_json = [](const std::string& s) -> std::string {
-        std::string result;
-        result.reserve(s.size()); // Предварительное резервирование памяти
+        std::string result; result.reserve(s.size());
         for (unsigned char c : s) {
             switch (c) {
                 case '"':  result += "\\\""; break;
@@ -1698,11 +1653,9 @@ if (text.empty()) return;
                 case '\r': result += "\\r";  break;
                 case '\t': result += "\\t";  break;
                 default:
-                    if (c >= 32 && c != 127) {
-                        result += static_cast<char>(c);
-                    } else {
-                        char buf[8];
-                        std::snprintf(buf, sizeof(buf), "\\u%04x", (unsigned int)c);
+                    if (c >= 32 && c != 127) result += static_cast<char>(c);
+                    else {
+                        char buf[8]; std::snprintf(buf, sizeof(buf), "\\u%04x", (unsigned int)c);
                         result += buf;
                     }
             }
@@ -1710,41 +1663,30 @@ if (text.empty()) return;
         return result;
     };
 
-    std::string escaped_text = escape_json(text);
-    std::string escaped_speaker = escape_json(speaker_wav);
-    std::string escaped_language = escape_json(language);
+    std::string data = "{\"text\":\"" + escape_json(text) + "\", "
+                       "\"language\":\"" + escape_json(language) + "\", "
+                       "\"speaker_wav\":\"" + escape_json(speaker_wav) + "\", "
+                       "\"reply_part\":" + std::to_string(reply_part) + "}";
 
-    // Формируем данные JSON для POST
-    std::string data = "{\"text\":\"" + escaped_text + "\", "
-                       "\"language\":\"" + escaped_language + "\", "
-                       "\"speaker_wav\":\"" + escaped_speaker + "\", "
-                       "\"reply_part\":" + std::to_string(reply_part) +
-                       "}";
-
-    // Отладочный вывод JSON 
-    // fprintf(stderr, "DEBUG (Minimal Norm): %s\n", data.c_str());
-
-    // Формируем URL и делаем запрос
-    tts_url = tts_url + "tts_to_audio/";
+    // Формируем URL и делаем запрос через cURL
+    std::string full_url = tts_url + "tts_to_audio/";
     CURL* http_handle = curl_easy_init();
     if (http_handle) {
         struct curl_slist* headers = nullptr;
         headers = curl_slist_append(headers, "Content-Type: application/json");
         curl_easy_setopt(http_handle, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(http_handle, CURLOPT_URL, tts_url.c_str());
+        curl_easy_setopt(http_handle, CURLOPT_URL, full_url.c_str());
         curl_easy_setopt(http_handle, CURLOPT_POSTFIELDS, data.c_str());
-        curl_easy_setopt(http_handle, CURLOPT_VERBOSE, 0L); // Отключить подробный вывод
+        curl_easy_setopt(http_handle, CURLOPT_VERBOSE, 0L);
 
-        // Получение ответа
         std::string responseData;
         curl_easy_setopt(http_handle, CURLOPT_WRITEDATA, &responseData);
         curl_easy_setopt(http_handle, CURLOPT_WRITEFUNCTION, WriteCallback);
 
-        CURLcode res = curl_easy_perform(http_handle);
-        // Освобождаем ресурсы ВСЕГДА — независимо от успеха
-        curl_slist_free_all(headers); // освобождаем заголовки даже при ошибке!
-        curl_easy_cleanup(http_handle);
+        curl_easy_perform(http_handle);
 
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(http_handle);
     } else {
         fprintf(stderr, "Failed to initialize cURL handle\n");
     }
