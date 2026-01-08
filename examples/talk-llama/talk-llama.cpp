@@ -554,27 +554,16 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "\n");
 }
 
-// ### ГЛОБАЛЬНЫЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (trim, replace, LowerCase и т.д.) ###
+// ### ГЛОБАЛЬНЫЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ###
 
-// Функция возвращает текущее время в секундах с момента Unix-эпохи (1 января 1970 года)
-// с точностью до миллисекунд, представленное в формате float.
+// Возвращает текущее время в секундах с точностью до миллисекунд
 float get_current_time_ms() {
-    // Получаем текущую точку времени с высоким разрешением
     auto now = std::chrono::high_resolution_clock::now();
-
-    // Вычисляем продолжительность времени от Unix-эпохи до текущего момента
     auto duration = now.time_since_epoch();
-
-    // Преобразуем продолжительность в миллисекунды и получаем количество миллисекунд
-    // Затем делим на 1000, чтобы получить значение в секундах с дробной частью,
-    // представляющей миллисекунды
-    float millis = (float)std::chrono::duration_cast<std::chrono::milliseconds>(duration).count() / 1000;
-
-    // Возвращаем результат
-    return millis;
+    return std::chrono::duration_cast<std::chrono::milliseconds>(duration).count() / 1000.0f;
 }
 
-// 🔒 БЕЗОПАСНАЯ ФУНКЦИЯ ДОБАВЛЕНИЯ ПОТОКА
+// Потокобезопасное добавление задачи в вектор потоков
 static void safe_thread_emplace(std::vector<std::thread>& threads_vec, std::function<void()> task) {
     std::lock_guard<std::mutex> lock(g_threads_mutex);
     try {
@@ -584,44 +573,41 @@ static void safe_thread_emplace(std::vector<std::thread>& threads_vec, std::func
     }
 }
 
-
-// Улучшенная функция для транскрибации аудио с использованием модели Whisper
+// Функция транскрибации аудио с использованием Whisper
 static std::string transcribe(
-    whisper_context * ctx, // Контекст Whisper.
-    const whisper_params & params, // Параметры транскрибации.
-    const std::vector<float> & pcmf32, // Аудиоданные в формате float32.
-    const std::string & prompt_text, // Текст промпта.
-    float & prob, // Вероятность транскрибированного текста.
-    int64_t & t_ms) { // Время выполнения транскрибации в миллисекундах.
-																   
+    whisper_context* ctx,               // Контекст Whisper
+    const whisper_params& params,       // Параметры транскрибации
+    const std::vector<float>& pcmf32,   // Аудиоданные в формате float32
+    const std::string& prompt_text,     // Текст промпта (не используется в текущей реализации)
+    float& prob,                        // Средняя вероятность транскрипции
+    int64_t& t_ms) {                    // Время выполнения в миллисекундах
     
-    // Начало измерения времени выполнения функции
-   // Проверка валидности входных параметров
-    if (!ctx) {
-        std::cerr << "Ошибка: Контекст Whisper не инициализирован" << std::endl;
-        return "";
-    } 
-    const auto t_start = std::chrono::high_resolution_clock::now();
+    // Инициализация выходных параметров
     prob = 0.0f;
     t_ms = 0;
 
-    // Создаём копию аудио для обработки, так как normalize_audio изменяет данные по ссылке
-    // Имя processed_audio оставлено для ясности, несмотря на удаление шумоподавления
-    std::vector<float> processed_audio = pcmf32; 
-
-    // Проверка на пустоту оригинального вектора pcmf32 (проверка копии)
-    if (processed_audio.empty()) {
-        std::cerr << "Error: Input audio (pcmf32) is empty." << std::endl;
+    // Проверка входных параметров
+    if (!ctx) {
+        std::cerr << "Ошибка: Контекст Whisper не инициализирован" << std::endl;
+        return "";
+    }
+    
+    if (pcmf32.empty()) {
+        std::cerr << "Ошибка: Входные аудиоданные пусты" << std::endl;
         return "";
     }
 
-    // Установка параметров для модели Whisper
-    whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+    // Начало замера времени
+    const auto t_start = std::chrono::high_resolution_clock::now();
 
-    // Whisper не использует промпт — передаём пустой контекст
+    // Настройка параметров Whisper
+    whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+    
+    // Настройка промпта (в текущей реализации не используется)
     wparams.prompt_tokens = nullptr;
     wparams.prompt_n_tokens = 0;
-
+    
+    // Базовые параметры вывода
     wparams.print_progress = false;
     wparams.print_special = params.print_special;
     wparams.print_realtime = false;
@@ -629,93 +615,99 @@ static std::string transcribe(
     wparams.translate = params.translate;
     wparams.no_context = true;
     wparams.single_segment = true;
-												 
-													   
-												
 
-{
-    int model_text_ctx = whisper_n_text_ctx(ctx);
-    int mt = (params.max_tokens > 0 ? params.max_tokens : 64);
-    if (mt > model_text_ctx) {
-        std::cerr << "Warning: max_tokens (" << mt
-                  << ") is larger than model limit (" << model_text_ctx
-                  << "), clamping." << std::endl;
-        mt = model_text_ctx;
+    // Настройка максимального количества токенов с проверкой лимитов модели
+    {
+        // Явное приведение типов для избежания предупреждений компилятора
+        int model_text_ctx = static_cast<int>(whisper_n_text_ctx(ctx));
+        int mt = (params.max_tokens > 0 ? params.max_tokens : 64);
+        
+        if (mt > model_text_ctx) {
+            std::cerr << "Предупреждение: max_tokens (" << mt 
+                      << ") превышает лимит модели (" << model_text_ctx 
+                      << "), применяется лимит модели" << std::endl;
+            mt = model_text_ctx;
+        }
+        wparams.max_tokens = mt;
     }
-    wparams.max_tokens = mt;
-}
 
-// 🔧 Проверка audio_ctx, чтобы не превысить лимит модели
-wparams.audio_ctx = params.audio_ctx;
-int model_audio_ctx = whisper_n_audio_ctx(ctx);
-if (wparams.audio_ctx > model_audio_ctx) {
-    std::cerr << "Warning: audio_ctx (" << wparams.audio_ctx
-              << ") is larger than model limit (" << model_audio_ctx
-              << "), clamping." << std::endl;
-    wparams.audio_ctx = model_audio_ctx;
-}
+    // Настройка аудиоконтекста с проверкой лимитов модели
+    wparams.audio_ctx = params.audio_ctx;
+    int model_audio_ctx = static_cast<int>(whisper_n_audio_ctx(ctx));
+    
+    if (wparams.audio_ctx > model_audio_ctx) {
+        std::cerr << "Предупреждение: audio_ctx (" << wparams.audio_ctx 
+                  << ") превышает лимит модели (" << model_audio_ctx 
+                  << "), применяется лимит модели" << std::endl;
+        wparams.audio_ctx = model_audio_ctx;
+    }
 
-wparams.language = params.language.c_str();
-wparams.n_threads = params.n_threads;
+    // Настройка языка и потоков
+    wparams.language = params.language.empty() ? nullptr : params.language.c_str();
+    wparams.n_threads = params.n_threads;
 
-// Выполнение транскрипции аудио — только аудио, без промпта!
-if (whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size()) != 0) {
-    std::cerr << "Error: Failed to transcribe audio." << std::endl;
-    return ""; // Возвращаем пустую строку в случае ошибки.
-}
+    // Выполнение транскрипции
+    if (whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size()) != 0) {
+        std::cerr << "Ошибка: Не удалось выполнить транскрипцию аудио" << std::endl;
+        
+        // Рассчёт времени выполнения даже при ошибке
+        const auto t_end = std::chrono::high_resolution_clock::now();
+        t_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+        
+        return "";
+    }
 
-    // Получаем результат транскрибации.
+    // Сбор результатов транскрипции
     int prob_n = 0;
     std::string result;
-
+    
     const int n_segments = whisper_full_n_segments(ctx);
     for (int i = 0; i < n_segments; ++i) {
-        const char * text = whisper_full_get_segment_text(ctx, i); // Получаем текст сегмента.
-        result += text; // Добавляем текст сегмента к результату.
-					   
-
-        const int n_tokens = whisper_full_n_tokens(ctx, i); // Получаем количество токенов в сегменте.
+        const char* text = whisper_full_get_segment_text(ctx, i);
+        result += text;
+        
+        // Расчёт вероятности для сегмента
+        const int n_tokens = whisper_full_n_tokens(ctx, i);
         for (int j = 0; j < n_tokens; ++j) {
-            const auto token = whisper_full_get_token_data(ctx, i, j); // Получаем данные токена.
-            prob += token.p; // Добавляем вероятность токена к общей вероятности.
-            ++prob_n; // Увеличиваем счетчик токенов.
-					 
+            const auto token = whisper_full_get_token_data(ctx, i, j);
+            prob += token.p;
+            ++prob_n;
         }
     }
 
-    // Безопасное вычисление средней вероятности
+    // Расчёт средней вероятности
     if (prob_n > 0) {
-        prob /= static_cast<float>(prob_n); // Явное приведение типа
+        prob /= static_cast<float>(prob_n);
     } else {
-        prob = 0.0f; // Устанавливаем вероятность 0 если нет токенов
+        prob = 0.0f;
         std::cerr << "Предупреждение: Нет токенов для вычисления вероятности" << std::endl;
     }
 
-    // Замеряем время окончания выполнения функции.
+    // Замер времени выполнения
     const auto t_end = std::chrono::high_resolution_clock::now();
     auto duration = t_end - t_start;
-
-    // Проверяем что время не отрицательное (на случай проблем с системными часами)
+    
+    // Защита от отрицательного времени (редкий случай проблем с системными часами)
     if (duration.count() < 0) {
-        std::cerr << "Предупреждение: Отрицательное время выполнения, использую 0" << std::endl;
+        std::cerr << "Предупреждение: Обнаружено отрицательное время выполнения" << std::endl;
         t_ms = 0;
     } else {
         t_ms = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
     }
 
-    return result; // Возвращаем результат транскрибации
-    }
+    return result;
+}
 
-// Функция для получения слов из строки
-static std::vector<std::string> get_words(const std::string &txt) {
+// Разбивает строку на слова
+static std::vector<std::string> get_words(const std::string& txt) {
     std::vector<std::string> words;
-
     std::istringstream iss(txt);
     std::string word;
+    
     while (iss >> word) {
-        words.emplace_back(std::move(word)); // Используем emplace_back и std::move
+        words.emplace_back(std::move(word));
     }
-
+    
     return words;
 }
 
