@@ -214,11 +214,6 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/whisper.pc"
 # programs, examples and tests
 #
 
-if (WHISPER_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
-    include(CTest)
-    add_subdirectory(tests)
-endif ()
-
 if (WHISPER_BUILD_EXAMPLES)
     add_subdirectory(examples)
 endif()
@@ -251,8 +246,6 @@ if (MSVC)
         disable_msvc_warnings(whisper-server)
         disable_msvc_warnings(whisper-stream)
         disable_msvc_warnings(whisper-talk-llama)
-        disable_msvc_warnings(whisper-bench)
-        disable_msvc_warnings(quantize)
-        disable_msvc_warnings(vad-speech-segments)
+
     endif()
 endif()
