@@ -24,7 +24,7 @@
 #include <stdexcept>
 
 #if defined(_MSC_VER)
-#pragma warning(disable: 4244 4267) // possible loss of data
+#pragma warning(disable: 4244 4267 4018) // possible loss of data
 #endif
 
 //
@@ -666,7 +666,7 @@ static void llama_params_fit_impl(
         }
 
         // try to fit at least part of one more layer
-        if (ngl_per_device[id_dense_start].n_layer > (id < nd - 1 ? 0 : 1)) {
+			if (ngl_per_device[id_dense_start].n_layer > (uint32_t)(id < nd - 1 ? 0 : 1)) {
             std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
             size_t id_dense_start_test = id_dense_start;
             ngl_per_device_test[id_dense_start_test].n_layer--;
