@@ -738,8 +738,6 @@ std::string getTempDir() {
 #endif
 }
 
-
-
 // Записывает в файл значение 0 или 1, чтобы разрешить или запретить воспроизведение XTTS
 // @path: ссылка на строку, куда будет записан полный путь к файлу (возвращается для отладки)
 // @xtts_play_allowed: 0 — воспроизведение запрещено, 1 — разрешено
@@ -1376,8 +1374,7 @@ void send_tts_async(std::string text,
     
     try {
             static const std::regex re_newline(R"(\r\n|\r|\n)", std::regex::ECMAScript);
-            // ЗАМЕНЯЕМ НА \n, а не на пробел, чтобы Python видел структуру списков
-            text = std::regex_replace(text, re_newline, "\n");
+            text = std::regex_replace(text, re_newline, " ");
         } catch (const std::regex_error& e) {
             fprintf(stderr, "Regex error (newline normalization): %s\n", e.what());
             text = replace(text, "\r\n", "\n");
@@ -1407,95 +1404,74 @@ void send_tts_async(std::string text,
     trim(text);
     if (text.empty()) return;
 
-    // Markdown: снимаем оформление, сохраняем полезное содержимое
+// === ОБЪЕДИНЕННАЯ ОБРАБОТКА MARKDOWN, СКОБОК (ПАУЗ) И МУСОРА ===
     try {
+        // 1. ОПРЕДЕЛЕНИЕ РЕГУЛЯРОК
         static const std::regex re_code_block(R"(```(.*?)```)", std::regex::ECMAScript);
         static const std::regex re_code_inline(R"(`([^`]*)`)", std::regex::ECMAScript);
-        static const std::regex re_img_md(R"(!\[[^\]]*\]\([^)\s]+(?:\s+"[^"]*")?\))", std::regex::ECMAScript);
+        static const std::regex re_img_md(R"!(!\[[^\]]*\]\([^)\s]+(?:\s+"[^"]*")?\))!", std::regex::ECMAScript);
         static const std::regex re_link_md(R"(\[([^\]]*)\]\(([^)\s]+(?:\s+"[^"]*")?)\))", std::regex::ECMAScript);
         static const std::regex re_bold1(R"(\*\*([^*]+)\*\*)", std::regex::ECMAScript);
         static const std::regex re_bold2(R"(__([^_]+)__)", std::regex::ECMAScript);
         static const std::regex re_ital1(R"(\*([^*]+)\*)", std::regex::ECMAScript);
         static const std::regex re_ital2(R"(_([^_]+)_)", std::regex::ECMAScript);
         static const std::regex re_del(R"(~~([^~]+)~~)", std::regex::ECMAScript);
-        static const std::regex re_multi_stars(R"(\*{2,})", std::regex::ECMAScript);
-        static const std::regex re_multi_unders(R"(_{2,})", std::regex::ECMAScript);
-        static const std::regex re_multi_tildes(R"(~{2,})", std::regex::ECMAScript);
+        
+        // Регулярки для скобок (превращаем в текст с запятой для паузы)
+        static const std::regex re_parens(R"(\(([^)]+)\))", std::regex::ECMAScript);
+        static const std::regex re_curly(R"(\{([^{}]+)\})", std::regex::ECMAScript);
+        static const std::regex re_square(R"(\[([^\]]+)\])", std::regex::ECMAScript);
 
-        // Блоки и инлайн-код — оставляем содержимое
+        // Технический мусор (решетки, черты, слэши)
+        static const std::regex re_noise(R"([#\|\\])", std::regex::ECMAScript);
+
+        // 2. ПРИМЕНЕНИЕ ЗАМЕН
         text = std::regex_replace(text, re_code_block, "$1");
         text = std::regex_replace(text, re_code_inline, "$1");
-
-        // Изображения — полностью в пробел
         text = std::regex_replace(text, re_img_md, " ");
-
-        // Ссылки — оставляем URL
         text = std::regex_replace(text, re_link_md, "$2");
 
-        // Снимаем жирный/курсив/зачёркнутый с добавлением пробелов (защита от склеивания) чтобы **Привет**Мир не превратилось в ПриветМир.
+        // Умные паузы: вынимаем содержимое скобок и ставим запятую
+        text = std::regex_replace(text, re_parens, " $1, ");
+        text = std::regex_replace(text, re_curly, " $1, ");
+        text = std::regex_replace(text, re_square, " $1, ");
+
+        // Снимаем жирный/курсив
         text = std::regex_replace(text, re_bold1, " $1 ");
         text = std::regex_replace(text, re_bold2, " $1 ");
         text = std::regex_replace(text, re_ital1, " $1 ");
         text = std::regex_replace(text, re_ital2, " $1 ");
         text = std::regex_replace(text, re_del, " $1 ");
 
-        // Добиваем висячие маркеры
+        // Удаляем технический мусор
+        text = std::regex_replace(text, re_noise, " ");
+
+        // Подчищаем висячие маркеры
+        static const std::regex re_multi_stars(R"(\*{2,})", std::regex::ECMAScript);
+        static const std::regex re_multi_unders(R"(_{2,})", std::regex::ECMAScript);
+        static const std::regex re_multi_tildes(R"(~{2,})", std::regex::ECMAScript);
         text = std::regex_replace(text, re_multi_stars, " ");
         text = std::regex_replace(text, re_multi_unders, " ");
         text = std::regex_replace(text, re_multi_tildes, " ");
 
     } catch (const std::regex_error& e) {
-        fprintf(stderr, "Regex error (Markdown removal): %s\n", e.what());
-        text = replace(text, "```", " ");
-        text = replace(text, "`", " ");
-        text = replace(text, "![", " ");
-        text = replace(text, "](", " ");
-        text = replace(text, "**", " ");
-        text = replace(text, "__", " ");
-        text = replace(text, "~~", " ");
-    }
-    trim(text);
-    if (text.empty()) return;
-
-    // Удаление содержимого в {…} с поддержкой вложенности (итеративно)
-    try {
-        static const std::regex re_curly(R"(\{[^{}]*\})", std::regex::ECMAScript);
-        bool changed = true;
-        while (changed) {
-            changed = false;
-            std::string t1 = std::regex_replace(text, re_curly, " ");
-            if (t1 != text) {
-                text.swap(t1);
-                changed = true;
-            }
-        }
-    } catch (const std::regex_error& e) {
-        fprintf(stderr, "Regex error (curly braces removal): %s\n", e.what());
-        text = replace(text, "{", " ");
-        text = replace(text, "}", " ");
+        fprintf(stderr, "Regex error (Markdown/Braces/Noise): %s\n", e.what());
     }
 
     trim(text);
     if (text.empty()) return;
 
-    // Удаление только реального мусора (#, |, \). 
-    // Кавычки оставляем, они нужны XTTS для интонации "цитирования".
+    // === КОРРЕКЦИЯ ПУНКТУАЦИИ (после добавления запятых из скобок) ===
     try {
-        static const std::regex re_noise(R"([#\|\\])", std::regex::ECMAScript);
-        text = std::regex_replace(text, re_noise, " ");
+        // Чтобы не было "Привет! , " или "Мир. , "
+        static const std::regex re_fix_punct(R"(([.!?;])\s*,)", std::regex::ECMAScript);
+        text = std::regex_replace(text, re_fix_punct, "$1 ");
         
-        // Опционально: Если хотите удалить кавычки, но оставить апострофы внутри слов (don't):
-        // static const std::regex re_clean_quotes(R"(["“])", std::regex::ECMAScript); 
-        // text = std::regex_replace(text, re_clean_quotes, ""); 
-        // Но лучше оставить как есть.
-    } catch (const std::regex_error& e) {
-        // ... старый код catch, но уберите replace для quotes
-        text = replace(text, "#", " ");
-        text = replace(text, "|", " ");
-        text = replace(text, "\\", " ");
-        // text = replace(text, "\"", " "); // <-- Закомментировать
-        // text = replace(text, "'", " ");  // <-- Закомментировать
-    }
+        // Чтобы не было двойных запятых ", ,"
+        static const std::regex re_double_comma(R"(,\s*,)", std::regex::ECMAScript);
+        text = std::regex_replace(text, re_double_comma, ", ");
+    } catch (...) {}
+
     trim(text);
     if (text.empty()) return;
 
@@ -1546,8 +1522,49 @@ void send_tts_async(std::string text,
         }
         text = temp;
     }
-    trim(text);
-    if (text.empty()) return;
+
+// --- ОЧИСТКА ЭЛЕМЕНТОВ СПИСКА ---
+try {
+    // Обновленная регулярка:
+    // ^\s* - любые пробелы в начале
+    // (
+    //   \d+[\.\)]    - цифры с точкой или скобкой (1. или 1))
+    //   | [A-Za-zА-Яа-яЁё][\.\)] - одна буква с точкой или скобкой (а. или B))
+    //   | [IVXLCDMivxlcdm]+[\.\)] - РИМСКИЕ ЦИФРЫ с точкой или скобкой (IV. или XI))
+    //   | [\-\*\+\>\|#]+ - маркеры: тире, звезды, плюсы, цитирование (>), решетки
+    //   | \[.*?\]       - текст в квадратных скобках ([1] или [x])
+    // )
+    // \s* - любые пробелы после маркера
+    static const std::regex re_list_markers(
+        R"(^\s*(\d+[\.\)]|[A-Za-zА-Яа-яЁё][\.\)]|[IVXLCDMivxlcdm]+[\.\)]|[\-\*\+\>\|#]+|\[.*?\])\s*)", 
+        std::regex::ECMAScript
+    );
+    
+    text = std::regex_replace(text, re_list_markers, "");
+} catch (const std::regex_error& e) {
+    fprintf(stderr, "Regex error (list cleanup): %s\n", e.what());
+}
+
+trim(text);
+if (text.empty()) return;
+// --------------------------------
+
+     // Проверка: есть ли в тексте буквы? (чтобы не отправлять "1.", "2." и т.д.)
+    bool has_letters = false;
+    for (unsigned char c : text) {
+        // Если нашли латиницу, кириллицу (UTF-8 > 127) или цифру, которая может быть словом
+        // Но лучше строго: буквы или символы UTF-8
+        if (std::isalpha(c) || c > 127) {
+            has_letters = true;
+            break;
+        }
+    }
+
+    // Если букв нет (только цифры, точки, тире) — игнорируем этот кусок текста
+    if (!has_letters) {
+        return; 
+    }
+    // --- КОНЕЦ ПРОВЕРКИ ---
 
     // Удаляем префикс вида "Эмма: "
     if (text.find(speaker_wav + ":") == 0) {
@@ -1568,16 +1585,25 @@ void send_tts_async(std::string text,
     trim(text);
     if (text.empty()) return;
 
-    // ФИНАЛЬНАЯ ПРОВЕРКА: Если после всех регулярок букв не осталось — не отправляем!
+    // 3. ДОБАВЛЯЕМ ТОЧКУ для интонации (если знаков нет)
+    if (!text.empty() && !strpbrk(&text.back(), ".!?")) {
+        text += ".";
+    }
+
+    // 4. ФИНАЛЬНЫЙ ФИЛЬТР (Защита от 400 Bad Request)
     bool final_content_check = false;
     for (unsigned char c : text) {
+        // Проверяем наличие букв или цифр (включая кириллицу)
         if (std::isalnum((unsigned char)c) || (unsigned char)c > 127) {
             final_content_check = true;
             break;
         }
     }
-    if (!final_content_check) return; 
 
+    // ВАЖНО: Если букв нет ИЛИ текст слишком короткий (например, только точка или запятая)
+    if (!final_content_check || text.length() < 2) {
+        return; 
+    }
     // Подготовка JSON
     auto escape_json = [](const std::string& s) -> std::string {
         std::string result; result.reserve(s.size());
@@ -1591,15 +1617,17 @@ void send_tts_async(std::string text,
                 case '\r': result += "\\r";  break;
                 case '\t': result += "\\t";  break;
                 default:
-                // Все печатные символы и UTF-8 (включая русские буквы) пропускаем.
-                // Коды < 32 и код 127 экранируем в \u00xx
-                if (c >= 32 && c != 127) {
-                    result += static_cast<char>(c);
-                } else {
-                    char buf[8]; 
-                    std::snprintf(buf, sizeof(buf), "\\u%04x", (unsigned int)(c & 0xFF));
-                    result += buf;
-                }
+                    // КРИТИЧЕСКАЯ ПРАВКА: 
+                    // 1. Все символы с кодом >= 128 (кириллица UTF-8) пропускаем как есть.
+                    // 2. Печатные символы ASCII (32-126) пропускаем как есть.
+                    // 3. Только управляющие символы (< 32) кодируем в \u00xx.
+                    if (c >= 32) {
+                        result += static_cast<char>(c);
+                    } else {
+                        char buf[8]; 
+                        std::snprintf(buf, sizeof(buf), "\\u%04x", (unsigned int)c);
+                        result += buf;
+                    }
             }
         }
         return result;
