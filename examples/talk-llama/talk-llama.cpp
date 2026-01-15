@@ -1363,45 +1363,48 @@ std::string emb_to_str(llama_context* ctx_llama, const std::vector<llama_token>&
 }
 
 // Асинхронная функция для отправки текста в TTS (Text-to-Speech) сервис
-// ВСЕ параметры передаются по значению для безопасности в многопоточном окружении.
+// Все параметры передаются по значению для безопасности в многопоточном окружении.
+// ВСЕ регулярные выражения компилируются ОДИН РАЗ при первом вызове функции.
 // Использует оптимизированные regex и безопасную обработку UTF-8.
 void send_tts_async(std::string text,
                     std::string speaker_wav = "Emma",
                     std::string language = "ru",
                     std::string tts_url = "http://localhost:8020/",
                     int reply_part = 0) {
-    
-    // 1. ПРОВЕРКА ВХОДНЫХ ДАННЫХ И БАЗОВАЯ ЗАЩИТА
+
+    // Быстрая защита: если пусто — сразу выходим
     if (text.empty()) {
-        return; // Быстрый выход при пустом тексте
+        return;
     }
 
-    // 2. БАЗОВАЯ НОРМАЛИЗАЦИЯ ТЕКСТА
-    // 2.1 Унификация переводов строк: все варианты в пробел
+    // 1) Унификация переводов строки и начальная обрезка
+    //   - Все \r\n, \r, \n превращаем в пробел
+    //   - Это позволяет не учитывать спецсимволы в дальнейших регулярках
+    //   - После замены обязательно trim()
     try {
         static const std::regex re_newline(R"(\r\n|\r|\n)", std::regex::ECMAScript);
         text = std::regex_replace(text, re_newline, " ");
     } catch (const std::regex_error& e) {
-        fprintf(stderr, "Ошибка regex при нормализации переносов: %s\n", e.what());
+        fprintf(stderr, "Regex error (newline normalization): %s\n", e.what());
         text = replace(text, "\r\n", " ");
         text = replace(text, "\r", " ");
         text = replace(text, "\n", " ");
     }
-    
     trim(text);
-    if (text.empty()) return; // Защита после начальной очистки
+    if (text.empty()) return;
 
-    // 2.2 Удаление HTML-тегов
+    // Удаление HTML-тегов и базовая нормализация HTML-сущностей
+    // ВАЖНО: НЕ удаляем глобально '=' и '/' — это ломает URL и обычный текст.
     try {
         static const std::regex re_html_tag(R"(<[^>]*>)", std::regex::ECMAScript);
         text = std::regex_replace(text, re_html_tag, " ");
     } catch (const std::regex_error& e) {
-        fprintf(stderr, "Ошибка regex при удалении HTML: %s\n", e.what());
+        fprintf(stderr, "Regex error (HTML removal): %s\n", e.what());
         text = replace(text, "<", " ");
         text = replace(text, ">", " ");
     }
 
-    // 2.3 Декодирование HTML-сущностей (самые частые)
+    // Декодируем самые частые HTML-сущности, но очень локально и безопасно.
     text = replace(text, "&nbsp;", " ");
     text = replace(text, "&amp;", "&");
     text = replace(text, "&lt;", "<");
@@ -1410,156 +1413,35 @@ void send_tts_async(std::string text,
     text = replace(text, "&#39;", "'");
     text = replace(text, "&apos;", "'");
 
-    trim(text);
-    if (text.empty()) return;
-
-    // [БЛОК 2.4] ДОПОЛНИТЕЛЬНОЕ ДЕКОДИРОВАНИЕ HTML-СУЩНОСТЕЙ
-    // Исправление проблем с &quot;, &apos;, &#39;, &#34; и другими
-    try {
-        // Обработка дополнительных HTML сущностей
-        struct HtmlEntity {
-            const char* entity;
-            const char* replacement;
-        };
-        
-        static const HtmlEntity additional_entities[] = {
-            {"&#34;", "\""},   // Альтернатива &quot;
-            {"&#x22;", "\""},  // Шестнадцатеричная версия
-            {"&#x27;", "'"},   // Шестнадцатеричная версия апострофа
-            {"&rsquo;", "'"},  // Правая одинарная кавычка
-            {"&lsquo;", "'"},  // Левая одинарная кавычка
-            {"&rdquo;", "\""}, // Правая двойная кавычка
-            {"&ldquo;", "\""}, // Левая двойная кавычка
-            {"&mdash;", "-"},  // Длинное тире
-            {"&ndash;", "-"},  // Короткое тире
-            {"&hellip;", "..."}, // Многоточие
-            {"&laquo;", "\""}, // Левая угловая кавычка
-            {"&raquo;", "\""}, // Правая угловая кавычка
-            {"&#8217;", "'"},  // Апостроф в Windows-1252
-            {"&#8220;", "\""}, // Левая двойная кавычка в Windows-1252
-            {"&#8221;", "\""}, // Правая двойная кавычка в Windows-1252
-            {"&#8211;", "-"},  // Короткое тире в Windows-1252
-            {"&#8212;", "-"},  // Длинное тире в Windows-1252
-            {"&#8230;", "..."}, // Многоточие в Windows-1252
-        };
-        
-        for (const auto& entity : additional_entities) {
-            text = replace(text, entity.entity, entity.replacement);
-        }
-        
-        // Обработка числовых сущностей (десятичных) - простой подход
-        std::string result;
-        size_t pos = 0;
-        while (pos < text.size()) {
-            if (pos + 3 < text.size() && text[pos] == '&' && text[pos + 1] == '#') {
-                size_t end_pos = text.find(';', pos);
-                if (end_pos != std::string::npos && end_pos - pos <= 8) {
-                    // Пытаемся извлечь число
-                    std::string num_str = text.substr(pos + 2, end_pos - pos - 2);
-                    bool is_hex = false;
-                    
-                    // Проверяем шестнадцатеричное ли это
-                    if (!num_str.empty() && (num_str[0] == 'x' || num_str[0] == 'X')) {
-                        is_hex = true;
-                        num_str = num_str.substr(1);
-                    }
-                    
-                    if (!num_str.empty()) {
-                        try {
-                            int code = 0;
-                            if (is_hex) {
-                                code = std::stoi(num_str, nullptr, 16);
-                            } else {
-                                code = std::stoi(num_str);
-                            }
-                            
-                            // Заменяем распространенные коды
-                            if (code == 34 || code == 0x22) {
-                                result += "\"";
-                                pos = end_pos + 1;
-                                continue;
-                            } else if (code == 39 || code == 0x27) {
-                                result += "'";
-                                pos = end_pos + 1;
-                                continue;
-                            } else if (code == 160 || code == 0xA0) {
-                                result += " ";
-                                pos = end_pos + 1;
-                                continue;
-                            } else if (code >= 32 && code <= 126) {
-                                result += static_cast<char>(code);
-                                pos = end_pos + 1;
-                                continue;
-                            }
-                        } catch (...) {
-                            // Если преобразование не удалось, оставляем как есть
-                        }
-                    }
-                }
-            }
-            
-            // Если не HTML entity, копируем символ
-            result += text[pos];
-            pos++;
-        }
-        
-        text = std::move(result);
-        
-    } catch (const std::exception& e) {
-        fprintf(stderr, "Ошибка при декодировании HTML сущностей: %s\n", e.what());
-        // Резервная обработка: удаляем оставшиеся &;
-        std::string result;
-        result.reserve(text.size());
-        bool in_entity = false;
-        for (size_t i = 0; i < text.size(); ++i) {
-            if (text[i] == '&') {
-                in_entity = true;
-                result += ' ';
-            } else if (text[i] == ';' && in_entity) {
-                in_entity = false;
-            } else if (!in_entity) {
-                result += text[i];
-            }
-        }
-        text = std::move(result);
-    }
+    // Дополнительные HTML-сущности для лучшей обработки
+    text = replace(text, "&#34;", "\"");
+    text = replace(text, "&rsquo;", "'");
+    text = replace(text, "&lsquo;", "'");
+    text = replace(text, "&rdquo;", "\"");
+    text = replace(text, "&ldquo;", "\"");
+    text = replace(text, "&mdash;", "-");
+    text = replace(text, "&ndash;", "-");
+    text = replace(text, "&hellip;", "...");
 
     trim(text);
     if (text.empty()) return;
 
-    // [БЛОК 2.5] ОБРАБОТКА UNICODE СИМВОЛОВ И "УМНЫХ" КАВЫЧЕК
-    // Безопасная обработка для Windows
-    try {
-        // Заменяем UTF-8 последовательности для "умных" кавычек и тире
-        std::vector<std::pair<std::string, std::string>> utf8_replacements = {
-            {"\xE2\x80\x9C", "\""}, // Левая двойная кавычка
-            {"\xE2\x80\x9D", "\""}, // Правая двойная кавычка
-            {"\xE2\x80\x98", "'"},  // Левая одинарная кавычка
-            {"\xE2\x80\x99", "'"},  // Правая одинарная кавычка (апостроф)
-            {"\xE2\x80\x93", "-"},  // Короткое тире
-            {"\xE2\x80\x94", "-"},  // Длинное тире
-            {"\xC2\xA0", " "},      // Неразрывный пробел
-            {"\xE2\x80\xA6", "..."}, // Многоточие
-            {"\xE2\x80\x9E", "\""}, // Двойная нижняя кавычка
-            {"\xE2\x80\x9F", "\""}, // Двойная верхняя кавычка
-            {"\xE2\x80\xB9", "'"},  // Левая угловая одинарная кавычка
-            {"\xE2\x80\xBA", "'"},  // Правая угловая одинарная кавычка
-        };
-        
-        for (const auto& replacement : utf8_replacements) {
-            text = replace(text, replacement.first, replacement.second);
-        }
-        
-    } catch (const std::exception& e) {
-        fprintf(stderr, "Ошибка при обработке Unicode символов: %s\n", e.what());
-    }
+    // Обработка "умных" кавычек и тире в UTF-8
+    // Безопасная замена без сложных проверок
+    text = replace(text, "\xE2\x80\x9C", "\"");
+    text = replace(text, "\xE2\x80\x9D", "\"");
+    text = replace(text, "\xE2\x80\x98", "'");
+    text = replace(text, "\xE2\x80\x99", "'");
+    text = replace(text, "\xE2\x80\x93", "-");
+    text = replace(text, "\xE2\x80\x94", "-");
+    text = replace(text, "\xC2\xA0", " ");
+    text = replace(text, "\xE2\x80\xA6", "...");
 
     trim(text);
     if (text.empty()) return;
 
-    // 3. ОБРАБОТКА MARKDOWN РАЗМЕТКИ
+    // Markdown: снимаем оформление, сохраняем полезное содержимое
     try {
-        // 3.1 Регулярные выражения для элементов Markdown
         static const std::regex re_code_block(R"(```(.*?)```)", std::regex::ECMAScript);
         static const std::regex re_code_inline(R"(`([^`]*)`)", std::regex::ECMAScript);
         static const std::regex re_img_md(R"(!\[[^\]]*\]\([^)\s]+(?:\s+"[^"]*")?\))", std::regex::ECMAScript);
@@ -1569,41 +1451,33 @@ void send_tts_async(std::string text,
         static const std::regex re_ital1(R"(\*([^*]+)\*)", std::regex::ECMAScript);
         static const std::regex re_ital2(R"(_([^_]+)_)", std::regex::ECMAScript);
         static const std::regex re_del(R"(~~([^~]+)~~)", std::regex::ECMAScript);
-        
-        // 3.2 Обработка скобок для создания пауз в речи
-        static const std::regex re_parens(R"(\(([^)]+)\))", std::regex::ECMAScript);
-        static const std::regex re_curly(R"(\{([^{}]+)\})", std::regex::ECMAScript);
-        static const std::regex re_square(R"(\[([^\]]+)\])", std::regex::ECMAScript);
-
-        // 3.3 Применение замен для Markdown
-        text = std::regex_replace(text, re_code_block, "$1");
-        text = std::regex_replace(text, re_code_inline, "$1");
-        text = std::regex_replace(text, re_img_md, " ");
-        text = std::regex_replace(text, re_link_md, "$1"); // Сохраняем только текст ссылки
-
-        // 3.4 Создание пауз: содержимое скобок + запятая
-        text = std::regex_replace(text, re_parens, " $1, ");
-        text = std::regex_replace(text, re_curly, " $1, ");
-        text = std::regex_replace(text, re_square, " $1, ");
-
-        // 3.5 Удаление форматирования
-        text = std::regex_replace(text, re_bold1, " $1 ");
-        text = std::regex_replace(text, re_bold2, " $1 ");
-        text = std::regex_replace(text, re_ital1, " $1 ");
-        text = std::regex_replace(text, re_ital2, " $1 ");
-        text = std::regex_replace(text, re_del, " $1 ");
-
-        // 3.6 Очистка висячих маркеров форматирования
         static const std::regex re_multi_stars(R"(\*{2,})", std::regex::ECMAScript);
         static const std::regex re_multi_unders(R"(_{2,})", std::regex::ECMAScript);
         static const std::regex re_multi_tildes(R"(~{2,})", std::regex::ECMAScript);
+
+        // Блоки и инлайн-код — оставляем содержимое
+        text = std::regex_replace(text, re_code_block, "$1");
+        text = std::regex_replace(text, re_code_inline, "$1");
+
+        // Изображения — полностью в пробел
+        text = std::regex_replace(text, re_img_md, " ");
+
+        // Ссылки — оставляем URL (вторная группа захвата)
+        text = std::regex_replace(text, re_link_md, "$2");
+
+        // Снимаем жирный/курсив/зачёркнутый
+        text = std::regex_replace(text, re_bold1, "$1");
+        text = std::regex_replace(text, re_bold2, "$1");
+        text = std::regex_replace(text, re_ital1, "$1");
+        text = std::regex_replace(text, re_ital2, "$1");
+        text = std::regex_replace(text, re_del, "$1");
+
+        // Добиваем висячие маркеры
         text = std::regex_replace(text, re_multi_stars, " ");
         text = std::regex_replace(text, re_multi_unders, " ");
         text = std::regex_replace(text, re_multi_tildes, " ");
-
     } catch (const std::regex_error& e) {
-        fprintf(stderr, "Ошибка regex при обработке Markdown: %s\n", e.what());
-        // Резервная обработка без регулярных выражений
+        fprintf(stderr, "Regex error (Markdown removal): %s\n", e.what());
         text = replace(text, "```", " ");
         text = replace(text, "`", " ");
         text = replace(text, "![", " ");
@@ -1612,12 +1486,69 @@ void send_tts_async(std::string text,
         text = replace(text, "__", " ");
         text = replace(text, "~~", " ");
     }
+    trim(text);
+    if (text.empty()) return;
+
+    // Удаление маркеров списков в начале строки
+    // Это важно для TTS, чтобы не зачитывались номера пунктов
+    try {
+        static const std::regex re_list_markers(
+            R"(^\s*(\d+[\.\)]|[A-Za-zА-Яа-яЁё][\.\)]|[\-\*\+\>\|#]+)\s*)",
+            std::regex::ECMAScript
+        );
+        text = std::regex_replace(text, re_list_markers, "");
+    } catch (const std::regex_error& e) {
+        fprintf(stderr, "Regex error (list markers removal): %s\n", e.what());
+        // Простая замена наиболее частых маркеров
+        if (text.size() > 2) {
+            if (text[0] == '-' || text[0] == '*' || text[0] == '+' || text[0] == '#') {
+                if (text[1] == ' ') {
+                    text = text.substr(2);
+                }
+            }
+            // Удаление цифр с точкой или скобкой в начале
+            else if (isdigit(text[0])) {
+                size_t i = 1;
+                while (i < text.size() && isdigit(text[i])) i++;
+                if (i < text.size() && (text[i] == '.' || text[i] == ')')) {
+                    if (i + 1 < text.size() && text[i + 1] == ' ') {
+                        text = text.substr(i + 2);
+                    } else {
+                        text = text.substr(i + 1);
+                    }
+                }
+            }
+        }
+    }
 
     trim(text);
     if (text.empty()) return;
 
-    // 4. УДАЛЕНИЕ СЛУЖЕБНЫХ КОНСТРУКЦИЙ
-    // 4.1 Рекурсивное удаление содержимого в фигурных скобках {…}
+    // Обработка скобок для создания искусственных пауз в речи
+    // Содержимое скобок сохраняется, но вместо закрывающей скобки ставится запятая
+    // Это создает естественную паузу при озвучивании
+    try {
+        // Обработка круглых скобок ()
+        static const std::regex re_parens(R"(\(([^)]+)\))", std::regex::ECMAScript);
+        text = std::regex_replace(text, re_parens, " $1, ");
+        
+        // Обработка квадратных скобок []
+        static const std::regex re_square(R"(\[([^\]]+)\])", std::regex::ECMAScript);
+        text = std::regex_replace(text, re_square, " $1, ");
+    } catch (const std::regex_error& e) {
+        fprintf(stderr, "Regex error (brackets processing): %s\n", e.what());
+        // Резервная обработка без запятых для безопасности
+        text = replace(text, "(", " ");
+        text = replace(text, ")", " ");
+        text = replace(text, "[", " ");
+        text = replace(text, "]", " ");
+    }
+
+    trim(text);
+    if (text.empty()) return;
+
+    // Удаление содержимого в {…} с поддержкой вложенности (итеративно)
+    // Фигурные скобки полностью удаляются с содержимым
     try {
         static const std::regex re_curly(R"(\{[^{}]*\})", std::regex::ECMAScript);
         bool changed = true;
@@ -1630,7 +1561,7 @@ void send_tts_async(std::string text,
             }
         }
     } catch (const std::regex_error& e) {
-        fprintf(stderr, "Ошибка regex при удалении фигурных скобок: %s\n", e.what());
+        fprintf(stderr, "Regex error (curly braces removal): %s\n", e.what());
         text = replace(text, "{", " ");
         text = replace(text, "}", " ");
     }
@@ -1638,323 +1569,140 @@ void send_tts_async(std::string text,
     trim(text);
     if (text.empty()) return;
 
-    // [БЛОК 4.2] УЛУЧШЕННАЯ ОБРАБОТКА КАВЫЧЕК И АПОСТРОФОВ
-    // Сохраняем апострофы внутри слов, удаляем остальные кавычки
+    // Удаление одиночных "мусорных" символов и кавычек
     try {
-        // Сначала заменяем все двойные кавычки на пробелы
+        static const std::regex re_noise(R"([#\|\\])", std::regex::ECMAScript);
+        static const std::regex re_quotes(R"(["'])", std::regex::ECMAScript);
+        text = std::regex_replace(text, re_noise, " ");
+        text = std::regex_replace(text, re_quotes, " ");
+    } catch (const std::regex_error& e) {
+        fprintf(stderr, "Regex error (single-char removal): %s\n", e.what());
+        text = replace(text, "#", " ");
+        text = replace(text, "|", " ");
+        text = replace(text, "\\", " ");
         text = replace(text, "\"", " ");
-        
-        // Теперь обрабатываем одиночные кавычки и апострофы
-        std::string result;
-        result.reserve(text.size());
-        
-        std::string current_word;
-        for (size_t i = 0; i < text.size(); ++i) {
-            char c = text[i];
-            
-            // Проверяем, является ли символ частью слова
-            if (std::isalnum(static_cast<unsigned char>(c)) || c == '\'' || c == '-') {
-                current_word += c;
-            } else {
-                // Обрабатываем накопленное слово
-                if (!current_word.empty()) {
-                    // Проверяем, есть ли в слове апостроф и он внутри слова
-                    bool has_valid_apostrophe = false;
-                    size_t apostrophe_pos = current_word.find('\'');
-                    
-                    if (apostrophe_pos != std::string::npos && 
-                        apostrophe_pos > 0 && apostrophe_pos < current_word.length() - 1) {
-                        // Проверяем, что символы вокруг апострофа - буквы
-                        char before = current_word[apostrophe_pos - 1];
-                        char after = current_word[apostrophe_pos + 1];
-                        
-                        if (std::isalpha(static_cast<unsigned char>(before)) && 
-                            std::isalpha(static_cast<unsigned char>(after))) {
-                            has_valid_apostrophe = true;
-                        }
-                    }
-                    
-                    if (has_valid_apostrophe) {
-                        // Сохраняем слово с апострофом
-                        result += current_word;
-                    } else {
-                        // Удаляем все апострофы из слова
-                        for (char wc : current_word) {
-                            if (wc != '\'') {
-                                result += wc;
-                            }
-                        }
-                    }
-                    current_word.clear();
-                }
-                
-                // Обработка текущего символа
-                if (c == '\'') {
-                    // Одиночная кавычка вне слова
-                    result += ' ';
-                } else if (c == '#' || c == '|' || c == '\\') {
-                    // Опасные символы
-                    result += ' ';
-                } else {
-                    result += c;
-                }
-            }
-        }
-        
-        // Обработка последнего слова, если оно есть
-        if (!current_word.empty()) {
-            // Та же логика для последнего слова
-            bool has_valid_apostrophe = false;
-            size_t apostrophe_pos = current_word.find('\'');
-            
-            if (apostrophe_pos != std::string::npos && 
-                apostrophe_pos > 0 && apostrophe_pos < current_word.length() - 1) {
-                char before = current_word[apostrophe_pos - 1];
-                char after = current_word[apostrophe_pos + 1];
-                
-                if (std::isalpha(static_cast<unsigned char>(before)) && 
-                    std::isalpha(static_cast<unsigned char>(after))) {
-                    has_valid_apostrophe = true;
-                }
-            }
-            
-            if (has_valid_apostrophe) {
-                result += current_word;
-            } else {
-                for (char wc : current_word) {
-                    if (wc != '\'') {
-                        result += wc;
-                    }
-                }
-            }
-        }
-        
-        text = std::move(result);
-        
-    } catch (const std::exception& e) {
-        fprintf(stderr, "Ошибка при обработке кавычек: %s\n", e.what());
-        // Резервная обработка: простой подход
-        try {
-            static const std::regex re_special_chars(R"([#\|\\"'])", std::regex::ECMAScript);
-            text = std::regex_replace(text, re_special_chars, " ");
-        } catch (const std::regex_error& regex_err) {
-            fprintf(stderr, "Ошибка regex при удалении спецсимволов: %s\n", regex_err.what());
-            // Ручная замена символов
-            for (auto& c : text) {
-                if (c == '#' || c == '|' || c == '\\' || c == '"' || c == '\'') {
-                    c = ' ';
-                }
-            }
-        }
+        text = replace(text, "'", " ");
     }
-
     trim(text);
     if (text.empty()) return;
 
-    // 5. КОРРЕКЦИЯ ПУНКТУАЦИИ ДЛЯ ЕСТЕСТВЕННОГО ЗВУЧАНИЯ
-    // 5.1 Исправление некорректных последовательностей пунктуации
-    // Убираем двойные запятые
-    while (text.find(", ,") != std::string::npos) {
-        text = replace(text, ", ,", ", ");
-    }
-    
-    // Убираем запятую после точки, восклицания, вопроса
-    text = replace(text, ". ,", ". ");
-    text = replace(text, "! ,", "! ");
-    text = replace(text, "? ,", "? ");
-    text = replace(text, "; ,", "; ");
-
-    trim(text);
-    if (text.empty()) return;
-
-    // 5.2 Нормализация пунктуации
+    // Нормализация пунктуации: схлопываем повторы, многоточия в точку
+    // Важно исправить некорректные последовательности для естественного звучания
     try {
-        // Схлопывание повторяющихся знаков препинания
         static const std::regex re_commas(R"(,{2,})", std::regex::ECMAScript);
         static const std::regex re_semis(R"(;{2,})", std::regex::ECMAScript);
-        static const std::regex re_dashes(R"(\s*[\-–—]+\s*)", std::regex::ECMAScript);
+        static const std::regex re_dashes(R"([\-–—]{2,})", std::regex::ECMAScript);
         static const std::regex re_bangs(R"(!{2,})", std::regex::ECMAScript);
         static const std::regex re_qmarks(R"(\?{2,})", std::regex::ECMAScript);
-        
-        // Обработка многоточий
-        static const std::regex re_limit_dots(R"(\.{4,})", std::regex::ECMAScript);
+        static const std::regex re_all_dots(R"(\.{2,})", std::regex::ECMAScript); 
         static const std::regex re_ellipsis_spaces(R"(\s*\.\s*\.\s*\.\s*)", std::regex::ECMAScript);
-        
-        // Коррекция запятых
         static const std::regex re_comma_before_stop(R"(\s*,\s*([.!?]))", std::regex::ECMAScript);
         static const std::regex re_leading_comma(R"(^\s*,\s*)", std::regex::ECMAScript);
 
         text = std::regex_replace(text, re_commas, ", ");
         text = std::regex_replace(text, re_semis, "; ");
-        text = std::regex_replace(text, re_dashes, " - "); // Нормализация тире
-        text = std::regex_replace(text, re_bangs, "!");    // Схлопывание восклицаний
-        text = std::regex_replace(text, re_qmarks, "? ");  // Схлопывание вопросов
-        text = std::regex_replace(text, re_limit_dots, "..."); // Ограничение многоточий
+        text = std::regex_replace(text, re_dashes, "- ");
+        text = std::regex_replace(text, re_bangs, "!");
+        text = std::regex_replace(text, re_qmarks, "? ");
+        text = std::regex_replace(text, re_all_dots, ".");
         text = std::regex_replace(text, re_ellipsis_spaces, ".");
         text = std::regex_replace(text, re_comma_before_stop, "$1");
         text = std::regex_replace(text, re_leading_comma, "");
 
-    } catch (const std::regex_error& e) {
-        fprintf(stderr, "Ошибка regex при нормализации пунктуации: %s\n", e.what());
-        // Резервная обработка для запятых
-        while (text.find(",,") != std::string::npos) {
-            text = replace(text, ",,", ",");
+        // Дополнительная очистка: удаляем запятую после точки/вопроса/восклицания
+        text = replace(text, ". ,", ". ");
+        text = replace(text, "! ,", "! ");
+        text = replace(text, "? ,", "? ");
+        text = replace(text, "; ,", "; ");
+        
+        // Убираем двойные запятые, которые могли появиться
+        while (text.find(", ,") != std::string::npos) {
+            text = replace(text, ", ,", ", ");
         }
+    } catch (const std::regex_error& e) {
+        fprintf(stderr, "Regex error (punctuation normalization): %s\n", e.what());
+        while (text.find(",,") != std::string::npos) { text = replace(text, ",,", ","); }
+        text = replace(text, ". ,", ". ");
+        text = replace(text, "! ,", "! ");
+        text = replace(text, "? ,", "? ");
     }
-
     trim(text);
     if (text.empty()) return;
 
-    // 6. НОРМАЛИЗАЦИЯ ПРОБЕЛОВ И ФИНАЛЬНАЯ ОЧИСТКА
-    // 6.1 Схлопывание множественных пробелов
+    // Нормализуем последовательности пробелов до одного
     try {
         static const std::regex re_spaces(R"(\s+)", std::regex::ECMAScript);
         text = std::regex_replace(text, re_spaces, " ");
     } catch (const std::regex_error& e) {
-        fprintf(stderr, "Ошибка regex при нормализации пробелов: %s\n", e.what());
-        // Резервная обработка пробелов
-        text = replace(text, "\r", " ");
-        text = replace(text, "\n", " ");
+        fprintf(stderr, "Regex error (space normalization): %s\n", e.what());
         text = replace(text, "\t", " ");
-        
-        // Ручная нормализация пробелов
-        std::string temp;
-        bool last_was_space = false;
+        // (Резервный цикл обработки пробелов оставлен для надежности)
+        std::string temp; bool last_was_space = false;
         for (char c : text) {
             if (std::isspace(static_cast<unsigned char>(c))) {
-                if (!last_was_space) {
-                    temp += ' ';
-                    last_was_space = true;
-                }
-            } else {
-                temp += c;
-                last_was_space = false;
-            }
+                if (!last_was_space) { temp += ' '; last_was_space = true; }
+            } else { temp += c; last_was_space = false; }
         }
-        text = std::move(temp);
+        text = temp;
     }
-
-    // 6.2 Удаление маркеров списков и технических префиксов
-    try {
-        static const std::regex re_list_markers(
-            R"(^\s*(\d+[\.\)]|[A-Za-zА-Яа-яЁё][\.\)]|[IVXLCDMivxlcdm]+[\.\)]|[\-\*\+\>\|#]+|\[.*?\])\s*)", 
-            std::regex::ECMAScript
-        );
-        text = std::regex_replace(text, re_list_markers, "");
-    } catch (const std::regex_error& e) {
-        fprintf(stderr, "Ошибка regex при очистке маркеров: %s\n", e.what());
-    }
-
     trim(text);
     if (text.empty()) return;
 
-    // 6.3 Удаление префикса с именем говорящего (например "Эмма: ")
+    // Удаляем префикс вида "Эмма: "
     if (text.find(speaker_wav + ":") == 0) {
-        size_t pos = speaker_wav.length() + 1; // Позиция после ":"
+        size_t pos = speaker_wav.length() + 1;
         if (pos < text.length() && text[pos] == ' ') pos++;
         text = text.substr(pos);
         trim(text);
     }
 
-    // 7. ПОДГОТОВКА ПАРАМЕТРОВ ДЛЯ ОТПРАВКИ
-    // 7.1 Нормализация имени спикера
+    // Финальная нормализация имени спикера
+    // Безопасная обработка без сложных проверок, которые могут вызвать ошибки
     speaker_wav = replace(speaker_wav, ":", "");
     speaker_wav = replace(speaker_wav, "\\", "");
     speaker_wav = replace(speaker_wav, "\r", "");
     speaker_wav = replace(speaker_wav, "\"", "");
-    trim(speaker_wav);
-
-    // [БЛОК 7.2] РАСШИРЕННАЯ БЕЗОПАСНОСТЬ SPEAKER_WAV
-    // Защита от path traversal и опасных символов
-    try {
-        // Удаление path traversal попыток
-        while (true) {
-            size_t pos = speaker_wav.find("../");
-            if (pos == std::string::npos) {
-                pos = speaker_wav.find("..\\");
-            }
-            if (pos == std::string::npos) {
-                break;
-            }
-            speaker_wav.erase(pos, 3);
+    speaker_wav = replace(speaker_wav, "/", "_");
+    speaker_wav = replace(speaker_wav, "<", "_");
+    speaker_wav = replace(speaker_wav, ">", "_");
+    speaker_wav = replace(speaker_wav, "|", "_");
+    speaker_wav = replace(speaker_wav, "?", "_");
+    speaker_wav = replace(speaker_wav, "*", "_");
+    
+    // Удаление попыток path traversal
+    while (true) {
+        size_t pos = speaker_wav.find("../");
+        if (pos == std::string::npos) {
+            pos = speaker_wav.find("..\\");
         }
-        
-        // Удаление других опасных паттернов
-        speaker_wav = replace(speaker_wav, "./", "");
-        speaker_wav = replace(speaker_wav, ".\\", "");
-        speaker_wav = replace(speaker_wav, "/", "_");
-        speaker_wav = replace(speaker_wav, "\\", "_");
-        
-        // Удаление опасных символов для файловой системы
-        const char* dangerous_chars = "<>:\"|?*";
-        for (int i = 0; dangerous_chars[i] != '\0'; ++i) {
-            char dangerous_char = dangerous_chars[i];
-            speaker_wav = replace(speaker_wav, std::string(1, dangerous_char), "_");
-        }
-        
-        // Удаление ведущих и завершающих точек и пробелов
-        trim(speaker_wav);
-        while (!speaker_wav.empty() && (speaker_wav.back() == '.' || speaker_wav.back() == ' ')) {
-            speaker_wav.pop_back();
-        }
-        while (!speaker_wav.empty() && (speaker_wav.front() == '.' || speaker_wav.front() == ' ')) {
-            speaker_wav.erase(0, 1);
-        }
-        
-        // Удаление двойных пробелов/подчеркиваний
-        while (speaker_wav.find("  ") != std::string::npos) {
-            speaker_wav = replace(speaker_wav, "  ", " ");
-        }
-        while (speaker_wav.find("__") != std::string::npos) {
-            speaker_wav = replace(speaker_wav, "__", "_");
-        }
-        
-        // Замена пробелов на подчеркивания
-        speaker_wav = replace(speaker_wav, " ", "_");
-        
-        // Валидация длины
-        if (speaker_wav.size() < 2) {
-            speaker_wav = "default";
-        } else if (speaker_wav.size() > 255) {
-            speaker_wav = speaker_wav.substr(0, 255);
-        }
-        
-        // Проверка на зарезервированные имена в Windows (упрощенная)
-        if (speaker_wav.size() <= 4) {
-            static const char* reserved_names[] = {
-                "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4",
-                "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3",
-                "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
-            };
-            
-            std::string upper_name = speaker_wav;
-            std::transform(upper_name.begin(), upper_name.end(), upper_name.begin(),
-                          [](unsigned char c) { return std::toupper(c); });
-            
-            for (const char* name : reserved_names) {
-                if (upper_name == name) {
-                    speaker_wav = "default";
-                    break;
-                }
-            }
-        }
-        
-    } catch (const std::exception& e) {
-        fprintf(stderr, "Ошибка при валидации speaker_wav: %s\n", e.what());
-        if (speaker_wav.size() < 2) {
-            speaker_wav = "default";
-        }
+        if (pos == std::string::npos) break;
+        speaker_wav.erase(pos, 3);
     }
+    
+    speaker_wav = replace(speaker_wav, "./", "");
+    speaker_wav = replace(speaker_wav, ".\\", "");
+    
+    // Замена пробелов на подчеркивания и удаление лишних подчеркиваний
+    speaker_wav = replace(speaker_wav, " ", "_");
+    while (speaker_wav.find("__") != std::string::npos) {
+        speaker_wav = replace(speaker_wav, "__", "_");
+    }
+    
+    trim(speaker_wav);
+    
+    // Удаление ведущих и завершающих точек
+    while (!speaker_wav.empty() && speaker_wav.back() == '.') speaker_wav.pop_back();
+    while (!speaker_wav.empty() && speaker_wav.front() == '.') speaker_wav.erase(0, 1);
+    
+    if (speaker_wav.size() < 2) speaker_wav = "default";
+    if (speaker_wav.size() > 255) speaker_wav = speaker_wav.substr(0, 255);
 
-    // Финальная проверка текста
     trim(text);
     if (text.empty()) return;
 
-    // 8. ПОДГОТОВКА И ОТПРАВКА HTTP-ЗАПРОСА
-    // 8.1 Лямбда-функция для безопасного экранирования JSON строк
+    // Подготовка JSON
     auto escape_json = [](const std::string& s) -> std::string {
-        std::string result;
-        result.reserve(s.size()); // Предварительное резервирование памяти
+        std::string result; result.reserve(s.size());
         for (unsigned char c : s) {
             switch (c) {
                 case '"':  result += "\\\""; break;
@@ -1965,58 +1713,50 @@ void send_tts_async(std::string text,
                 case '\r': result += "\\r";  break;
                 case '\t': result += "\\t";  break;
                 default:
-                    // Передаем все остальные символы как есть (включая UTF-8)
-                    // Это безопасно, так как UTF-8 уже обработан
-                    result += static_cast<char>(c);
+                    if (c >= 32 && c != 127) result += static_cast<char>(c);
+                    else {
+                        char buf[8]; std::snprintf(buf, sizeof(buf), "\\u%04x", (unsigned int)c);
+                        result += buf;
+                    }
             }
         }
         return result;
     };
 
-    // 8.2 Экранирование данных для JSON
-    std::string escaped_text = escape_json(text);
-    std::string escaped_speaker = escape_json(speaker_wav);
-    std::string escaped_language = escape_json(language);
+    std::string data = "{\"text\":\"" + escape_json(text) + "\", "
+                       "\"language\":\"" + escape_json(language) + "\", "
+                       "\"speaker_wav\":\"" + escape_json(speaker_wav) + "\", "
+                       "\"reply_part\":" + std::to_string(reply_part) + "}";
 
-    // 8.3 Формирование JSON тела запроса
-    std::string data = "{\"text\":\"" + escaped_text + "\", "
-                       "\"language\":\"" + escaped_language + "\", "
-                       "\"speaker_wav\":\"" + escaped_speaker + "\", "
-                       "\"reply_part\":" + std::to_string(reply_part) +
-                       "}";
-
-    // Для отладки можно раскомментировать:
-    // fprintf(stderr, "DEBUG: Отправляемый JSON: %s\n", data.c_str());
-
-    // 8.4 Формирование полного URL
-    tts_url = tts_url + "tts_to_audio/";
-
-    // 8.5 Инициализация и настройка cURL
+    // Формируем URL и делаем запрос через cURL
+    std::string full_url = tts_url + "tts_to_audio/";
     CURL* http_handle = curl_easy_init();
     if (http_handle) {
         struct curl_slist* headers = nullptr;
         headers = curl_slist_append(headers, "Content-Type: application/json");
         
-        // Настройка параметров запроса
+        // Настройка таймаутов для стабильности соединения
+        curl_easy_setopt(http_handle, CURLOPT_TIMEOUT, 30L);
+        curl_easy_setopt(http_handle, CURLOPT_CONNECTTIMEOUT, 10L);
+        
         curl_easy_setopt(http_handle, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(http_handle, CURLOPT_URL, tts_url.c_str());
+        curl_easy_setopt(http_handle, CURLOPT_URL, full_url.c_str());
         curl_easy_setopt(http_handle, CURLOPT_POSTFIELDS, data.c_str());
-        curl_easy_setopt(http_handle, CURLOPT_VERBOSE, 0L); // Отключить подробный вывод
+        curl_easy_setopt(http_handle, CURLOPT_VERBOSE, 0L);
 
-        // Буфер для ответа сервера
         std::string responseData;
         curl_easy_setopt(http_handle, CURLOPT_WRITEDATA, &responseData);
         curl_easy_setopt(http_handle, CURLOPT_WRITEFUNCTION, WriteCallback);
 
-        // Выполнение запроса
         CURLcode res = curl_easy_perform(http_handle);
-        
-        // 8.6 Очистка ресурсов cURL (ВАЖНО: всегда выполнять!)
+        if (res != CURLE_OK) {
+            fprintf(stderr, "cURL request failed: %s\n", curl_easy_strerror(res));
+        }
+
         curl_slist_free_all(headers);
         curl_easy_cleanup(http_handle);
-        
     } else {
-        fprintf(stderr, "Ошибка инициализации cURL\n");
+        fprintf(stderr, "Failed to initialize cURL handle\n");
     }
 }
 
@@ -2326,8 +2066,6 @@ const std::string chat_symb = ":";
 std::vector<float> pcmf32_cur;
 std::vector<float> pcmf32_prev;
 std::vector<float> pcmf32_prompt;
-
-																						   
 
 // Инициализируем промпт для Whisper — он должен знать, с кем говорит
 std::string prompt_whisper;
