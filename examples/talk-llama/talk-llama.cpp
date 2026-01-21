@@ -1018,8 +1018,11 @@ return result_param;
 
 // Callback-функция для записи данных, полученных через CURL, в строку / Используется, например, для сохранения ответа от HTTP-запроса
 static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+    // Проверка атомарного флага прерывания
     if (g_is_interrupted.load()) {
-        return 0; // Это заставит cURL немедленно закрыть соединение
+        // Возвращаем число байт, отличное от реального (size*nmemb), 
+        // это штатный способ сказать cURL: "Остановись с ошибкой WRITE_ERROR"
+        return 0; 
     }
     size_t realsize = size * nmemb;
     ((std::string*)userp)->append((char*)contents, realsize);
@@ -2380,11 +2383,28 @@ if (llama_decode(ctx_llama, batch)) {
 	int eot_antiprompt_id_2 = 0;
 	std::string current_voice = params.xtts_voice;
 
+// --- ПАТЧ START: Расширенные стоп-слова ---
     // обратные подсказки для определения того, когда пришло время прекратить разговор
-    std::vector<std::string> antiprompts = {
-        params.person + chat_symb,
-        params.person + " "+chat_symb,
-    };
+    std::vector<std::string> antiprompts;
+
+    // 1. Базовые стоп-слова (Как было раньше: "Друг:")
+    antiprompts.push_back(params.person + chat_symb);
+    antiprompts.push_back(params.person + " " + chat_symb);
+
+    // 2. Специфичные стоп-слова для ChatML
+    // Если их не добавить, модель будет генерировать бесконечно или говорить сама с собой
+    if (params.instruct_preset == "ChatML") {
+        antiprompts.push_back("<|im_end|>");       // Главный сигнал конца фразы ассистента
+        antiprompts.push_back("<|im_start|>");     // Если модель галлюцинирует началом нового блока
+        antiprompts.push_back("<|im_start|>user"); // Жесткий стоп перед репликой юзера
+        antiprompts.push_back("\n<|im_start|>");   // Вариант с переносом строки
+    }
+
+    // 3. Универсальные предохранители
+    antiprompts.push_back("user:");  // На случай, если модель свалится в обычный текстовый режим
+    antiprompts.push_back("\n\n");   // Двойной перенос часто означает конец мысли
+    // --- ПАТЧ END ---
+
 	if (!params.allow_newline) antiprompts.push_back("\n");
 	if (!params.instruct_preset_data["stop_sequence"].empty())  antiprompts.push_back(params.instruct_preset_data["stop_sequence"]);
 	if (!params.instruct_preset_data["bot_message_suffix"].empty())  
@@ -3307,6 +3327,8 @@ std::string resp = send_curl(url);
         reply_part = 0;
     
 // ### ЦИКЛ ГЕНЕРАЦИИ ТЕКСТА (LLaMA) ###
+    // Объяви это ПЕРЕД циклом while(true) генерации LLaMA
+    int64_t speech_vad_start_ms = 0;
     llama_start_time = get_current_time_ms();
     
     // ОПТИМИЗАЦИЯ: Убрана первичная токенизация. Проверяем только пустоту строки.
@@ -3346,20 +3368,53 @@ std::string resp = send_curl(url);
                     text_heard.insert(0, "\n"+params.person + chat_symb + " ");
                     text_heard_with_instruct.insert(0, "\n"+params.instruct_preset_data["user_message_prefix"]+"\n"+params.person + chat_symb + " ");
                 }
-    text_heard += "\n" + params.bot_name + chat_symb;
-    text_heard_with_instruct += params.instruct_preset_data["user_message_suffix"]+"\n" + params.instruct_preset_data["bot_message_prefix"]+ "\n" + params.bot_name + chat_symb;
+// --- ПАТЧ START: ChatML Support ---
+    if (params.instruct_preset == "ChatML") {
+        // Для ChatML мы игнорируем старую логику склеивания имен
+        // Берем "чистый" распознанный текст (без добавленных ранее префиксов "Друг:")
+        std::string clean_input = text_heard_trimmed; 
+        if (clean_input.empty()) clean_input = text_heard; // На случай если trimmed пустой
 
-    if (user_typed_this) 
-    {
-        fprintf(stdout, "%s%s%s", "\033[1m", (params.bot_name + chat_symb).c_str(), "\033[0m");
-        { 
-            std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
-            g_hotkey_pressed = "";
+        // Формируем строгий блок по стандарту ChatML
+        // 1. Открываем блок юзера
+        // 2. Вставляем текст
+        // 3. Закрываем блок юзера
+        // 4. СРАЗУ открываем блок ассистента, чтобы спровоцировать генерацию ответа
+        text_heard = "<|im_start|>user\n" + clean_input + "<|im_end|>\n<|im_start|>assistant\n";
+        
+        // Красивый вывод в консоль для человека (без спецтегов)
+        if (user_typed_this) {
+             fprintf(stdout, "\n%sUser (typed): %s%s\n", "\033[1m", clean_input.c_str(), "\033[0m");
+             { 
+                std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
+                g_hotkey_pressed = "";
+             }
+        } else {
+             fprintf(stdout, "\n%sUser (voice): %s%s\n", "\033[1m", clean_input.c_str(), "\033[0m");
         }
-    }
-    else fprintf(stdout, "%s%s%s", "\033[1m", text_heard.c_str(), "\033[0m");
+        
+        // Визуально показываем, что бот начинает отвечать (но в промпт это имя НЕ идет)
+        fprintf(stdout, "%s%s%s", "\033[1m", (params.bot_name + chat_symb + " ").c_str(), "\033[0m");
 
-    if (params.instruct_preset.size()) text_heard = text_heard_with_instruct; 
+    } else {
+        // --- Старая логика для обычных моделей (не ChatML) ---
+        text_heard += "\n" + params.bot_name + chat_symb;
+        text_heard_with_instruct += params.instruct_preset_data["user_message_suffix"]+"\n" + params.instruct_preset_data["bot_message_prefix"]+ "\n" + params.bot_name + chat_symb;
+
+        if (user_typed_this) 
+        {
+            fprintf(stdout, "%s%s%s", "\033[1m", (params.bot_name + chat_symb).c_str(), "\033[0m");
+            { 
+                std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
+                g_hotkey_pressed = "";
+            }
+        }
+        else fprintf(stdout, "%s%s%s", "\033[1m", text_heard.c_str(), "\033[0m");
+
+        if (params.instruct_preset.size()) text_heard = text_heard_with_instruct; 
+    }
+    // --- ПАТЧ END ---
+
     fflush(stdout);
     int split_after = params.split_after;
     
@@ -3385,6 +3440,7 @@ std::string resp = send_curl(url);
     bool done = false;
     std::string text_to_speak;
     int new_tokens = 0;
+
 
     while (true) {
     // predict
@@ -3870,15 +3926,25 @@ try
             int vad_result = ::vad_simple_int(pcmf32_cur, WHISPER_SAMPLE_RATE, params.vad_last_ms, 
             params.vad_thold, params.freq_thold, params.print_energy, 
             params.vad_start_thold);
-            // Если обнаружена речь
-            // Внутри цикла while(true) генерации токенов LLaMA
+
+            // Если обнаружена активность голоса
             if (vad_result == 1) {
-                printf(" [Speech detected!]\n");
-                llama_interrupted.store(1);      // Остановка LLaMA
-                g_is_interrupted.store(true);    // ДОБАВИТЬ: Остановка TTS (cURL)
-                allow_xtts_file(params.xtts_control_path, 0); 
-                done = true; 
-                break;
+                if (speech_vad_start_ms == 0) {
+                    speech_vad_start_ms = get_current_time_ms() * 1000; // Фиксируем начало звука
+                }
+                
+                // Проверяем длительность: прерываем только если звук длится > 250 мс
+                if ((get_current_time_ms() * 1000) - speech_vad_start_ms > 250) {
+                    printf(" [Speech interruption confirmed!]\n");
+                    llama_interrupted.store(1);
+                    g_is_interrupted.store(true);
+                    allow_xtts_file(params.xtts_control_path, 0);
+                    done = true;
+                    break;
+                }
+            } else {
+                // Если звук пропал раньше чем через 250мс — это был шум, сбрасываем таймер
+                speech_vad_start_ms = 0;
             }
         }
     }
