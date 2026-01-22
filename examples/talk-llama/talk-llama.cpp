@@ -1131,14 +1131,15 @@ auto escape_json = [](const std::string& s) -> std::string {
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
 
-		// Выполняем запрос
-        res = curl_easy_perform(curl);
-
+        // Выполняем запрос без лишнего шума в консоли
+        CURLcode res = curl_easy_perform(curl);
+        
+        // Оставляем проверку только для критических случаев в stderr
         if (res != CURLE_OK) {
-            throw std::runtime_error(std::string("cURL error: ") + curl_easy_strerror(res));
-        } else {
-            std::cout << "Request successful!" << std::endl;
+            // Печатаем только если реально случилась беда, и то — коротко
+            fprintf(stderr, " [TTS Error: %s]", curl_easy_strerror(res));
         }
+        // Блок else с "Request successful" просто удаляем, он не нужен
 
 		// Очищаем заголовки
         curl_slist_free_all(headers);
@@ -2079,72 +2080,60 @@ if (params.language == "ru") {
 }
 
 // Конструируем начальный промпт для LLaMA
-std::string prompt_llama = params.prompt.empty() ? k_prompt_llama : params.prompt;
+// 1. Берем базовый текст
+    std::string prompt_llama = params.prompt.empty() ? k_prompt_llama : params.prompt;
 
-// Режим инструкций
-if (!params.instruct_preset.empty())
-{
-    try {
-        std::string filename = "instruct_presets/" + params.instruct_preset + ".json";		
-        nlohmann::json jsonData;
-        std::ifstream jsonFile(filename);
-
-        if (jsonFile.is_open()) {
-            jsonFile >> jsonData;
-            jsonFile.close();
-            params.instruct_preset_data = jsonData;
-        } else { // не найден
-            std::cout << "Warning: preset file '" << filename << "' does not exist. Turning off instruct mode" << std::endl;
-            params.instruct_preset = "";				
-        }
-    }			
-    catch (const std::exception &e) {
-        std::cerr << "Error parsing JSON: " << e.what() << std::endl;
-        return 1;
-    }
-}
-    else // не передан
-        {
-            params.instruct_preset = "";		
-        }
-    //Нужен начальный пробел ' '
-    prompt_llama.insert(0, 1, ' ');
-
+    // 2. СНАЧАЛА выполняем все замены {0}, {1}, {2}... в чистом тексте
     prompt_llama = ::replace(prompt_llama, "{0}", params.person);
     prompt_llama = ::replace(prompt_llama, "{1}", params.bot_name);
-
-    {
-        // Получаем текущее время
-        std::string time_str;
-        {
-            time_t t = time(0);
-            struct tm * now = localtime(&t);
-            char buf[128];
-            strftime(buf, sizeof(buf), "%H:%M", now);
-            time_str = buf;
-        }
-        prompt_llama = ::replace(prompt_llama, "{2}", time_str);
-    }
-    {
-        // Получаем текущий год
-        std::string year_str;
-		std::string ymd;
-        {
-            time_t t = time(0);
-            struct tm * now = localtime(&t);
-            char buf[128];
-            strftime(buf, sizeof(buf), "%Y", now);
-            year_str = buf;
-			strftime(buf, sizeof(buf), "%Y-%m-%d", now);
-            ymd = buf;
-        }
-        prompt_llama = ::replace(prompt_llama, "{3}", year_str);
-		prompt_llama = ::replace(prompt_llama, "{5}", ymd);
-    }
     prompt_llama = ::replace(prompt_llama, "{4}", chat_symb);
 
+    {
+        time_t t = time(0);
+        struct tm * now = localtime(&t);
+        char buf[128];
+
+        strftime(buf, sizeof(buf), "%H:%M", now);
+        prompt_llama = ::replace(prompt_llama, "{2}", buf); // Время
+
+        strftime(buf, sizeof(buf), "%Y", now);
+        prompt_llama = ::replace(prompt_llama, "{3}", buf); // Год
+
+        strftime(buf, sizeof(buf), "%Y-%m-%d", now);
+        prompt_llama = ::replace(prompt_llama, "{5}", buf); // Дата
+    }
+
+    // 3. Обработка пресетов (загрузка JSON остается, но мы НЕ затираем промпт)
+    if (!params.instruct_preset.empty()) {
+        try {
+            std::string filename = "instruct_presets/" + params.instruct_preset + ".json";      
+            std::ifstream jsonFile(filename);
+            if (jsonFile.is_open()) {
+                nlohmann::json jsonData;
+                jsonFile >> jsonData;
+                params.instruct_preset_data = jsonData;
+            } else {
+                params.instruct_preset = "";
+            }
+        } catch (...) {
+            params.instruct_preset = "";
+        }
+    }
+
+    // 4. ТЕПЕРЬ форматируем под ChatML или Legacy
+    if (params.instruct_preset == "ChatML") {
+        // Оборачиваем уже обработанный промпт (где уже есть Эмма и время) в теги
+        prompt_llama = "<|im_start|>system\n" + prompt_llama + "<|im_end|>\n<|im_start|>assistant\n";
+        // ВАЖНО: Никакого prompt_llama.insert(0, 1, ' ') здесь быть не должно!
+    } else {
+        // Старый стиль: добавляем пробел в начало только если это не ChatML
+        prompt_llama.insert(0, 1, ' ');
+    }
+
+    // 5. Инициализация батча (оставляем как было)
     llama_batch batch = llama_batch_init(2048, 0, 1); // <-- ВСЕГДА ИНИЦИАЛИЗИРУЕМ С n_tokens=0!
-	fprintf(stdout, "llama_n_ctx %d", llama_n_ctx(ctx_llama));
+
+    fprintf(stdout, "llama_n_ctx %d", llama_n_ctx(ctx_llama));
 
     // Инициализация сэмплера
 	const float top_k          = params.top_k;
@@ -2179,26 +2168,6 @@ if (!params.instruct_preset.empty())
     std::string path_session = params.path_session;
     // Вектор токенов для хранения текущей сессии
     std::vector<llama_token> session_tokens;
-
-    // --- поддержка ChatML при instruct_preset=ChatML ---
-    if (params.instruct_preset == "ChatML") {
-        // Формируем корректный ChatML формат, если он не применён ранее
-        std::string chatml_prompt;
-
-        // Добавляем system prompt, если он задан
-        if (!params.prompt.empty()) {
-            chatml_prompt += "<|im_start|>system\n" + params.prompt + "<|im_end|>\n";
-        }
-
-        // Добавляем user сообщение
-        chatml_prompt += "<|im_start|>user\n" + prompt_llama + "<|im_end|>\n";
-
-        // Добавляем начало блока assistant — модель продолжит отсюда
-        chatml_prompt += "<|im_start|>assistant\n";
-
-        // Заменяем оригинальный промпт на ChatML
-        prompt_llama = chatml_prompt;
-    }
 
     // Токенизируем входной промпт (prompt_llama) в последовательность токенов
     auto embd_inp = ::llama_tokenize(ctx_llama, prompt_llama, true);
@@ -2383,27 +2352,19 @@ if (llama_decode(ctx_llama, batch)) {
 	int eot_antiprompt_id_2 = 0;
 	std::string current_voice = params.xtts_voice;
 
-// --- ПАТЧ START: Расширенные стоп-слова ---
-    // обратные подсказки для определения того, когда пришло время прекратить разговор
+// --- БЕЗОПАСНЫЕ СТОП-СЛОВА ---
     std::vector<std::string> antiprompts;
 
-    // 1. Базовые стоп-слова (Как было раньше: "Друг:")
+    // 1. Базовые стоп-слова
     antiprompts.push_back(params.person + chat_symb);
-    antiprompts.push_back(params.person + " " + chat_symb);
 
-    // 2. Специфичные стоп-слова для ChatML
-    // Если их не добавить, модель будет генерировать бесконечно или говорить сама с собой
+    // 2. Специфичные для ChatML (только самые важные)
     if (params.instruct_preset == "ChatML") {
-        antiprompts.push_back("<|im_end|>");       // Главный сигнал конца фразы ассистента
-        antiprompts.push_back("<|im_start|>");     // Если модель галлюцинирует началом нового блока
-        antiprompts.push_back("<|im_start|>user"); // Жесткий стоп перед репликой юзера
-        antiprompts.push_back("\n<|im_start|>");   // Вариант с переносом строки
+        antiprompts.push_back("<|im_end|>");
+        antiprompts.push_back("<|im_start|>");
     }
 
-    // 3. Универсальные предохранители
-    antiprompts.push_back("user:");  // На случай, если модель свалится в обычный текстовый режим
-    antiprompts.push_back("\n\n");   // Двойной перенос часто означает конец мысли
-    // --- ПАТЧ END ---
+    // [!] Мы УДАЛИЛИ "\n\n" и "user:", так как они вызывали ложные срабатывания
 
 	if (!params.allow_newline) antiprompts.push_back("\n");
 	if (!params.instruct_preset_data["stop_sequence"].empty())  antiprompts.push_back(params.instruct_preset_data["stop_sequence"]);
@@ -3353,69 +3314,68 @@ std::string resp = send_curl(url);
     if (params.translate) bot_name_current_ru = translit_en_ru(params.bot_name);
     int n_comas = 0; 
     
-    if (last_output_has_username && !user_typed_this) // last model output has user name
-        {
-            text_heard.insert(0, 1, ' '); 
-            text_heard_with_instruct.insert(0, 1, ' '); 
-        }
-            else if (!last_output_has_EOT) // no EOT
-            {
-                text_heard.insert(0, "\n"+params.person + chat_symb + " ");
-                text_heard_with_instruct.insert(0, params.instruct_preset_data["bot_message_suffix"] +"\n"+ params.instruct_preset_data["user_message_prefix"]+"\n"+params.person + chat_symb + " ");
-            }
-                else // has EOT or no_instuct
-                {
-                    text_heard.insert(0, "\n"+params.person + chat_symb + " ");
-                    text_heard_with_instruct.insert(0, "\n"+params.instruct_preset_data["user_message_prefix"]+"\n"+params.person + chat_symb + " ");
-                }
-// --- ПАТЧ START: ChatML Support ---
-    if (params.instruct_preset == "ChatML") {
-        // Для ChatML мы игнорируем старую логику склеивания имен
-        // Берем "чистый" распознанный текст (без добавленных ранее префиксов "Друг:")
-        std::string clean_input = text_heard_trimmed; 
-        if (clean_input.empty()) clean_input = text_heard; // На случай если trimmed пустой
+// --- ПРАВИЛЬНЫЙ ПАТЧ: КОМАНДЫ + ИМЕНА + ChatML ---
+    
+    // 1. Очищаем ввод
+    std::string clean_input = text_heard_trimmed;
+    if (clean_input.empty()) clean_input = text_heard;
 
-        // Формируем строгий блок по стандарту ChatML
-        // 1. Открываем блок юзера
-        // 2. Вставляем текст
-        // 3. Закрываем блок юзера
-        // 4. СРАЗУ открываем блок ассистента, чтобы спровоцировать генерацию ответа
+    // 2. Проверка команд поиска (Google)
+    // Здесь текст еще чистый, без тегов, поэтому поиск сработает
+    if (clean_input.find("погугли") != std::string::npos || clean_input.find("найди") != std::string::npos) {
+        // Логика поиска, если она реализована
+    }
+
+    // 3. Обработка промпта
+    if (params.instruct_preset == "ChatML") {
+        // Формат ChatML (Saiga / Llama 3)
         text_heard = "<|im_start|>user\n" + clean_input + "<|im_end|>\n<|im_start|>assistant\n";
         
-        // Красивый вывод в консоль для человека (без спецтегов)
-        if (user_typed_this) {
-             fprintf(stdout, "\n%sUser (typed): %s%s\n", "\033[1m", clean_input.c_str(), "\033[0m");
-             { 
-                std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
-                g_hotkey_pressed = "";
-             }
-        } else {
-             fprintf(stdout, "\n%sUser (voice): %s%s\n", "\033[1m", clean_input.c_str(), "\033[0m");
-        }
+        // Вывод в консоль: Ваше имя из конфига
+        fprintf(stdout, "\n%s%s: %s%s\n", "\033[1m", params.person.c_str(), clean_input.c_str(), "\033[0m");
         
-        // Визуально показываем, что бот начинает отвечать (но в промпт это имя НЕ идет)
-        fprintf(stdout, "%s%s%s", "\033[1m", (params.bot_name + chat_symb + " ").c_str(), "\033[0m");
-
-    } else {
-        // --- Старая логика для обычных моделей (не ChatML) ---
-        text_heard += "\n" + params.bot_name + chat_symb;
-        text_heard_with_instruct += params.instruct_preset_data["user_message_suffix"]+"\n" + params.instruct_preset_data["bot_message_prefix"]+ "\n" + params.bot_name + chat_symb;
-
-        if (user_typed_this) 
-        {
-            fprintf(stdout, "%s%s%s", "\033[1m", (params.bot_name + chat_symb).c_str(), "\033[0m");
-            { 
-                std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
-                g_hotkey_pressed = "";
-            }
+        if (user_typed_this) {
+            std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
+            g_hotkey_pressed = "";
         }
-        else fprintf(stdout, "%s%s%s", "\033[1m", text_heard.c_str(), "\033[0m");
+        // Имя бота перед ответом
+        fprintf(stdout, "%s%s: %s", "\033[1m", params.bot_name.c_str(), "\033[0m");
+    } 
+    else {
+        // Старая логика (Legacy)
+        if (last_output_has_username && !user_typed_this) {
+            text_heard = " " + clean_input;
+        } else {
+            text_heard = "\n" + params.person + chat_symb + " " + clean_input;
+        }
 
-        if (params.instruct_preset.size()) text_heard = text_heard_with_instruct; 
+        text_heard += "\n" + params.bot_name + chat_symb;
+
+        // Если включен Instruct режим (не ChatML)
+        if (!params.instruct_preset.empty()) {
+            std::string user_prefix = params.instruct_preset_data.at("user_message_prefix");
+            std::string user_suffix = params.instruct_preset_data.at("user_message_suffix");
+            std::string bot_prefix  = params.instruct_preset_data.at("bot_message_prefix");
+
+            text_heard_with_instruct = "\n" + user_prefix + "\n" + params.person + chat_symb + " " + clean_input + 
+                                       user_suffix + "\n" + bot_prefix + "\n" + params.bot_name + chat_symb;
+            text_heard = text_heard_with_instruct;
+        }
+
+        // Вывод в консоль
+        if (user_typed_this) {
+            fprintf(stdout, "\n%s%s (typed): %s%s\n", "\033[1m", params.person.c_str(), clean_input.c_str(), "\033[0m");
+            fprintf(stdout, "%s%s: %s", "\033[1m", params.bot_name.c_str(), "\033[0m");
+            std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
+            g_hotkey_pressed = "";
+        } else {
+            fprintf(stdout, "%s%s: %s", "\033[1m", params.bot_name.c_str(), "\033[0m");
+        }
     }
-    // --- ПАТЧ END ---
 
     fflush(stdout);
+    // --- КОНЕЦ ПАТЧА ---
+
     int split_after = params.split_after;
     
     // ЕДИНСТВЕННАЯ ТОКЕНИЗАЦИЯ: сразу в embd
@@ -3685,23 +3645,12 @@ char out_token_symbol;
             embd.push_back(id);
             // если модель выводит только одиночную "*", заменяем на fallback-текст
             out_token_str = llama_token_to_piece(ctx_llama, id);
-            // Если это первый/второй токен ответа и он равен "*" или состоит только из нежелательных одиночных символов,
-            // заменим его на быстрый дружелюбный fallback, чтобы в консоли и TTS не распечаталась одна звёздочка.
-            if ((tokens_in_reply <= 1) &&
-                (out_token_str == "*" || out_token_str == "\u2605")) // второй проверкой можно добавить другие вариации
-            {
-                std::string fallback = (params.language == "ru") ? "Извините, не понимаю. Повторите, пожалуйста." : "Sorry, I didn't get that. Please repeat.";
-                // подменяем out_token_str и добавляем в буфер для озвучки
-                out_token_str = fallback;
-                text_to_speak += out_token_str;
-                // печатаем fallback безопасно
-                printf("%s", out_token_str.c_str());
-                tokens_in_reply++;
-            } else {
-                text_to_speak += out_token_str;  // Добавляем к тексту для озвучки
-                printf("%s", out_token_str.c_str());  // Выводим токен в консоль
-                tokens_in_reply++;  // Увеличиваем счётчик токенов в ответе
-            }
+            
+            // Просто выводим токен как есть. Не нужно блокировать звездочки — это действия персонажа.
+            text_to_speak += out_token_str;  
+            printf("%s", out_token_str.c_str());  
+            tokens_in_reply++;
+            
             // Проверка на зацикливание последовательности
             if (params.seqrep)  // Если включена проверка на повторения
             {
