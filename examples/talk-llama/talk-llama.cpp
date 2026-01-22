@@ -1752,10 +1752,7 @@ void send_tts_async(std::string text,
         curl_easy_setopt(http_handle, CURLOPT_WRITEDATA, &responseData);
         curl_easy_setopt(http_handle, CURLOPT_WRITEFUNCTION, WriteCallback);
 
-        CURLcode res = curl_easy_perform(http_handle);
-        if (res != CURLE_OK) {
-            fprintf(stderr, "cURL request failed: %s\n", curl_easy_strerror(res));
-        }
+        curl_easy_perform(http_handle);
 
         curl_slist_free_all(headers);
         curl_easy_cleanup(http_handle);
@@ -2049,16 +2046,16 @@ int run(int argc, char ** argv) {
         fprintf(stderr, "\n");
     }
 
-// Инициализируем асинхронный аудиобуфер длительностью 15 секунд
-audio_async audio(15 * 1000);
+    // Инициализируем асинхронный аудиобуфер длительностью 15 секунд
+    audio_async audio(15 * 1000);
 
-// Пытаемся инициализировать аудиоустройство с указанным ID захвата
-if (!audio.init(params.capture_id, WHISPER_SAMPLE_RATE)) {
-    fprintf(stderr, "%s: Ошибка инициализации аудиоустройства (ID: %d)\n", 
-            __func__, params.capture_id);
-    fprintf(stderr, "Проверьте доступные аудиоустройства и правильность ID захвата\n");
-    return 1; // Завершаем программу при невозможности инициализации аудио
-}
+    // Пытаемся инициализировать аудиоустройство с указанным ID захвата
+    if (!audio.init(params.capture_id, WHISPER_SAMPLE_RATE)) {
+        fprintf(stderr, "%s: Ошибка инициализации аудиоустройства (ID: %d)\n", 
+                __func__, params.capture_id);
+        fprintf(stderr, "Проверьте доступные аудиоустройства и правильность ID захвата\n");
+        return 1; // Завершаем программу при невозможности инициализации аудио
+    }
 
 // Возобновляем работу аудиобуфера после успешной инициализации
 audio.resume();
@@ -2071,16 +2068,16 @@ std::vector<float> pcmf32_cur;
 std::vector<float> pcmf32_prev;
 std::vector<float> pcmf32_prompt;
 
-// Инициализируем промпт для Whisper — он должен знать, с кем говорит
-std::string prompt_whisper;
-if (params.language == "ru") {
-    prompt_whisper = ::replace(k_prompt_whisper_ru, "{1}", params.bot_name);
-} else {
-    prompt_whisper = ::replace(k_prompt_whisper, "{1}", params.bot_name);
-}
+    // Инициализируем промпт для Whisper — он должен знать, с кем говорит
+    std::string prompt_whisper;
+    if (params.language == "ru") {
+        prompt_whisper = ::replace(k_prompt_whisper_ru, "{1}", params.bot_name);
+    } else {
+        prompt_whisper = ::replace(k_prompt_whisper, "{1}", params.bot_name);
+    }
 
-// Конструируем начальный промпт для LLaMA
-// 1. Берем базовый текст
+    // Конструируем начальный промпт для LLaMA
+    // 1. Берем базовый текст
     std::string prompt_llama = params.prompt.empty() ? k_prompt_llama : params.prompt;
 
     // 2. СНАЧАЛА выполняем все замены {0}, {1}, {2}... в чистом тексте
@@ -2103,16 +2100,19 @@ if (params.language == "ru") {
         prompt_llama = ::replace(prompt_llama, "{5}", buf); // Дата
     }
 
-    // 3. Обработка пресетов (загрузка JSON остается, но мы НЕ затираем промпт)
+    // 3. Обработка пресетов (загрузка метаданных JSON)
     if (!params.instruct_preset.empty()) {
         try {
             std::string filename = "instruct_presets/" + params.instruct_preset + ".json";      
+        nlohmann::json jsonData;
             std::ifstream jsonFile(filename);
+
             if (jsonFile.is_open()) {
-                nlohmann::json jsonData;
                 jsonFile >> jsonData;
+            jsonFile.close();
                 params.instruct_preset_data = jsonData;
-            } else {
+        } else { // не найден
+            std::cout << "Warning: preset file '" << filename << "' does not exist. Turning off instruct mode" << std::endl;
                 params.instruct_preset = "";
             }
         } catch (...) {
@@ -2120,18 +2120,23 @@ if (params.language == "ru") {
         }
     }
 
-    // 4. ТЕПЕРЬ форматируем под ChatML или Legacy
+    // 4. ФОРМАТИРОВАНИЕ
     if (params.instruct_preset == "ChatML") {
-        // Оборачиваем уже обработанный промпт (где уже есть Эмма и время) в теги
-        prompt_llama = "<|im_start|>system\n" + prompt_llama + "<|im_end|>\n<|im_start|>assistant\n";
-        // ВАЖНО: Никакого prompt_llama.insert(0, 1, ' ') здесь быть не должно!
+        // ВАЖНО: Закрываем блок system. 
+        // Мы НЕ добавляем сюда <|im_start|>assistant, так как это заставит модель 
+        // галлюцинировать ответ сразу после системных правил. 
+        // Ответ ассистента добавится в цикле ПОСЛЕ реплики пользователя.
+        prompt_llama = "<|im_start|>system\n" + prompt_llama + "<|im_end|>\n";
     } else {
-        // Старый стиль: добавляем пробел в начало только если это не ChatML
-        prompt_llama.insert(0, 1, ' ');
+        // Старый стиль: просто пробел в начало
+        if (prompt_llama.front() != ' ') {
+            prompt_llama.insert(0, 1, ' ');
+        }
     }
 
-    // 5. Инициализация батча (оставляем как было)
-    llama_batch batch = llama_batch_init(2048, 0, 1); // <-- ВСЕГДА ИНИЦИАЛИЗИРУЕМ С n_tokens=0!
+    // 5. Инициализация батча
+    // Используем n_tokens=0, чтобы начать заполнение с чистого листа
+    llama_batch batch = llama_batch_init(2048, 0, 1);
 
     fprintf(stdout, "llama_n_ctx %d", llama_n_ctx(ctx_llama));
 
@@ -2168,6 +2173,26 @@ if (params.language == "ru") {
     std::string path_session = params.path_session;
     // Вектор токенов для хранения текущей сессии
     std::vector<llama_token> session_tokens;
+
+    // --- поддержка ChatML при instruct_preset=ChatML ---
+    if (params.instruct_preset == "ChatML") {
+        // Формируем корректный ChatML формат, если он не применён ранее
+        std::string chatml_prompt;
+
+        // Добавляем system prompt, если он задан
+        if (!params.prompt.empty()) {
+            chatml_prompt += "<|im_start|>system\n" + params.prompt + "<|im_end|>\n";
+        }
+
+        // Добавляем user сообщение
+        chatml_prompt += "<|im_start|>user\n" + prompt_llama + "<|im_end|>\n";
+
+        // Добавляем начало блока assistant — модель продолжит отсюда
+        chatml_prompt += "<|im_start|>assistant\n";
+
+        // Заменяем оригинальный промпт на ChatML
+        prompt_llama = chatml_prompt;
+    }
 
     // Токенизируем входной промпт (prompt_llama) в последовательность токенов
     auto embd_inp = ::llama_tokenize(ctx_llama, prompt_llama, true);
@@ -2352,20 +2377,11 @@ if (llama_decode(ctx_llama, batch)) {
 	int eot_antiprompt_id_2 = 0;
 	std::string current_voice = params.xtts_voice;
 
-// --- БЕЗОПАСНЫЕ СТОП-СЛОВА ---
-    std::vector<std::string> antiprompts;
-
-    // 1. Базовые стоп-слова
-    antiprompts.push_back(params.person + chat_symb);
-
-    // 2. Специфичные для ChatML (только самые важные)
-    if (params.instruct_preset == "ChatML") {
-        antiprompts.push_back("<|im_end|>");
-        antiprompts.push_back("<|im_start|>");
-    }
-
-    // [!] Мы УДАЛИЛИ "\n\n" и "user:", так как они вызывали ложные срабатывания
-
+    // обратные подсказки для определения того, когда пришло время прекратить разговор
+    std::vector<std::string> antiprompts = {
+        params.person + chat_symb,
+        params.person + " "+chat_symb,
+    };
 	if (!params.allow_newline) antiprompts.push_back("\n");
 	if (!params.instruct_preset_data["stop_sequence"].empty())  antiprompts.push_back(params.instruct_preset_data["stop_sequence"]);
 	if (!params.instruct_preset_data["bot_message_suffix"].empty())  
@@ -3326,31 +3342,33 @@ std::string resp = send_curl(url);
         // Логика поиска, если она реализована
     }
 
-    // 3. Обработка промпта
+    // 3. Обработка промпта и обновление истории (prompt_llama)
     if (params.instruct_preset == "ChatML") {
-        // Формат ChatML (Saiga / Llama 3)
-        text_heard = "<|im_start|>user\n" + clean_input + "<|im_end|>\n<|im_start|>assistant\n";
+        // Формат ChatML: пользователь закончил, Эмма начинает
+        std::string chat_step = "<|im_start|>user\n" + clean_input + "<|im_end|>\n<|im_start|>assistant\n";
+        prompt_llama += chat_step;
         
-        // Вывод в консоль: Ваше имя из конфига
         fprintf(stdout, "\n%s%s: %s%s\n", "\033[1m", params.person.c_str(), clean_input.c_str(), "\033[0m");
+        
+        // ВАЖНО: Тег assistant в конце ОБЯЗАТЕЛЕН для генерации
+        prompt_llama += "<|im_start|>user\n" + clean_input + "<|im_end|>\n<|im_start|>assistant\n";
         
         if (user_typed_this) {
             std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
             g_hotkey_pressed = "";
         }
-        // Имя бота перед ответом
         fprintf(stdout, "%s%s: %s", "\033[1m", params.bot_name.c_str(), "\033[0m");
     } 
     else {
         // Старая логика (Legacy)
+        std::string legacy_step;
         if (last_output_has_username && !user_typed_this) {
-            text_heard = " " + clean_input;
+            legacy_step = " " + clean_input;
         } else {
-            text_heard = "\n" + params.person + chat_symb + " " + clean_input;
+            legacy_step = "\n" + params.person + chat_symb + " " + clean_input;
         }
-
-        text_heard += "\n" + params.bot_name + chat_symb;
-
+        legacy_step += "\n" + params.bot_name + chat_symb;
+        
         // Если включен Instruct режим (не ChatML)
         if (!params.instruct_preset.empty()) {
             std::string user_prefix = params.instruct_preset_data.at("user_message_prefix");
@@ -3365,32 +3383,42 @@ std::string resp = send_curl(url);
         // Вывод в консоль
         if (user_typed_this) {
             fprintf(stdout, "\n%s%s (typed): %s%s\n", "\033[1m", params.person.c_str(), clean_input.c_str(), "\033[0m");
-            fprintf(stdout, "%s%s: %s", "\033[1m", params.bot_name.c_str(), "\033[0m");
             std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
             g_hotkey_pressed = "";
-        } else {
-            fprintf(stdout, "%s%s: %s", "\033[1m", params.bot_name.c_str(), "\033[0m");
         }
+        fprintf(stdout, "%s%s: %s", "\033[1m", params.bot_name.c_str(), "\033[0m");
+    }
+    fflush(stdout);
+
+    // 3. ТОКЕНИЗАЦИЯ И РОТАЦИЯ
+    // Теперь embd содержит ПОЛНЫЙ актуальный контекст
+    embd = ::llama_tokenize(ctx_llama, prompt_llama, true);
+    int n_ctx = llama_n_ctx(ctx_llama);
+    
+    // Если токенов больше, чем влезает в контекст (с запасом 100 на ответ)
+    if ((int)embd.size() > (n_ctx - params.n_predict - 100)) {
+        fprintf(stdout, "\n\033[93m[Система: Ротация контекста]\033[0m\n");
+        // Сохраняем системные правила (до первого <|im_end|>)
+        size_t sys_end = prompt_llama.find("<|im_end|>\n");
+        std::string sys_part = (sys_end != std::string::npos) ? prompt_llama.substr(0, sys_end + 11) : "";
+        // Оставляем последние 2000 символов истории диалога
+        prompt_llama = sys_part + "\n...[очищено]...\n" + prompt_llama.substr(prompt_llama.size() - 2000);
+        // Пересоздаем токены после обрезки
+        embd = ::llama_tokenize(ctx_llama, prompt_llama, true);
     }
 
-    fflush(stdout);
-    // --- КОНЕЦ ПАТЧА ---
-
-    int split_after = params.split_after;
-    
-    // ЕДИНСТВЕННАЯ ТОКЕНИЗАЦИЯ: сразу в embd
-    embd = ::llama_tokenize(ctx_llama, text_heard, false); 
-    input_tokens_count = embd.size();
-
-    // Append the new input tokens to the session_tokens vector
+    // 4. Инициализация переменных для работы цикла генерации
     if (!path_session.empty()) {
-        // Используем embd (актуальные токены), а не удаленный вектор tokens
+        session_tokens.clear(); // Очищаем старую копию, чтобы не дублировать
         session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
     }
+
+    // 5. ПОДГОТОВКА ПЕРЕМЕННЫХ ДЛЯ ЦИКЛА ГЕНЕРАЦИИ
+    int split_after = params.split_after;
+    input_tokens_count = embd.size();
     
-    // только защита от переполнения индекса
     if (thread_i >= 150) {
-        thread_i = 0; // Мягкая ротация — не ломает логику, не вызывает join(), не мешает потокам
+        thread_i = 0; 
     }
     
     float temp_next = params.temp;
@@ -3400,6 +3428,7 @@ std::string resp = send_curl(url);
     bool done = false;
     std::string text_to_speak;
     int new_tokens = 0;
+    // --- КОНЕЦ ПАТЧА ---
 
 
     while (true) {
