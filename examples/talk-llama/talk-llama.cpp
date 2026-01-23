@@ -1103,6 +1103,9 @@ auto escape_json = [](const std::string& s) -> std::string {
     return result;
 };
 	// Настройка запроса
+    struct curl_slist *headers = nullptr; // Выносим объявление перед try
+    bool curl_freed = false; // Флаг, чтобы отследить очистку curl
+    
     try {
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_VERBOSE, 0L);
@@ -1120,7 +1123,6 @@ auto escape_json = [](const std::string& s) -> std::string {
         fprintf(stdout, "send_curl_json: %s\n", jsonData.c_str());
 		
 		// Устанавливаем заголовки
-        struct curl_slist *headers = nullptr;
         headers = curl_slist_append(headers, "Content-Type: application/json");
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 		
@@ -1139,17 +1141,33 @@ auto escape_json = [](const std::string& s) -> std::string {
             // Печатаем только если реально случилась беда, и то — коротко
             fprintf(stderr, " [TTS Error: %s]", curl_easy_strerror(res));
         }
-        // Блок else с "Request successful" просто удаляем, он не нужен
 
 		// Очищаем заголовки
         curl_slist_free_all(headers);
-		} catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+        headers = nullptr;
+		
+		// Очищаем curl
         curl_easy_cleanup(curl);
+        curl_freed = true;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        
+        // Очищаем заголовки если они были созданы
+        if (headers) {
+            curl_slist_free_all(headers);
+            headers = nullptr;
+        }
+        
+        // Очищаем curl только если еще не очищен
+        if (!curl_freed && curl) {
+            curl_easy_cleanup(curl);
+            curl_freed = true;
+        }
         return "";
     }
-	// Очищаем curl
-    curl_easy_cleanup(curl);
+    
+    // curl уже очищен, ничего делать не нужно
     
     return readBuffer;
 }
