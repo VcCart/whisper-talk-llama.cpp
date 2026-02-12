@@ -1484,7 +1484,7 @@ void send_tts_async(std::string text,
         // Изображения — полностью в пробел
         text = std::regex_replace(text, re_img_md, " ");
 
-        // Ссылки — оставляем URL (вторная группа захвата)
+        // Ссылки — оставляем URL
         text = std::regex_replace(text, re_link_md, "$2");
 
         // Снимаем жирный/курсив/зачёркнутый
@@ -1689,35 +1689,9 @@ void send_tts_async(std::string text,
     speaker_wav = replace(speaker_wav, ">", "_");
     speaker_wav = replace(speaker_wav, "|", "_");
     speaker_wav = replace(speaker_wav, "?", "_");
-    speaker_wav = replace(speaker_wav, "*", "_");
-    
-    // Удаление попыток path traversal
-    while (true) {
-        size_t pos = speaker_wav.find("../");
-        if (pos == std::string::npos) {
-            pos = speaker_wav.find("..\\");
-        }
-        if (pos == std::string::npos) break;
-        speaker_wav.erase(pos, 3);
-    }
-    
-    speaker_wav = replace(speaker_wav, "./", "");
-    speaker_wav = replace(speaker_wav, ".\\", "");
-    
-    // Замена пробелов на подчеркивания и удаление лишних подчеркиваний
-    speaker_wav = replace(speaker_wav, " ", "_");
-    while (speaker_wav.find("__") != std::string::npos) {
-        speaker_wav = replace(speaker_wav, "__", "_");
-    }
-    
+    speaker_wav = replace(speaker_wav, "*", "_");   
     trim(speaker_wav);
-    
-    // Удаление ведущих и завершающих точек
-    while (!speaker_wav.empty() && speaker_wav.back() == '.') speaker_wav.pop_back();
-    while (!speaker_wav.empty() && speaker_wav.front() == '.') speaker_wav.erase(0, 1);
-    
     if (speaker_wav.size() < 2) speaker_wav = "default";
-    if (speaker_wav.size() > 255) speaker_wav = speaker_wav.substr(0, 255);
 
     trim(text);
     if (text.empty()) return;
@@ -2098,28 +2072,9 @@ std::vector<float> pcmf32_prompt;
     // 1. Берем базовый текст
     std::string prompt_llama = params.prompt.empty() ? k_prompt_llama : params.prompt;
 
-    // 2. СНАЧАЛА выполняем все замены {0}, {1}, {2}... в чистом тексте
-    prompt_llama = ::replace(prompt_llama, "{0}", params.person);
-    prompt_llama = ::replace(prompt_llama, "{1}", params.bot_name);
-    prompt_llama = ::replace(prompt_llama, "{4}", chat_symb);
-
-    {
-        time_t t = time(0);
-        struct tm * now = localtime(&t);
-        char buf[128];
-
-        strftime(buf, sizeof(buf), "%H:%M", now);
-        prompt_llama = ::replace(prompt_llama, "{2}", buf); // Время
-
-        strftime(buf, sizeof(buf), "%Y", now);
-        prompt_llama = ::replace(prompt_llama, "{3}", buf); // Год
-
-        strftime(buf, sizeof(buf), "%Y-%m-%d", now);
-        prompt_llama = ::replace(prompt_llama, "{5}", buf); // Дата
-    }
-
-    // 3. Обработка пресетов (загрузка метаданных JSON)
-    if (!params.instruct_preset.empty()) {
+// Режим инструкций
+if (!params.instruct_preset.empty())
+{
         try {
             std::string filename = "instruct_presets/" + params.instruct_preset + ".json";      
         nlohmann::json jsonData;
@@ -2133,29 +2088,53 @@ std::vector<float> pcmf32_prompt;
             std::cout << "Warning: preset file '" << filename << "' does not exist. Turning off instruct mode" << std::endl;
                 params.instruct_preset = "";
             }
-        } catch (...) {
+    }			
+    catch (const std::exception &e) {
+        std::cerr << "Error parsing JSON: " << e.what() << std::endl;
+        return 1;
+    }
+}
+    else // не передан
+        {
             params.instruct_preset = "";
         }
-    }
+    //Нужен начальный пробел ' '
+    prompt_llama.insert(0, 1, ' ');
 
-    // 4. ФОРМАТИРОВАНИЕ
-    if (params.instruct_preset == "ChatML") {
-        // ВАЖНО: Закрываем блок system. 
-        // Мы НЕ добавляем сюда <|im_start|>assistant, так как это заставит модель 
-        // галлюцинировать ответ сразу после системных правил. 
-        // Ответ ассистента добавится в цикле ПОСЛЕ реплики пользователя.
-        prompt_llama = "<|im_start|>system\n" + prompt_llama + "<|im_end|>\n";
-    } else {
-        // Старый стиль: просто пробел в начало
-        if (prompt_llama.front() != ' ') {
-            prompt_llama.insert(0, 1, ' ');
+    prompt_llama = ::replace(prompt_llama, "{0}", params.person);
+    prompt_llama = ::replace(prompt_llama, "{1}", params.bot_name);
+
+    {
+        // Получаем текущее время
+        std::string time_str;
+        {
+            time_t t = time(0);
+            struct tm * now = localtime(&t);
+            char buf[128];
+            strftime(buf, sizeof(buf), "%H:%M", now);
+            time_str = buf;
         }
+        prompt_llama = ::replace(prompt_llama, "{2}", time_str);
     }
+    {
+        // Получаем текущий год
+        std::string year_str;
+		std::string ymd;
+        {
+            time_t t = time(0);
+            struct tm * now = localtime(&t);
+            char buf[128];
+            strftime(buf, sizeof(buf), "%Y", now);
+            year_str = buf;
+			strftime(buf, sizeof(buf), "%Y-%m-%d", now);
+            ymd = buf;
+        }
+        prompt_llama = ::replace(prompt_llama, "{3}", year_str);
+		prompt_llama = ::replace(prompt_llama, "{5}", ymd);
+        }
+    prompt_llama = ::replace(prompt_llama, "{4}", chat_symb);
 
-    // 5. Инициализация батча
-    // Используем n_tokens=0, чтобы начать заполнение с чистого листа
-    llama_batch batch = llama_batch_init(2048, 0, 1);
-
+    llama_batch batch = llama_batch_init(2048, 0, 1); // <-- ВСЕГДА ИНИЦИАЛИЗИРУЕМ С n_tokens=0!
     fprintf(stdout, "llama_n_ctx %d", llama_n_ctx(ctx_llama));
 
     // Инициализация сэмплера
@@ -3348,95 +3327,51 @@ std::string resp = send_curl(url);
     if (params.translate) bot_name_current_ru = translit_en_ru(params.bot_name);
     int n_comas = 0; 
     
-// --- ПРАВИЛЬНЫЙ ПАТЧ: КОМАНДЫ + ИМЕНА + ChatML ---
-    
-    // 1. Очищаем ввод
-    std::string clean_input = text_heard_trimmed;
-    if (clean_input.empty()) clean_input = text_heard;
+    if (last_output_has_username && !user_typed_this) // last model output has user name
+        {
+            text_heard.insert(0, 1, ' '); 
+            text_heard_with_instruct.insert(0, 1, ' '); 
+        }
+            else if (!last_output_has_EOT) // no EOT
+            {
+                text_heard.insert(0, "\n"+params.person + chat_symb + " ");
+                text_heard_with_instruct.insert(0, params.instruct_preset_data["bot_message_suffix"] +"\n"+ params.instruct_preset_data["user_message_prefix"]+"\n"+params.person + chat_symb + " ");
+            }
+                else // has EOT or no_instuct
+                {
+                    text_heard.insert(0, "\n"+params.person + chat_symb + " ");
+                    text_heard_with_instruct.insert(0, "\n"+params.instruct_preset_data["user_message_prefix"]+"\n"+params.person + chat_symb + " ");
+                }
+    text_heard += "\n" + params.bot_name + chat_symb;
+    text_heard_with_instruct += params.instruct_preset_data["user_message_suffix"]+"\n" + params.instruct_preset_data["bot_message_prefix"]+ "\n" + params.bot_name + chat_symb;
 
-    // 2. Проверка команд поиска (Google)
-    // Здесь текст еще чистый, без тегов, поэтому поиск сработает
-    if (clean_input.find("погугли") != std::string::npos || clean_input.find("найди") != std::string::npos) {
-        // Логика поиска, если она реализована
-    }
-
-    // 3. Обработка промпта и обновление истории (prompt_llama)
-    if (params.instruct_preset == "ChatML") {
-        // Формат ChatML: пользователь закончил, Эмма начинает
-        std::string chat_step = "<|im_start|>user\n" + clean_input + "<|im_end|>\n<|im_start|>assistant\n";
-        prompt_llama += chat_step;
-        
-        fprintf(stdout, "\n%s%s: %s%s\n", "\033[1m", params.person.c_str(), clean_input.c_str(), "\033[0m");
-        
-        // ВАЖНО: Тег assistant в конце ОБЯЗАТЕЛЕН для генерации
-        prompt_llama += "<|im_start|>user\n" + clean_input + "<|im_end|>\n<|im_start|>assistant\n";
-        
-        if (user_typed_this) {
+    if (user_typed_this) 
+    {
+        fprintf(stdout, "%s%s%s", "\033[1m", (params.bot_name + chat_symb).c_str(), "\033[0m");
+        { 
             std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
             g_hotkey_pressed = "";
         }
-        fprintf(stdout, "%s%s: %s", "\033[1m", params.bot_name.c_str(), "\033[0m");
-    } 
-    else {
-        // Старая логика (Legacy)
-        std::string legacy_step;
-        if (last_output_has_username && !user_typed_this) {
-            legacy_step = " " + clean_input;
-        } else {
-            legacy_step = "\n" + params.person + chat_symb + " " + clean_input;
-        }
-        legacy_step += "\n" + params.bot_name + chat_symb;
-        
-        // Если включен Instruct режим (не ChatML)
-        if (!params.instruct_preset.empty()) {
-            std::string user_prefix = params.instruct_preset_data.at("user_message_prefix");
-            std::string user_suffix = params.instruct_preset_data.at("user_message_suffix");
-            std::string bot_prefix  = params.instruct_preset_data.at("bot_message_prefix");
-
-            text_heard_with_instruct = "\n" + user_prefix + "\n" + params.person + chat_symb + " " + clean_input + 
-                                       user_suffix + "\n" + bot_prefix + "\n" + params.bot_name + chat_symb;
-            text_heard = text_heard_with_instruct;
-        }
-
-        // Вывод в консоль
-        if (user_typed_this) {
-            fprintf(stdout, "\n%s%s (typed): %s%s\n", "\033[1m", params.person.c_str(), clean_input.c_str(), "\033[0m");
-            std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
-            g_hotkey_pressed = "";
-        }
-        fprintf(stdout, "%s%s: %s", "\033[1m", params.bot_name.c_str(), "\033[0m");
     }
+    else fprintf(stdout, "%s%s%s", "\033[1m", text_heard.c_str(), "\033[0m");
+
+    if (params.instruct_preset.size()) text_heard = text_heard_with_instruct; 
     fflush(stdout);
+    int split_after = params.split_after;
 
-    // 3. ТОКЕНИЗАЦИЯ И РОТАЦИЯ
-    // Теперь embd содержит ПОЛНЫЙ актуальный контекст
-    embd = ::llama_tokenize(ctx_llama, prompt_llama, true);
-    int n_ctx = llama_n_ctx(ctx_llama);
-    
-    // Если токенов больше, чем влезает в контекст (с запасом 100 на ответ)
-    if ((int)embd.size() > (n_ctx - params.n_predict - 100)) {
-        fprintf(stdout, "\n\033[93m[Система: Ротация контекста]\033[0m\n");
-        // Сохраняем системные правила (до первого <|im_end|>)
-        size_t sys_end = prompt_llama.find("<|im_end|>\n");
-        std::string sys_part = (sys_end != std::string::npos) ? prompt_llama.substr(0, sys_end + 11) : "";
-        // Оставляем последние 2000 символов истории диалога
-        prompt_llama = sys_part + "\n...[очищено]...\n" + prompt_llama.substr(prompt_llama.size() - 2000);
-        // Пересоздаем токены после обрезки
-        embd = ::llama_tokenize(ctx_llama, prompt_llama, true);
-    }
+    // ЕДИНСТВЕННАЯ ТОКЕНИЗАЦИЯ: сразу в embd
+    embd = ::llama_tokenize(ctx_llama, text_heard, false); 
+    input_tokens_count = embd.size();
 
-    // 4. Инициализация переменных для работы цикла генерации
+    // Append the new input tokens to the session_tokens vector
     if (!path_session.empty()) {
-        session_tokens.clear(); // Очищаем старую копию, чтобы не дублировать
+        // Используем embd (актуальные токены), а не удаленный вектор tokens
         session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
     }
 
-    // 5. ПОДГОТОВКА ПЕРЕМЕННЫХ ДЛЯ ЦИКЛА ГЕНЕРАЦИИ
-    int split_after = params.split_after;
-    input_tokens_count = embd.size();
-    
+    // только защита от переполнения индекса
     if (thread_i >= 150) {
-        thread_i = 0; 
+        thread_i = 0; // Мягкая ротация — не ломает логику, не вызывает join(), не мешает потокам
     }
     
     float temp_next = params.temp;
@@ -3446,8 +3381,6 @@ std::string resp = send_curl(url);
     bool done = false;
     std::string text_to_speak;
     int new_tokens = 0;
-    // --- КОНЕЦ ПАТЧА ---
-
 
     while (true) {
     // predict
