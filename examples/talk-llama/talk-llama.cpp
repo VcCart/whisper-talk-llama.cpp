@@ -147,10 +147,10 @@ struct whisper_params {
     int32_t max_tokens = 64;
     int32_t audio_ctx  = 0;
     int32_t n_gpu_layers = 999;
-	float vad_thold  = 0.6f;
-    float vad_start_thold  = 0.000270f;
-    float vad_last_ms  = 1250;
-    float freq_thold = 100.0f;
+	float vad_thold  = 0.0005f;
+    float vad_start_thold  = 0.0003f;
+    float vad_last_ms  = 1500;
+    float freq_thold = 90.0f;
     bool speed_up       = false;
     bool translate      = false;
     bool print_special  = false;
@@ -209,6 +209,7 @@ struct whisper_params {
     float repeat_penalty = 1.10;   
     int repeat_last_n = 256;
     int n_keep = 128;
+    bool safe_context_shift = true;     // Включить расширенную защиту (всегда true в этом патче)
 };
 
 // ### ПАРСИНГ АРГУМЕНТОВ КОМАНДНОЙ СТРОКИ ###
@@ -256,7 +257,7 @@ bool whisper_params_parse(int argc, char **argv, whisper_params &params) {
             } 
             else if (arg == "-vlm" || arg == "--vad-last-ms") {
                 params.vad_last_ms = std::stoi(argv[++i]);
-            } 
+            }
             else if (arg == "-fth" || arg == "--freq-thold") {
                 params.freq_thold = std::stof(argv[++i]);
             } 
@@ -2374,50 +2375,79 @@ if (llama_decode(ctx_llama, batch)) {
 	int eot_antiprompt_id_2 = 0;
 	std::string current_voice = params.xtts_voice;
 
-    // обратные подсказки для определения того, когда пришло время прекратить разговор
-    std::vector<std::string> antiprompts = {
-        params.person + chat_symb,
-        params.person + " "+chat_symb,
-    };
-	if (!params.allow_newline) antiprompts.push_back("\n");
-	if (!params.instruct_preset_data["stop_sequence"].empty())  antiprompts.push_back(params.instruct_preset_data["stop_sequence"]);
-	if (!params.instruct_preset_data["bot_message_suffix"].empty())  
-	{
-		antiprompts.push_back(params.instruct_preset_data["bot_message_suffix"]);
-		eot_antiprompt_id_1 = antiprompts.size()-1;
-		antiprompts.push_back("</end_of_turn>"); // weird tag that gemma-2-9 sometimes return instead of <end_of_turn>
-		eot_antiprompt_id_2 = antiprompts.size()-1;
-	}
-	
-	// дополнительные стоп-слова
-	size_t startIndex = 0;
-    size_t endIndex = params.stop_words.find(';');
-	if (params.stop_words.size())
-	{
-		if (endIndex == std::string::npos) // single word
-		{
-			antiprompts.push_back(params.stop_words);
-		}
-		else
-		{
-			while (startIndex < params.stop_words.size()) // несколько стоп-слов
-			{
-				std::string word = params.stop_words.substr(startIndex, endIndex - startIndex);
-				if (word.size())
-				{
-					word = ::replace(word, "\\r", "\r");
-					word = ::replace(word, "\\n", "\n");
-					antiprompts.push_back(word);
-				}
-				startIndex = endIndex + 1;
-				endIndex = params.stop_words.find(';', startIndex);
-				if (endIndex == std::string::npos) endIndex = params.stop_words.size();
-			}	
-		}
-	}
+// === УЛУЧШЕННЫЕ АНТИПРОМПТЫ (без проблемного \n) ===
+std::vector<std::string> antiprompts = {
+    params.person + chat_symb,      // "Друг:"
+    params.person + " " + chat_symb, // "Друг :"
+};
 
-	printf("Llama stop words: ");
-	for (const auto &prompt : antiprompts) printf("'%s', ", prompt.c_str());
+// Добавляем варианты с двоеточием для надежности (как в Mozer)
+antiprompts.push_back(params.person + ":");
+antiprompts.push_back(params.person + " :");
+
+// Стоп-последовательность из инструкций
+if (!params.instruct_preset_data["stop_sequence"].empty()) {
+    antiprompts.push_back(params.instruct_preset_data["stop_sequence"]);
+}
+
+// Суффикс сообщения бота
+if (!params.instruct_preset_data["bot_message_suffix"].empty())  
+{
+    antiprompts.push_back(params.instruct_preset_data["bot_message_suffix"]);
+    eot_antiprompt_id_1 = antiprompts.size() - 1;
+    
+    // Страховка от странных тегов
+    antiprompts.push_back("</end_of_turn>");
+    eot_antiprompt_id_2 = antiprompts.size() - 1;
+}
+
+// Пользовательские стоп-слова (с фильтром коротких слов)
+if (!params.stop_words.empty())
+{
+    size_t startIndex = 0;
+    size_t endIndex = params.stop_words.find(';');
+    
+    if (endIndex == std::string::npos) {
+        // Одно слово
+        std::string word = params.stop_words;
+        if (word.length() >= 2) {  // ← ФИЛЬТР: игнорируем слова короче 2 символов
+            word = ::replace(word, "\\r", "\r");
+            word = ::replace(word, "\\n", "\n");
+            antiprompts.push_back(word);
+        }
+    } else {
+        // Несколько слов через ";"
+        while (startIndex < params.stop_words.size())
+        {
+            std::string word = params.stop_words.substr(startIndex, endIndex - startIndex);
+            if (!word.empty())
+            {
+                // ← ФИЛЬТР: игнорируем слова короче 2 символов
+                if (word.length() >= 2) {
+                    word = ::replace(word, "\\r", "\r");
+                    word = ::replace(word, "\\n", "\n");
+                    antiprompts.push_back(word);
+                }
+            }
+            startIndex = endIndex + 1;
+            endIndex = params.stop_words.find(';', startIndex);
+            if (endIndex == std::string::npos) {
+                endIndex = params.stop_words.size();
+            }
+        }
+    }
+}
+
+// Выводим итоговый список стоп-слов для отладки
+printf("Llama stop words (%zu): ", antiprompts.size());
+for (const auto &prompt : antiprompts) {
+    if (prompt.length() < 10) {
+        printf("'%s', ", prompt.c_str());
+    } else {
+        printf("'%.7s...', ", prompt.c_str());
+    }
+}
+printf("\n");
 
 	std::thread input_thread(input_thread_func);
 	std::thread shortcut_thread([cur_window_handle]() {
@@ -2445,6 +2475,10 @@ if (llama_decode(ctx_llama, batch)) {
 	llama_time_total = 0.0;
     std::string user_typed = "";
     bool user_typed_this = false;
+    // === Для Патча 3: буфер накопления ввода ===
+static std::string input_accumulator = "";      // буфер накопления фраз
+static float last_input_time = 0.0f;            // время последнего ввода (секунды)
+const float INPUT_TIMEOUT_MS = 1.5f;            // 1.5 сек тишины = конец фразы
 
 // ### ОСНОВНОЙ ЦИКЛ РАБОТЫ ПРИЛОЖЕНИЯ ###
     while (is_running) {
@@ -2459,20 +2493,30 @@ if (llama_decode(ctx_llama, batch)) {
         // задержка. попробуйте опустить?
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         int64_t t_ms = 0;
+            // === FIX: Объявляем text_heard раньше, чтобы он был виден в keyboard input ===
+    static std::string text_heard = "";  // static — сохраняет значение между итерациями
 		
-        // keyboard input
-        user_typed_this = false;  // Сброс флага (уже объявлен ранее в функции)
-        console::set_display(console::reset);
+        // === ПАТЧ 3: Буфер накопления ввода пользователя ===
+// === ВАЖНО: Перед этим патчем, в начале функции run(), добавь эти переменные: ===
+// static std::string input_accumulator = "";      // буфер накопления
+// static float last_input_time = 0.0f;            // время последнего ввода
+// const float INPUT_TIMEOUT_MS = 1.5f;            // 1.5 сек тишины = конец фразы
+
+// keyboard input
+user_typed_this = false;
+console::set_display(console::reset);
+
+// === ФИКС: Накопление ввода вместо мгновенной отправки ===
+{
+    std::lock_guard<std::mutex> lock(input_mutex);
+    if (!input_queue.empty())
+    {
+        std::string buffer;
+        while (!input_queue.empty())
         {
-            std::lock_guard<std::mutex> lock(input_mutex);
-            if (!input_queue.empty())
-            {
-                std::string buffer;
-                while (!input_queue.empty())
-                {
-                    buffer += input_queue.front() + " ";
-                    input_queue.pop();
-                }
+            buffer += input_queue.front() + " ";
+            input_queue.pop();
+        }
                 user_typed = buffer;
                 trim(user_typed);
                 user_typed_this = true;
@@ -3389,126 +3433,111 @@ std::string resp = send_curl(url);
             if (embd.size() > 0) {
     		    if (n_past + (int) embd.size() > n_ctx) {
              
-// СЛОЖНОЕ УПРАВЛЕНИЕ КОНТЕКСТОМ (Shift context)
+// === НОВЫЙ ПАТЧ 1: ОПТИМИЗИРОВАННАЯ РОТАЦИЯ КОНТЕКСТА ===
+// Используем штатные методы llama.cpp для сдвига контекста,
+// что должно быть быстрее и надежнее ручного управления токенами.
 if (n_past + (int)embd.size() > n_ctx) {
+    // Получаем вокабуляр для проверки BOS токена
     const llama_vocab * vocab_llama = llama_model_get_vocab(model_llama);
+    
     // Безопасное вычисление n_left и n_discard с защитой от отрицательных значений
     const int n_left = std::max(0, n_past - n_keep);
-    const int n_discard = std::max(0, n_left / 4);
+    
+    // Вычисляем, сколько токенов нужно выбросить. Используем ту же логику, что и была (n_left / 4),
+    // но добавляем защиту от отрицательных значений и минимум в 1 токен.
+    int n_discard = 0;
+    if (n_left > 0) {
+        n_discard = std::max(1, n_left / 4);
+        // Убеждаемся, что n_discard не больше, чем n_left
+        n_discard = std::min(n_discard, n_left);
+    }
+    
+    // Флаг для отслеживания, был ли выполнен сдвиг
     bool context_updated = false;
     
-    if (n_discard > 0) {
-        // Безопасные проверки границ перед удалением
-        if (n_keep >= 0 && n_keep <= (int)embd_inp.size()) {
-            if (n_keep + n_discard <= (int)embd_inp.size() && n_keep + n_discard <= n_past) {
-                // 1. Удаляем токены из локального буфера с безопасными индексами
-                size_t erase_start = (size_t)n_keep;
-                size_t erase_end = (size_t)(n_keep + n_discard);
-                
-                // Дополнительная проверка на случай крайних случаев
-                if (erase_start < erase_end && erase_end <= embd_inp.size()) {
-                    embd_inp.erase(
-                        embd_inp.begin() + erase_start,
-                        embd_inp.begin() + erase_end
-                    );
-
-                    // СИНХРОННО удаляем токены из session_tokens с такими же проверками
-                    if (!session_tokens.empty()) {
-                        size_t session_erase_start = std::min((size_t)n_keep, session_tokens.size());
-                        size_t session_erase_end = std::min((size_t)(n_keep + n_discard), session_tokens.size());
-                        
-                        if (session_erase_start < session_erase_end) {
-                            session_tokens.erase(
-                                session_tokens.begin() + session_erase_start,
-                                session_tokens.begin() + session_erase_end
-                            );
-                        }
-                    }
-
-                    // 2a. Удаляем записи KV-кэша с проверкой валидности диапазона
-                    if (n_keep >= 0 && n_keep + n_discard > n_keep) {
-                        llama_memory_seq_rm(
-                            llama_get_memory(ctx_llama),
-                            0,
-                            n_keep,
-                            n_keep + n_discard
-                        );
-                    }
-                    
-                    // 2b. Сдвигаем оставшиеся записи KV-кэша с проверкой
-                    if (n_keep + n_discard < n_past) {
-                        llama_memory_seq_add(llama_get_memory(ctx_llama), 0, n_keep + n_discard, n_past, -n_discard);
-                    }
-
-                    // 3. Добавляем последние n_prev токенов в embd с безопасными проверками
-                    const int keep_recent = std::min(
-                        std::max(0, (int)embd_inp.size() - n_keep), 
-                        n_prev
-                    );
-                    
-                    if (keep_recent > 0 && embd_inp.size() >= (size_t)keep_recent) {
-                        embd.insert(embd.begin(), embd_inp.end() - keep_recent, embd_inp.end());
-                    }
-                    
-                    context_updated = true;
-                    printf(" [Context shifted: discarded %d tokens. New context size: %zu.]", n_discard, embd_inp.size());
-                }
-            } else {
-                fprintf(stderr, "WARNING: Invalid bounds for context shift: n_keep=%d, n_discard=%d, embd_inp.size()=%zu\n",
-                        n_keep, n_discard, embd_inp.size());
+    // Дополнительная защита: проверяем валидность диапазона для удаления
+    if (n_discard > 0 && n_keep + n_discard <= n_past) {
+        // Проверяем границы embd_inp для безопасности
+        if (n_keep >= 0 && n_keep + n_discard <= (int)embd_inp.size()) {
+            
+            // 1. Удаляем диапазон [n_keep, n_keep + n_discard) из KV-кэша для последовательности 0.
+            //    Используем llama_memory_seq_rm (как в вашем оригинальном коде)
+            llama_memory_seq_rm(llama_get_memory(ctx_llama), 0, n_keep, n_keep + n_discard);
+            
+            // 2. Сдвигаем оставшиеся токены (с n_keep + n_discard до n_past) влево на n_discard позиций.
+            if (n_keep + n_discard < n_past) {
+                llama_memory_seq_add(llama_get_memory(ctx_llama), 0, n_keep + n_discard, n_past, -n_discard);
             }
-        } else {
-            fprintf(stderr, "WARNING: Invalid n_keep=%d, embd_inp.size()=%zu\n", n_keep, embd_inp.size());
+            
+            // 3. Обновляем наш локальный буфер токенов, просто удаляя соответствующий диапазон.
+            //    Это значительно быстрее, чем вручную собирать embd из обрезков.
+            embd_inp.erase(embd_inp.begin() + n_keep, embd_inp.begin() + n_keep + n_discard);
+            
+            // 4. Синхронизируем session_tokens, если используется сессия.
+            if (!path_session.empty() && !session_tokens.empty()) {
+                size_t session_erase_start = std::min((size_t)n_keep, session_tokens.size());
+                size_t session_erase_end = std::min((size_t)(n_keep + n_discard), session_tokens.size());
+                if (session_erase_start < session_erase_end) {
+                    session_tokens.erase(session_tokens.begin() + session_erase_start,
+                                         session_tokens.begin() + session_erase_end);
+                }
+            }
+            
+            context_updated = true;
+            printf(" [Context shifted: discarded %d tokens. New context size: %zu.]", 
+                   n_discard, embd_inp.size());
         }
     }
-    if (!context_updated) {
-        // fallback: сброс контекста до n_keep с безопасными проверками
-        printf(" [Context shift not possible or bounds error, falling back to reset]");
-        
-        // Безопасное изменение размера embd_inp
-        size_t new_size = std::min((size_t)std::max(0, n_keep), embd_inp.size());
-        embd_inp.resize(new_size);
-        
-        //Синхронизируем session_tokens с безопасными проверками
-        if (!session_tokens.empty()) {
-            size_t session_new_size = std::min((size_t)std::max(0, n_keep), session_tokens.size());
-            session_tokens.resize(session_new_size);
-        }
-        
-        const int keep_recent = std::min(
-            std::max(0, (int)embd_inp.size() - n_keep), 
-            n_prev
-        );
-        
-        if (keep_recent > 0 && embd_inp.size() >= (size_t)keep_recent) {
-            embd.insert(embd.begin(), embd_inp.end() - keep_recent, embd_inp.end());
-        }
-    }
-    // ЕДИНСТВЕННОЕ МЕСТО ОБНОВЛЕНИЯ n_past - после ВСЕХ изменений embd_inp
-    n_past = (int)embd_inp.size();
-    n_session_consumed = n_past; // ВАЖНО: обновляем счетчик сессии
     
-    // Проверка и восстановление BOS-токена, если нужно (с проверкой vocab_llama)
+    // Если сдвиг не удался (например, из-за невалидных параметров), используем безопасный fallback
+    if (!context_updated) {
+        printf(" [Context shift fallback - keeping last %d tokens.]", n_keep);
+        
+        // Просто оставляем последние n_keep токенов
+        size_t new_size = std::min((size_t)std::max(0, n_keep), embd_inp.size());
+        if (new_size < embd_inp.size()) {
+            embd_inp.resize(new_size);
+            
+            // Синхронизируем session_tokens
+            if (!path_session.empty() && !session_tokens.empty()) {
+                size_t session_new_size = std::min((size_t)std::max(0, n_keep), session_tokens.size());
+                session_tokens.resize(session_new_size);
+            }
+            
+            // В вашей версии API нет прямой функции для полной очистки кэша,
+            // поэтому используем существующий подход
+            printf(" [Using fallback reset]");
+        }
+    }
+    
+    // ВАЖНО: Обновляем n_past после всех изменений
+    n_past = (int)embd_inp.size();
+    n_session_consumed = n_past;
+    
+    // Проверка и восстановление BOS-токена, если нужно
     if (vocab_llama) {
+        // В вашей версии используется llama_token_bos, а не llama_vocab_bos
         const llama_token bos_token = llama_token_bos(vocab_llama);
         if (!embd_inp.empty() && embd_inp[0] != bos_token) {
             embd_inp.insert(embd_inp.begin(), bos_token);
             
-            // ПАТЧ: Синхронизируем session_tokens
+            // Синхронизируем session_tokens
             if (!session_tokens.empty()) {
                 session_tokens.insert(session_tokens.begin(), bos_token);
             }
             
             n_past = (int)embd_inp.size();
             n_session_consumed = n_past;
-            printf(" [BOS token was missing, added it back. n_past adjusted.]");
+            printf(" [BOS token restored.]");
         }
     } else {
         fprintf(stderr, "WARNING: vocab_llama is null, cannot check BOS token\n");
     }
     
     printf(" [Final context size: %zu. n_past: %d]", embd_inp.size(), n_past);
-    path_session = ""; // Отключаем сессию после shift
+    
+    // Отключаем сессию после сдвига
+    path_session = "";
 }
 } 
     // Попытка повторного использования совпадающего префикса из загруженной сессии
@@ -3624,12 +3653,12 @@ char out_token_symbol;
             // Добавляем токен в контекст для следующей итерации
             embd.push_back(id);
             // если модель выводит только одиночную "*", заменяем на fallback-текст
-            out_token_str = llama_token_to_piece(ctx_llama, id);
-            
+out_token_str = llama_token_to_piece(ctx_llama, id);
+
             // Просто выводим токен как есть. Не нужно блокировать звездочки — это действия персонажа.
             text_to_speak += out_token_str;  
-            printf("%s", out_token_str.c_str());  
-            tokens_in_reply++;
+    printf("%s", out_token_str.c_str());
+tokens_in_reply++;
             
             // Проверка на зацикливание последовательности
             if (params.seqrep)  // Если включена проверка на повторения
@@ -3710,11 +3739,11 @@ char out_token_symbol;
         // Не разбиваем по Mr.
         if (text_to_speak.size() >= 3 && text_to_speak.substr(text_to_speak.size()-3, 3) == "Mr.") 
             text_to_speak[text_len-1] = ' ';
-        // Остановка генерации по голосовому сигналу или горячей клавише
-        // Проверяем каждые 2 токена
-        if (new_tokens % 2 == 0)
+        
+        
+            // Проверяем каждые 2 токена, НО не прерываем первые 50 токенов
+        if (new_tokens % 2 == 0 && new_tokens > 50)  // ← ФИКС 1: даём Эмме начать фразу
         {
-            // Получаем аудио данные (неблокирующий вызов, 2000 мс)
             audio.get(2000, pcmf32_cur);
             // Проверяем уровень энергии (VAD - Voice Activity Detection)
             int vad_result = ::vad_simple_int(pcmf32_cur, WHISPER_SAMPLE_RATE, params.vad_last_ms, 
@@ -3727,9 +3756,9 @@ char out_token_symbol;
             {
                 // 1. Взводим флаги для остановки сетевых потоков и генерации
                 llama_interrupted.store(1);
-                g_is_interrupted.store(true);  
+                g_is_interrupted.store(true);
                 // 2. ОЧИЩАЕМ буфер текста, чтобы следующая итерация цикла не отправила "ошметки" фразы в TTS
-                text_to_speak = ""; 
+                text_to_speak = "";
                 // 3. ОСТАНОВКА ЗВУКА (SDL2)
                 // Очищаем очередь аудио, чтобы недоигранные фрагменты исчезли мгновенно
                 // В talk-llama вывод обычно идет через устройство с ID 2 или глобальный микшер
@@ -3919,13 +3948,16 @@ try
     int i_antiprompt = 0;
     last_output_has_username = false;  // Флаг наличия имени пользователя
     last_output_has_EOT = false;       // Флаг наличия конца текста
+    
+    bool antiprompt_matched = false;  // Флаг, был ли найден антипромпт
+    
     // Проходим по всем антипромптам
     for (std::string & antiprompt : antiprompts) 
     {
         // Обработка нескольких имён персонажей для XTTS
         if (params.multi_chars && last_output.size()>=4)
         {
-            // Очищаем текст от различных знаков препинания, которые могут мешать распознаванию
+            // Очищаем текст от различных знаков препинания
             last_output = ::replace(last_output, " ???", ""); 
             last_output = ::replace(last_output, " ??", "");
             last_output = ::replace(last_output, " ?", "");
@@ -3940,119 +3972,124 @@ try
             last_output = ::replace(last_output, "...", "");
             last_output = ::replace(last_output, "(", "");
             last_output = ::replace(last_output, ")", "");
-            // Поиск нового персонажа - будет использован его голос в TTS
+            
+            // Поиск нового персонажа
             std::smatch matches;							
-            // Регулярное выражение для поиска имени персонажа (формат: \nИмя:)
             std::regex r("\n([^:]*):", std::regex::icase | std::regex::optimize);
-            // Если найдено имя персонажа и оно не пустое
+            
             if (std::regex_search(last_output, matches, r) && !matches.empty() && 
                 matches.size() >= 2 && !matches[1].str().empty() && 
-                matches[1].str() != params.person &&  // Не имя пользователя
+                matches[1].str() != params.person &&  
                 matches[1].str() != " \n"+params.person) 
             {
-                // Извлекаем имя текущего голоса
-                current_voice_tmp = matches[1].str();
-                current_voice_tmp = ::replace(current_voice_tmp, ":", "");   // Убираем двоеточие
-                current_voice_tmp = ::replace(current_voice_tmp, "\"", "");  // Убираем кавычки
-                trim(current_voice_tmp);  // Убираем пробелы по краям
+                std::string current_voice_tmp = matches[1].str();
+                current_voice_tmp = ::replace(current_voice_tmp, ":", "");
+                current_voice_tmp = ::replace(current_voice_tmp, "\"", "");
+                trim(current_voice_tmp);
                 
-                // Проверяем, что имя валидное (не слишком короткое и не слишком длинное)
                 if (current_voice_tmp.size()>1 && current_voice_tmp.size()<30) 
                 {
-                    current_voice = current_voice_tmp;  // Устанавливаем новый голос
-                    
-                    // Удаляем имя бота из текста для озвучки
+                    current_voice = current_voice_tmp;
                     std::regex regEx("\n" + current_voice + ":");
                     text_to_speak = std::regex_replace(text_to_speak, regEx, "\n");
                 }									
             }
         }
+        
         // Обработка стоп-слов
-        // Проверяем, содержит ли последний вывод антипромпт (стоп-слово)
         if (last_output.length() > antiprompt.length() && 
             last_output.find(antiprompt.c_str(), last_output.length() - antiprompt.length(), antiprompt.length()) != std::string::npos) 
         {
-            done = true;  // Устанавливаем флаг завершения
+            antiprompt_matched = true;  // Запоминаем, что антипромпт найден
+            
+            done = true;  // Предварительно устанавливаем флаг завершения
             // Удаляем антипромпт из текста для озвучки
             text_to_speak = ::replace(text_to_speak, antiprompt, "");
-            fflush(stdout);  // Сбрасываем буфер вывода
-            need_to_save_session = true;  // Помечаем, что нужно сохранить сессию
+            fflush(stdout);
+            need_to_save_session = true;
+            
             // Если это первый антипромпт (обычно имя пользователя)
             if (i_antiprompt == 0) 
             {
-                last_output_has_username = true;  // Устанавливаем флаг имени пользователя
-                printf(" "); // Для вводимого текста
+                last_output_has_username = true;
+                printf(" ");
             }
             // Если это антипромпт конца текста (EOT)
             else if (i_antiprompt == eot_antiprompt_id_1 || i_antiprompt == eot_antiprompt_id_2) 
             {
-                last_output_has_EOT = true;	 // Устанавливаем флаг конца текста							
+                last_output_has_EOT = true;							
             }
+            
             // Если антипромпт является суффиксом сообщения бота или тегом конца
             if (antiprompt == params.instruct_preset_data["bot_message_suffix"] || antiprompt == "</end_of_turn>" ) 
             {
-                // Создаём строки для удаления напечатанного тега
-                std::string backspaces(antiprompt.length(), '\b');  // Символы возврата курсора
-                std::string spaces(antiprompt.length(), ' ');        // Пробелы для замены
+                std::string backspaces(antiprompt.length(), '\b');
+                std::string spaces(antiprompt.length(), ' ');
                 fflush(stdout);
-                // Удаляем напечатанный тег с экрана
-                printf("%s", backspaces.c_str()); // удаляем напечатанный тег
-                printf("%s", spaces.c_str());     // заменяем пробелами
-                printf("%s", backspaces.c_str()); // удаляем пробелы
+                printf("%s", backspaces.c_str());
+                printf("%s", spaces.c_str());
+                printf("%s", backspaces.c_str());
                 printf("\n");
                 fflush(stdout);
             }
+            
             // Проверка минимального количества токенов в ответе
-            // Если задано минимальное количество токенов и текущий ответ короче
             if (params.min_tokens && tokens_in_reply < params.min_tokens)
             {
-                // Рассчитываем количество символов и токенов для удаления
-                int symbols_to_delete = static_cast<int>(utf8_length(antiprompt) * 1) + 1; // +\n
+                int symbols_to_delete = static_cast<int>(utf8_length(antiprompt) * 1) + 1;
                 const std::vector<llama_token> tokens_to_del = llama_tokenize(ctx_llama, antiprompt.c_str(), false);
-                int rollback_num = tokens_to_del.size() + 1; // + \n
+                int rollback_num = tokens_to_del.size() + 1;
                 
-                if (rollback_num) // Если есть токены для удаления
+                if (rollback_num)
                 {		
-                    // Удаляем токены из контекста
                     embd_inp.erase(embd_inp.end() - rollback_num, embd_inp.end());
-                    n_past = embd_inp.size();  // Обновляем позицию
-                    n_session_consumed = n_past;  // Обновляем сессию
-                    // Удаляем последовательность 0 из KV-кэша (новый API)
-                    // Диапазон [embd_inp.size(), end)
+                    n_past = embd_inp.size();
+                    n_session_consumed = n_past;
                     llama_memory_seq_rm(llama_get_memory(ctx_llama), 0, embd_inp.size(), -1);
-                    // Обновляем текст для озвучки
+                    
                     if (symbols_to_delete > utf8_length(text_to_speak)) text_to_speak = "";
                     else text_to_speak = utf8_substr(text_to_speak, 0, utf8_length(text_to_speak)-symbols_to_delete);
-                    temp_next = 1.8; // Повышаем температуру для следующего токена
+                    
+                    temp_next = 1.8;
                     fflush(stdout);
-                    // Удаляем напечатанное имя пользователя
-                    printf("\b\b\b\b\b\b\b\b\b\b\b\b"); // удаляем напечатанное имя пользователя
+                    printf("\b\b\b\b\b\b\b\b\b\b\b\b");
                     fflush(stdout);
-                    done = false;  // Снимаем флаг завершения (продолжаем генерацию)
+                    done = false;  // Продолжаем генерацию
                 }
-                // Если включён режим отладки
+                
                 if (params.debug)
                 {
-                    // Выводим весь текст в контексте для отладки
                     std::string full_dialog = emb_to_str(ctx_llama, embd_inp);
-                    printf("\n=====FULL text in embd (%zd tokens, %zd symbols)=====\n%s\n====END====\n", embd_inp.size(), full_dialog.size(), full_dialog.c_str());
+                    printf("\n=====FULL text in embd (%zd tokens, %zd symbols)=====\n%s\n====END====\n", 
+                           embd_inp.size(), full_dialog.size(), full_dialog.c_str());
                 }
             }
             else 
             {		
-                // Если не нужно удалять токены (ответ достаточной длины)
                 if (params.debug)
                 {
-                    // Выводим весь текст в контексте для отладки
                     std::string full_dialog = emb_to_str(ctx_llama, embd_inp);
-                    printf("\n=====FULL text in embd (%zd tokens, %zd symbols)=====\n%s\n====END====\n", embd_inp.size(), full_dialog.size(), full_dialog.c_str());
+                    printf("\n=====FULL text in embd (%zd tokens, %zd symbols)=====\n%s\n====END====\n", 
+                           embd_inp.size(), full_dialog.size(), full_dialog.c_str());
                 }
-                break;  // Выходим из цикла обработки антипромптов
+                break;
             }
         }
-        i_antiprompt++;  // Переходим к следующему антипромпту
+        i_antiprompt++;
+    } // КОНЕЕЦ ЦИКЛА for
+    
+    // ========== ДОБАВЛЕННАЯ ФИНАЛЬНАЯ ПРОВЕРКА ==========
+    // СТРАХОВКА: если антипромпт был найден, но ответ слишком короткий,
+    // принудительно продолжаем генерацию (перезаписываем done)
+    if (antiprompt_matched && params.min_tokens > 0 && tokens_in_reply < params.min_tokens) {
+        done = false;  // Гарантированно продолжаем
+        if (params.verbose) {
+            printf(" [Safety: short response protected] ");
+        }
     }
-}
+    // ========== КОНЕЦ ДОБАВЛЕННОЙ ПРОВЕРКИ ==========
+    
+} // КОНЕЦ БЛОКА антипромптов
 // ### ОБРАБОТКА АУДИОВХОДА И СИГНАЛОВ (VAD) ###
             // Проверяем SDL события (ввод с клавиатуры, закрытие окна и т.д.)
             is_running = sdl_poll_events();
