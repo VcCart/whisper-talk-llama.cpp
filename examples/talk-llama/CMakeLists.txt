@@ -22,7 +22,7 @@ if (WHISPER_SDL2)
         llama-kv-cache-iswa.cpp
         llama-memory-recurrent.cpp
         llama-memory-hybrid.cpp
-        llama-memory-hybrid-iswa.cpp
+		llama-memory-hybrid-iswa.cpp
         llama-memory.cpp
         llama-mmap.cpp
         llama-model-loader.cpp
@@ -34,8 +34,8 @@ if (WHISPER_SDL2)
         unicode.cpp
         unicode-data.cpp
         ${SRC_MODELS})
-		    
-    target_include_directories(${TARGET} PRIVATE ${SDL2_INCLUDE_DIRS})
+    
+    target_include_directories(${TARGET} PRIVATE . ${SDL2_INCLUDE_DIRS})
 	set(CMAKE_TOOLCHAIN_FILE "c:\\DATA\\vcpkg\\scripts\\buildsystems\\vcpkg.cmake" CACHE STRING "")
 	find_package (CURL REQUIRED)
 	include_directories(${CURL_INCLUDE_DIRS})
@@ -46,7 +46,8 @@ if (WHISPER_SDL2)
 	find_package (CURL REQUIRED)
 	include_directories(${CURL_INCLUDE_DIRS})
 	include_directories("c:\\DATA\\vcpkg\\installed\\x64-windows\\lib")
-	target_link_libraries(${TARGET} PRIVATE CURL::libcurl)  
+	target_link_libraries(${TARGET} PRIVATE CURL::libcurl)    
+    
     target_include_directories(${TARGET} PRIVATE ${SDL2_INCLUDE_DIRS})
 
     target_link_libraries(${TARGET} PRIVATE common common-sdl whisper ${SDL2_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
