@@ -2381,9 +2381,6 @@ std::vector<std::string> antiprompts = {
     params.person + " " + chat_symb, // "Друг :"
 };
 
-// Добавляем варианты с двоеточием для надежности (как в Mozer)
-antiprompts.push_back(params.person + ":");
-antiprompts.push_back(params.person + " :");
 
 // Стоп-последовательность из инструкций
 if (!params.instruct_preset_data["stop_sequence"].empty()) {
@@ -2441,11 +2438,7 @@ if (!params.stop_words.empty())
 // Выводим итоговый список стоп-слов для отладки
 printf("Llama stop words (%zu): ", antiprompts.size());
 for (const auto &prompt : antiprompts) {
-    if (prompt.length() < 10) {
-        printf("'%s', ", prompt.c_str());
-    } else {
-        printf("'%.7s...', ", prompt.c_str());
-    }
+    printf("'%s', ", prompt.c_str());  // Без обрезки
 }
 printf("\n");
 
@@ -3650,15 +3643,146 @@ char out_token_symbol;
             }
         // Если токен не является токеном окончания (EOS)
         if (id != llama_vocab_eos(vocab_llama)) {
+            
             // Добавляем токен в контекст для следующей итерации
             embd.push_back(id);
+            
             // если модель выводит только одиночную "*", заменяем на fallback-текст
-out_token_str = llama_token_to_piece(ctx_llama, id);
+            out_token_str = llama_token_to_piece(ctx_llama, id);
 
-            // Просто выводим токен как есть. Не нужно блокировать звездочки — это действия персонажа.
-            text_to_speak += out_token_str;  
-    printf("%s", out_token_str.c_str());
-tokens_in_reply++;
+            // === УЛУЧШЕННЫЙ КОД: UTF-8 валидация + фильтр скобок и звездочек ===
+            static std::string output_buffer; // Буфер для накопления токенов
+            static bool in_parentheses = false; // Флаг: мы внутри скобок?
+            static std::string parentheses_buffer; // Буфер для содержимого скобок
+
+            // Добавляем текущий токен в общий буфер
+            output_buffer += out_token_str;
+
+            // ШАГ 1: Обработка скобок
+            if (!in_parentheses) {
+                // Мы не внутри скобок - ищем открывающую скобку
+                size_t open_pos = output_buffer.find('(');
+                if (open_pos != std::string::npos) {
+                    // Есть открывающая скобка - выводим текст до нее
+                    if (open_pos > 0) {
+                        std::string before = output_buffer.substr(0, open_pos);
+                        // Проверяем UTF-8 валидность before
+                        if (utf8_length(before) > 0) {
+                            printf("%s", before.c_str());
+                            text_to_speak += before;
+                            tokens_in_reply += utf8_length(before);
+                        }
+                    }
+                    
+                    // Переходим в режим скобок
+                    in_parentheses = true;
+                    parentheses_buffer = output_buffer.substr(open_pos + 1);
+                    output_buffer.clear();
+                    
+                    // Проверяем, не закрылась ли скобка сразу
+                    size_t close_pos = parentheses_buffer.find(')');
+                    if (close_pos != std::string::npos) {
+                        // Скобка закрылась - полностью игнорируем содержимое
+                        in_parentheses = false;
+                        std::string after = parentheses_buffer.substr(close_pos + 1);
+                        parentheses_buffer.clear();
+                        
+                        // Если есть текст после скобки - обработаем его в следующей итерации
+                        if (!after.empty()) {
+                            output_buffer = after;
+                        }
+                    }
+                }
+            } else {
+                // Мы внутри скобок - добавляем токен в буфер скобок
+                parentheses_buffer += out_token_str;
+                output_buffer.clear(); // Очищаем основной буфер, т.к. мы внутри скобок
+                
+                // Проверяем, не закрылись ли скобки
+                size_t close_pos = parentheses_buffer.find(')');
+                if (close_pos != std::string::npos) {
+                    // Скобки закрылись - выбрасываем всё содержимое
+                    in_parentheses = false;
+                    std::string after = parentheses_buffer.substr(close_pos + 1);
+                    parentheses_buffer.clear();
+                    
+                    // Если есть текст после скобки - сохраняем для вывода
+                    if (!after.empty()) {
+                        output_buffer = after;
+                    }
+                }
+            }
+
+            // ШАГ 2: Если мы не внутри скобок и есть что выводить - проверяем UTF-8
+            if (!in_parentheses && !output_buffer.empty()) {
+                // Проверяем UTF-8 валидность всего буфера
+                const unsigned char* bytes = reinterpret_cast<const unsigned char*>(output_buffer.c_str());
+                size_t len = output_buffer.length();
+                size_t i = 0;
+                bool utf8_valid = true;
+                size_t last_valid_pos = 0;
+                
+                while (i < len) {
+                    unsigned char c = bytes[i];
+                    size_t char_len = 0;
+                    
+                    if (c <= 0x7F) {
+                        char_len = 1;
+                    } else if ((c & 0xE0) == 0xC0) {
+                        char_len = 2;
+                        if (i + 1 >= len) { utf8_valid = false; break; }
+                    } else if ((c & 0xF0) == 0xE0) {
+                        char_len = 3;
+                        if (i + 2 >= len) { utf8_valid = false; break; }
+                    } else if ((c & 0xF8) == 0xF0) {
+                        char_len = 4;
+                        if (i + 3 >= len) { utf8_valid = false; break; }
+                    } else {
+                        utf8_valid = false;
+                        break;
+                    }
+                    
+                    i += char_len;
+                    last_valid_pos = i;
+                }
+                
+                // Если весь буфер валиден - выводим
+                if (utf8_valid && i == len) {
+                    // Дополнительная очистка от одиночных звездочек
+                    std::string clean_text = output_buffer;
+                    
+                    // Удаляем одиночные звездочки (но не жирный текст **)
+                    size_t star_pos;
+                    while ((star_pos = clean_text.find('*')) != std::string::npos) {
+                        // Проверяем, не часть ли это **
+                        if (star_pos > 0 && clean_text[star_pos - 1] == '*') {
+                            // Это часть ** - пропускаем
+                            star_pos++;
+                            continue;
+                        }
+                        if (star_pos + 1 < clean_text.size() && clean_text[star_pos + 1] == '*') {
+                            // Это часть ** - пропускаем
+                            star_pos++;
+                            continue;
+                        }
+                        // Одиночная звездочка - удаляем
+                        clean_text.erase(star_pos, 1);
+                    }
+                    
+                    // Удаляем множественные точки и восклицательные знаки
+                    clean_text = std::regex_replace(clean_text, std::regex(R"(\.{3,})"), "...");
+                    clean_text = std::regex_replace(clean_text, std::regex(R"(\!{3,})"), "!!!");
+                    
+                    // Выводим очищенный текст
+                    printf("%s", clean_text.c_str());
+                    text_to_speak += clean_text;
+                    tokens_in_reply += utf8_length(clean_text);
+                    output_buffer.clear();
+                } else {
+                    // Буфер содержит неполный UTF-8 символ - оставляем для следующей итерации
+                    // Ничего не выводим
+                }
+            }
             
             // Проверка на зацикливание последовательности
             if (params.seqrep)  // Если включена проверка на повторения
