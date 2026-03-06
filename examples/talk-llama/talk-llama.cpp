@@ -3878,24 +3878,21 @@ try
                 }
 
                 // Проверяем уровень энергии, если пользователь говорит
-                // (не вызывает распознавание whisper, только громкий шум останавливает всё)
                 if (!params.push_to_talk || (params.push_to_talk && g_hotkey_pressed == "Alt"))
                 {
-                    // Получаем аудио данные (неблокирующий вызов, 2000 мс)
-                    audio.get(2000, pcmf32_cur);
-                    // Проверяем активность голоса (VAD - Voice Activity Detection)
+                    // Получаем аудио данные (неблокирующий вызов)
+                    audio.get(params.interrupt_check_ms, pcmf32_cur);
+                    
                     int vad_result = ::vad_simple_int(pcmf32_cur, WHISPER_SAMPLE_RATE, params.vad_last_ms, 
                     params.vad_thold, params.freq_thold, params.print_energy, 
                     params.vad_start_thold);
 
-                    // Если обнаружена активность голоса
                     if (vad_result == 1) {
                         if (speech_vad_start_ms == 0) {
-                            speech_vad_start_ms = get_current_time_ms() * 1000; // Фиксируем начало звука
+                            speech_vad_start_ms = get_current_time_ms() * 1000;
                         }
                         
-                        // Проверяем длительность: прерываем только если звук длится > 250 мс
-                        if ((get_current_time_ms() * 1000) - speech_vad_start_ms > 250) {
+                        if ((get_current_time_ms() * 1000) - speech_vad_start_ms > params.interrupt_threshold_ms) {
                             printf(" [Speech interruption confirmed!]\n");
                             llama_interrupted.store(1);
                             g_is_interrupted.store(true);
@@ -3904,7 +3901,6 @@ try
                             break;
                         }
                     } else {
-                        // Если звук пропал раньше чем через 250мс — это был шум, сбрасываем таймер
                         speech_vad_start_ms = 0;
                     }
                 }
