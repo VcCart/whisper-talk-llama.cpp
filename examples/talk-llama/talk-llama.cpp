@@ -2481,26 +2481,27 @@ const float INPUT_TIMEOUT_MS = 1.5f;            // 1.5 сек тишины = к�
 
 // ### ОСНОВНОЙ ЦИКЛ РАБОТЫ ПРИЛОЖЕНИЯ ###
     while (is_running) {
+        // ===== ПРОВЕРКА СОБЫТИЙ В НАЧАЛЕ КАЖДОЙ ИТЕРАЦИИ =====
+        // Проверяем SDL события (закрытие окна, Ctrl+C и т.д.)
+        // Это единственное место, где вызывается sdl_poll_events()
+        is_running = sdl_poll_events();
+        if (!is_running) {
+            printf("\n[Shutdown requested, cleaning up...]\n");
+            break;
+        }
+        // ===== КОНЕЦ ПРОВЕРКИ СОБЫТИЙ =====
+        
         // СБРОС СОСТОЯНИЯ ПРЕРЫВАНИЯ
         g_is_interrupted.store(false);
         llama_interrupted.store(0);
-        // handle Ctrl + C
-        is_running = sdl_poll_events();
-        if (!is_running) {
-            break;
-        }
+        
         // задержка. попробуйте опустить?
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         int64_t t_ms = 0;
-            // === FIX: Объявляем text_heard раньше, чтобы он был виден в keyboard input ===
-    static std::string text_heard = "";  // static — сохраняет значение между итерациями
+        // === FIX: Объявляем text_heard раньше, чтобы он был виден в keyboard input ===
+        static std::string text_heard = "";  // static — сохраняет значение между итерациями
 		
-        // === ПАТЧ 3: Буфер накопления ввода пользователя ===
-// === ВАЖНО: Перед этим патчем, в начале функции run(), добавь эти переменные: ===
-// static std::string input_accumulator = "";      // буфер накопления
-// static float last_input_time = 0.0f;            // время последнего ввода
-// const float INPUT_TIMEOUT_MS = 1.5f;            // 1.5 сек тишины = конец фразы
-
+// ===  Буфер накопления ввода пользователя ===
 // keyboard input
 user_typed_this = false;
 console::set_display(console::reset);
@@ -4019,15 +4020,14 @@ try
 } // КОНЕЦ БЛОКА антипромптов
 
 // ### ОБРАБОТКА АУДИОВХОДА И СИГНАЛОВ (VAD) ###
-            // Проверяем SDL события (ввод с клавиатуры, закрытие окна и т.д.)
-            is_running = sdl_poll_events();
-                // Если приложение не запущено (закрыто), выходим из цикла
-                if (!is_running) {
-                    break;
-                }
-            }
-            // Финальная часть предложения, если осталась
-            text_to_speak = ::replace(text_to_speak, "\"", "'");
+// ВНИМАНИЕ: проверка событий УДАЛЕНА из цикла генерации
+// Она теперь выполняется только в главном цикле программы
+// для максимальной скорости генерации токенов
+
+// Финальная часть предложения, если осталась
+text_to_speak = ::replace(text_to_speak, "\"", "'");
+
+
             if (text_to_speak.size())  // Если есть текст для озвучки
             {
                 std::string text_to_speak_final = text_to_speak; // Создаём локальную копию
