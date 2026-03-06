@@ -180,7 +180,7 @@ struct whisper_params {
 	std::string person      = "Друг";
     std::string bot_name    = "Эмма";
     std::string xtts_voice  = "Emma";
-    std::string wake_cmd    = "";
+    std::string wake_cmd    = "";      // Команда пробуждения (например "Эмма,")
     std::string heard_ok    = "";
     std::string language    = "ru";
     std::string model_wsp   = "whisper-ggml-medium-q4_0.bin";
@@ -1934,8 +1934,7 @@ The transcription contains only text, without any markup such as HTML or Markdow
 
 // Основная функция run — запуск приложения
 int run(int argc, char ** argv) {
-    whisper_params params; // параметры Whisper
-
+whisper_params params;          // параметры Whisper
 std::vector<std::thread> threads;
 std::thread t;
 
@@ -2332,20 +2331,21 @@ if (llama_decode(ctx_llama, batch)) {
     printf("%s : done! start speaking in the microphone\n", __func__);
 
     // показывать команду пробуждения, если она включена
-    const std::string wake_cmd = params.wake_cmd;
-    const int wake_cmd_length = get_words(wake_cmd).size();
-    const bool use_wake_cmd = wake_cmd_length > 0;
-    if (use_wake_cmd) {
-        printf("%s : the wake-up command is: '%s%s%s'\n", __func__, "\033[1m", wake_cmd.c_str(), "\033[0m");
-    }
-    printf("\n");
-    printf("%s%s ", params.person.c_str(), chat_symb.c_str());
-    fflush(stdout);
+// показывать команду пробуждения, если она включена
+const std::string wake_cmd = params.wake_cmd;
+if (!wake_cmd.empty()) {
+    printf("%s : the wake-up command is: '%s%s%s'\n", __func__, "\033[1m", wake_cmd.c_str(), "\033[0m");
+}
+printf("\n");
+printf("%s%s ", params.person.c_str(), chat_symb.c_str());
+fflush(stdout);
 
-     // Очистка аудио-буфера
-    audio.clear();
-    // Переменные для текстового вывода
-    const int voice_id = 2;
+// Очистка аудио-буфера
+audio.clear();
+// Переменные для текстового вывода
+const int voice_id = 2;
+
+// ... 
 
     // ПЕРЕД генерацией сбрасываем ОБА флага прерывания
     g_is_interrupted.store(false);   // Чтобы cURL снова начал качать аудио
@@ -2643,36 +2643,54 @@ console::set_display(console::reset);
                             }
                         }
                     }
-                // логика обработки all_heard ---
-                // Разделяем распознанный текст на команду пробуждения и основной текст
-                const auto words = get_words(all_heard);
-                std::string wake_cmd_heard;
-                std::string text_heard;
-                // Первые wake_cmd_length слов — это команда пробуждения
-                for (int i = 0; i < (int) words.size(); ++i) {
-                    if (i < wake_cmd_length) {
-                        wake_cmd_heard += words[i] + " ";
+                    
+                    // Проверка wake-command (если включено)
+                    if (!params.wake_cmd.empty()) {
+                        // Проверяем, начинается ли распознанный текст с команды пробуждения
+                        // Например: "Эмма, привет" -> начинается с "Эмма,"
+                        if (all_heard.find(params.wake_cmd) != 0) {
+                            // Фраза не начинается с имени — игнорируем
+                            if (params.verbose) {
+                                fprintf(stdout, "[wake] ignored: \"%s\"\n", all_heard.c_str());
+                            }
+                            audio.clear();
+                            continue;
+                        }
+                        
+                        // Убираем имя из текста, оставляем только суть запроса
+                        // "Эмма, привет" -> "привет"
+                        text_heard = all_heard.substr(params.wake_cmd.length());
+                        trim(text_heard);
+                        
+                        if (params.verbose) {
+                            fprintf(stdout, "[wake] accepted: \"%s\"\n", text_heard.c_str());
+                        }
                     } else {
-                        text_heard += words[i] + " ";
+                        // Режим без wake-word — используем весь распознанный текст
+                        text_heard = all_heard;
                     }
-                }
 
-                // Выводим уровень энергии, если включён (для отладки)
-                if (params.print_energy) fprintf(stdout, " [text_heard: (%s)]\n", text_heard.c_str());
-                // Если используется команда пробуждения — проверяем её сходство с эталонной
-                if (use_wake_cmd) {
-                    const float sim = similarity(wake_cmd_heard, wake_cmd);
-                    // Если сходство слишком низкое или текст пуст — игнорируем и очищаем аудиобуфер
-                    if ((sim < 0.7f) || (text_heard.empty())) {
-                        audio.clear();
-                        continue;
-                    }
-                }
+// Выводим уровень энергии, если включён (для отладки)
+if (params.print_energy) fprintf(stdout, " [text_heard: (%s)]\n", text_heard.c_str());
 
-                // при необходимости дайте звуковую обратную связь о том, что текущий текст обрабатывается
-                if (!params.heard_ok.empty()) {
-                    speak_with_file(params.speak, params.heard_ok, params.speak_file, voice_id);
-                }
+// Если используется команда пробуждения — проверяем, начинается ли фраза с имени
+if (!wake_cmd.empty()) {
+    // Проверяем, начинается ли распознанный текст с команды пробуждения
+    // (эту проверку мы уже сделали раньше, но на всякий случай дублируем)
+    if (all_heard.find(wake_cmd) != 0) {
+        // Не начинается с имени — игнорируем
+        if (params.verbose) {
+            fprintf(stdout, "[wake] ignored in post-check: \"%s\"\n", all_heard.c_str());
+        }
+        audio.clear();
+        continue;
+    }
+}
+
+// при необходимости дайте звуковую обратную связь о том, что текущий текст обрабатывается
+if (!params.heard_ok.empty()) {
+    speak_with_file(params.speak, params.heard_ok, params.speak_file, voice_id);
+}
 
                 // Удалить текст в квадратных скобках: [всё внутри], но не жадно
                 // Используем [^\\]]* вместо .*?, потому что std::regex нестабильно работает с ленивыми квантификаторами
