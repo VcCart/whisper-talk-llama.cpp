@@ -44,18 +44,21 @@
 #endif                        
 
 // ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ И МЬЮТЕКСЫ
-std::atomic<bool> g_is_interrupted{false};
-// Эта переменная связывает система прослушивания и система озвучки
-std::atomic<int> llama_interrupted{0};  // Изменяем на atomic<int>
-std::queue<std::string> input_queue; // глобальная очередь ввода
-std::mutex input_mutex; // Мьютекс для защиты доступа к input_queue
-std::atomic<bool> keyboard_input_running{true}; // Атомарный флаг для безопасного доступа из разных потоков
-std::string g_hotkey_pressed = ""; // Глобальная переменная для отслеживания нажатых горячих клавиш
-std::mutex g_hotkey_pressed_mutex; // Мьютекс для защиты g_hotkey_pressed
-std::mutex g_tts_mutex; // Мьютекс для защиты массивов TTS
-std::mutex g_threads_mutex; // ← ДОБАВЛЯЕМ МЬЮТЕКС ДЛЯ ПОТОКОВ
-std::string g_last_tts_text = "";
-std::mutex g_last_tts_mutex;
+std::atomic<bool> g_is_interrupted{false};          // Флаг прерывания для сетевых запросов (curl)
+std::atomic<int>  llama_interrupted{0};             // Флаг прерывания генерации LLaMA (связь с озвучкой)
+
+std::queue<std::string> input_queue;                // Очередь ввода с клавиатуры
+std::mutex              input_mutex;                 // Мьютекс для защиты input_queue
+
+std::atomic<bool> keyboard_input_running{true};     // Флаг работы потока ввода с клавиатуры
+
+std::string g_hotkey_pressed = "";                  // Последняя нажатая горячая клавиша
+std::mutex  g_hotkey_pressed_mutex;                  // Мьютекс для защиты g_hotkey_pressed
+
+std::mutex g_threads_mutex;                          // Мьютекс для защиты вектора потоков threads
+
+std::string g_last_tts_text = "";                    // Последний текст, отправленный в TTS (для regenerate)
+std::mutex  g_last_tts_mutex;                         // Мьютекс для защиты g_last_tts_text
 
 // ФУНКЦИЯ ТОКЕНИЗАЦИИ ТЕКСТА
 // Преобразует текст в последовательность токенов модели LLaMA
@@ -564,7 +567,7 @@ float get_current_time_ms() {
 
 // Потокобезопасное добавление задачи в вектор потоков
 static void safe_thread_emplace(std::vector<std::thread>& threads_vec, std::function<void()> task) {
-     std::scoped_lock lock(g_threads_mutex, g_tts_mutex); // Deadlock-free
+    std::scoped_lock lock(g_threads_mutex); // Защищаем только вектор потоков
     try {
         threads_vec.emplace_back(std::move(task));
     } catch (const std::exception& e) {
@@ -1933,23 +1936,13 @@ The transcription contains only text, without any markup such as HTML or Markdow
 int run(int argc, char ** argv) {
     whisper_params params; // параметры Whisper
 
-	std::vector<std::thread> threads;
-	std::thread t;
-	int thread_i = 0;
-    thread_i = 0;
+std::vector<std::thread> threads;
+std::thread t;
 
-// Гарантируем, что thread_i не отрицательный перед использованием %
-    if (thread_i < 0) {
-        thread_i = 0;
-        fprintf(stderr, "WARNING: thread_i was negative, reset to 0\n");
-    }
-
-	int reply_part = 0;
-	std::string text_to_speak_arr[150];
-	int reply_part_arr[150];
-	bool last_output_has_username = false;	
-	bool last_output_has_EOT = true;	
-	int input_tokens_count = 0;	
+int reply_part = 0;
+bool last_output_has_username = false;	
+bool last_output_has_EOT = true;	
+int input_tokens_count = 0;	
 	
 	HWND cur_window_handle = GetForegroundWindow(); // предполагаем, что активное окно — наше
 
@@ -2919,7 +2912,7 @@ if (user_command == "regenerate" ||
                                         });
                                     }
                                     
-                                    // ✅ thread_i больше не нужен — убираем
+                                    
                                 }
                             }
                         }
@@ -2981,36 +2974,18 @@ if (!past_prev_arr.empty())
 								new_command_allowed = 0;
 											
                             // Асинхронное воспроизведение "Deleted" через TTS
-                            // Сохраняем текст "Deleted" в массив под защитой мьютекса
+                            // Отправляем уведомление об удалении напрямую, без массива
                             std::string text_for_deleted_tts = "Deleted";
-                            std::string text_to_respeak_safe;
-                            int previous_index = 0; // ← Объявляем ДО блока
-                            {
-                                std::lock_guard<std::mutex> lock(g_tts_mutex);
-                                
-                                // Сохраняем новый текст
-                                text_to_speak_arr[thread_i] = text_for_deleted_tts;
-                                
-                                // Безопасно читаем предыдущее значение
-                                previous_index = (thread_i - 1 + 150) % 150; // Используем previous_index вместо idx
-                                text_to_respeak_safe = text_to_speak_arr[previous_index];
-                                text_to_speak_arr[previous_index] = ""; // Очищаем под защитой
-                                
-                                thread_i = (thread_i + 1) % 150;
-                            }
-                            // Теперь можно использовать previous_index
-                            if (!text_to_respeak_safe.empty()) {
-                                threads.emplace_back([text_to_respeak_safe, current_voice, params]() {
-                                    send_tts_async(text_to_respeak_safe, current_voice, params.language, params.xtts_url);
+                            
+                            // Просто отправляем "Deleted" в TTS (один раз)
+                            if (!text_for_deleted_tts.empty()) {
+                                threads.emplace_back([text_for_deleted_tts, current_voice, params]() {
+                                    send_tts_async(text_for_deleted_tts, current_voice, params.language, params.xtts_url);
                                 });
                             }
-
-                            // Запускаем поток с локальными копиями
-                            if (!text_to_respeak_safe.empty()) {
-                                threads.emplace_back([text_to_respeak_safe, current_voice, params]() {
-                                    send_tts_async(text_to_respeak_safe, current_voice, params.language, params.xtts_url);
-                                });
-                            }					
+                            
+                            // При удалении не нужно переозвучивать предыдущий текст,
+                            // поэтому убираем всю логику с text_to_respeak_safe и дублирующий вызов
 							}
 						}
 						else 
@@ -3163,67 +3138,38 @@ if (user_command == "stop")
         user_command = "time";
     }
 
-    // Обработчик команды "google"
+        // Обработчик команды "google"
     else if (user_command == "google")
     {
-    //  Удобная обёртка для безопасного озвучивания коротких фраз (ПАТЧ: с защитой мьютексом)
-        auto speak_safe = [&](const std::string& msg) {
+        // Простая лямбда для отправки текста в TTS (без массивов и мьютексов)
+        auto speak_direct = [&](const std::string& msg) {
             if (msg.empty()) return;
-            // ЗАЩИЩАЕМ все операции с общими данными
             std::string msg_copy = msg;
-            int current_reply_part;
-            int current_idx;
-            {
-                std::lock_guard<std::mutex> lock(g_tts_mutex);
-                // Безопасные операции под защитой мьютекса
-                current_reply_part = reply_part++;
-                current_idx = thread_i % 150; // Защита от выхода за границы
-                // Сохраняем в массивы для совместимости с остальным кодом
-                text_to_speak_arr[current_idx] = msg_copy;
-                reply_part_arr[current_idx] = current_reply_part;
-                // Обновляем индекс с циклическим буфером
-                thread_i = (thread_i + 1) % 150;
-            }
-            
             try {
-                threads.emplace_back([msg_copy, current_voice, params, current_reply_part]() {
-                    send_tts_async(msg_copy, current_voice, params.language, params.xtts_url, current_reply_part);
+                threads.emplace_back([msg_copy, current_voice, params]() {
+                    send_tts_async(msg_copy, current_voice, params.language, params.xtts_url);
                 });
             } catch (const std::exception& e) {
                 fprintf(stderr, "[google] TTS thread spawn failed: %s\n", e.what());
-                // Откатываем изменения при ошибке (под защитой мьютекса)
-                {
-                    std::lock_guard<std::mutex> lock(g_tts_mutex);
-                    text_to_speak_arr[current_idx] = "";
-                    reply_part_arr[current_idx] = 0;
-                    // Внимание: не откатываем thread_i и reply_part для простоты
-                }
             }
         };
-    // Достаём ключевые слова
-    std::string q = ParseCommandAndGetKeyword(text_heard_trimmed, user_command);
-    if (q.empty()) {
-        fprintf(stdout, "[google] can't get keyword from: %s\n", text_heard_trimmed.c_str());
-        speak_safe("Извините, не удалось понять, что именно вы хотите найти.");
-        // ВАЖНО: не выходим из цикла генерации LLM жестким continue;
-        // просто очищаем пользовательский ввод и дадим модели ответить дальше как обычно
-        user_typed.clear();
-        user_typed_this = false;
-    } else {
-            // Безопасная аудио-квитанция
-            {
-                std::string google_search_msg = "Ищу информацию по запросу: " + q;
-                std::lock_guard<std::mutex> lock(g_tts_mutex);
-                int idx = thread_i;
-                if (idx < 0) idx = 0;
-                if (idx >= 150) idx = 149;
-                text_to_speak_arr[idx] = google_search_msg;
-                thread_i = (idx + 1) % 150;
-                // Запускаем TTS с локальной копией
-                threads.emplace_back([google_search_msg, current_voice, params]() {
-                    send_tts_async(google_search_msg, current_voice, params.language, params.xtts_url);
-                });
-            }
+
+        // Достаём ключевые слова
+        std::string q = ParseCommandAndGetKeyword(text_heard_trimmed, user_command);
+        
+        if (q.empty()) {
+            fprintf(stdout, "[google] can't get keyword from: %s\n", text_heard_trimmed.c_str());
+            speak_direct("Извините, не удалось понять, что именно вы хотите найти.");
+            user_typed.clear();
+            user_typed_this = false;
+        } else {
+            // Аудио-квитанция — просто отправляем в TTS без массива
+            std::string google_search_msg = "Ищу информацию по запросу: " + q;
+            threads.emplace_back([google_search_msg, current_voice, params]() {
+                send_tts_async(google_search_msg, current_voice, params.language, params.xtts_url);
+            });
+
+            // (запрос к серверу, проверка resp.empty(), формирование промпта для LLaMA)
 
 // Запрос к поисковому серверу
 const std::string url = params.google_url + "google?q=" + UrlEncode(q);
@@ -3390,11 +3336,6 @@ std::string resp = send_curl(url);
         session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
     }
 
-    // только защита от переполнения индекса
-    if (thread_i >= 150) {
-        thread_i = 0; // Мягкая ротация — не ломает логику, не вызывает join(), не мешает потокам
-    }
-    
     float temp_next = params.temp;
     int n_discard = 0;
     int n_left = 0;
@@ -4058,6 +3999,7 @@ try
     // ========== КОНЕЦ ДОБАВЛЕННОЙ ПРОВЕРКИ ==========
     
 } // КОНЕЦ БЛОКА антипромптов
+
 // ### ОБРАБОТКА АУДИОВХОДА И СИГНАЛОВ (VAD) ###
             // Проверяем SDL события (ввод с клавиатуры, закрытие окна и т.д.)
             is_running = sdl_poll_events();
@@ -4070,40 +4012,17 @@ try
             text_to_speak = ::replace(text_to_speak, "\"", "'");
             if (text_to_speak.size())  // Если есть текст для озвучки
             {
-                int current_reply_part_final;
-                int current_idx_final;
                 std::string text_to_speak_final = text_to_speak; // Создаём локальную копию
-                // ВСЕ операции с разделяемыми данными в одной критической секции
-                {
-                    std::lock_guard<std::mutex> lock(g_tts_mutex);
-                    current_idx_final = thread_i;
-                    current_reply_part_final = reply_part;
-                    // Сохраняем данные в массивы
-                    text_to_speak_arr[current_idx_final] = text_to_speak_final;
-                    reply_part_arr[current_idx_final] = current_reply_part_final;
-                    // Атомарно обновляем счетчики
-                    reply_part++;
-                    thread_i = (thread_i + 1) % 150;
-                }
-                try 
-                {		
-                    // Захватываем локальные копии, а не оригинальные переменные
-                    threads.emplace_back([text_to_speak_final, current_voice, params, current_reply_part_final]() {
-                        send_tts_async(text_to_speak_final, current_voice, params.language, params.xtts_url, current_reply_part_final);
+
+                try {
+                    threads.emplace_back([text_to_speak_final, current_voice, params]() {
+                        send_tts_async(text_to_speak_final, current_voice, params.language, params.xtts_url);
                     });
                     
                     text_to_speak = ""; // Очищаем оригинальную переменную
                 }
                 catch (const std::exception& ex) {
-                    std::cerr << "[Exception]: Failed to emplace fin thread: " << ex.what() << '\n'; 
-                    
-                    // Откатываем изменения под защитой мьютекса
-                    {
-                        std::lock_guard<std::mutex> lock(g_tts_mutex);
-                        text_to_speak_arr[current_idx_final] = "";
-                        reply_part_arr[current_idx_final] = 0;
-                    }
-                    // Внимание: не откатываем reply_part и thread_i для простоты
+                    std::cerr << "[Exception]: Failed to send final TTS: " << ex.what() << '\n';
                 }
             }
             // Безопасная очистка всех предыдущих потоков TTS — ВСЕ предыдущие потоки TTS должны быть завершены.
