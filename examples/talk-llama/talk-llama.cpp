@@ -3973,25 +3973,13 @@ if (text_len >= 2 && new_tokens >=2 && !person_name_is_found &&
                 continue;  // Переходим к следующей итерации для обработки промпта перевода
             }										
         }
-// XTTS в отдельных потоках
-// Сохраняем текст и номер части ответа для асинхронной обработки
-int current_reply_part = reply_part++; // захватываем значение ДО инкремента
-int current_idx; // индекс в массиве для этого текста
-    {
-        // БЛОКИРУЕМ доступ к глобальным массивам
-        std::lock_guard<std::mutex> lock(g_tts_mutex);
-        current_idx = thread_i; // сохраняем текущий индекс
-        text_to_speak_arr[current_idx] = text_to_speak; // записываем текст в массив
-        reply_part_arr[current_idx] = current_reply_part; // записываем номер части
-        thread_i = (thread_i + 1) % 150; // увеличиваем индекс с циклическим буфером
-    }
 
 try 
     {
         // Захватываем ВСЁ по значению — никаких глобальных массивов!
-        threads.emplace_back([text_to_speak, current_voice, params, current_reply_part]() {
-            send_tts_async(text_to_speak, current_voice, params.language, params.xtts_url, current_reply_part);
-        });
+        threads.emplace_back([text_to_speak, current_voice, params]() {
+    send_tts_async(text_to_speak, current_voice, params.language, params.xtts_url, 0);
+    });
         // Очищаем локальную переменную
         text_to_speak = "";
         // Если задержка перед XTTS включена, делаем паузу
