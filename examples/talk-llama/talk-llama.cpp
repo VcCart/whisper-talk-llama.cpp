@@ -4119,27 +4119,52 @@ try
         }
     }
 }
-    // Завершение работы - очистка потоков
-    printf("Cleaning up TTS threads...\n");
-    {
-        // Очищаем все потоки TTS перед завершением
-        std::lock_guard<std::mutex> lock(g_threads_mutex);
-        for (auto& t : threads) {
-            if (t.joinable()) {
-                try {
-                    t.join();
-                } catch (const std::exception& e) {
-                    fprintf(stderr, "Warning: Exception joining thread: %s\n", e.what());
-                    t.detach();  // Если join не удается, отсоединяем
-                } catch (...) {
-                    fprintf(stderr, "Warning: Unknown exception joining thread\n");
-                    t.detach();  // Если join не удается, отсоединяем
-                }
-            }
+ // Завершение работы - очистка потоков
+printf("Cleaning up TTS threads...\n");
+
+// ШАГ 1: Забираем все потоки из глобального вектора в локальный
+// Это единственное место, где нужна блокировка
+std::vector<std::thread> local_threads;
+{
+    // Блокировка только на время swap - микросекунды!
+    std::lock_guard<std::mutex> lock(g_threads_mutex);
+    
+    // Меняем местами: threads (пустой) и local_threads (с потоками)
+    // После этой операции:
+    // - threads пуст (никто не может случайно его использовать)
+    // - local_threads содержит все потоки, которые нужно завершить
+    local_threads.swap(threads);
+    
+    // Вектор threads теперь пуст, можно не вызывать clear()
+    // (swap уже сделал threads пустым)
+}
+// Мьютекс автоматически освобождён здесь (конец области lock_guard)
+
+// ШАГ 2: Ждём завершения всех потоков БЕЗ блокировки
+printf("Waiting for %zu TTS threads to finish...\n", local_threads.size());
+
+for (auto& t : local_threads) {
+    if (t.joinable()) {
+        try {
+            // Теперь можно безопасно ждать - никакой мьютекс не блокирует
+            // другие потоки при завершении
+            t.join();
+        } catch (const std::exception& e) {
+            // Если join выбросил исключение - отсоединяем поток
+            fprintf(stderr, "Warning: Exception joining thread: %s\n", e.what());
+            t.detach();
+        } catch (...) {
+            fprintf(stderr, "Warning: Unknown exception joining thread\n");
+            t.detach();
         }
-        threads.clear();
     }
-    printf("Cleanup complete.\n");
+}
+
+// Локальный вектор очистится автоматически при выходе из функции
+// (деструктор std::vector вызовет деструкторы потоков, но они уже завершены)
+
+printf("Cleanup complete.\n");
+
     // ### ЗАВЕРШЕНИЕ РАБОТЫ И ОСВОБОЖДЕНИЕ РЕСУРСОВ ###
     // Завершение работы программы
     audio.pause();  // Приостанавливаем аудио (останавливаем запись с микрофона)
