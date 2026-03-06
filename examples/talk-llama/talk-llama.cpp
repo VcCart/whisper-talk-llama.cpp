@@ -169,6 +169,9 @@ struct whisper_params {
     int split_after     = 0;
     int sleep_before_xtts = 0; // in ms
     int main_gpu = 0; 
+    // Параметры прерывания генерации
+    int32_t interrupt_check_ms   = 200;    // Как часто проверять микрофон (мс)
+    int32_t interrupt_threshold_ms = 250;   // Сколько мс речи нужно для прерывания
 	std::string person      = "Друг";
     std::string bot_name    = "Эмма";
     std::string xtts_voice  = "Emma";
@@ -239,7 +242,13 @@ bool whisper_params_parse(int argc, char **argv, whisper_params &params) {
             } 
             else if (arg == "-c" || arg == "--capture") {
                 params.capture_id = std::stoi(argv[++i]);
-            } 
+            }
+            else if (arg == "--interrupt-check-ms") {
+                params.interrupt_check_ms = std::stoi(argv[++i]);
+            }
+            else if (arg == "--interrupt-threshold-ms") {
+                params.interrupt_threshold_ms = std::stoi(argv[++i]);
+            }
             else if (arg == "-mt" || arg == "--max-tokens") {
                 params.max_tokens = std::stoi(argv[++i]);
             } 
@@ -481,6 +490,8 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -h,       --help           [default] show this help message and exit\n");
     fprintf(stderr, "  -t N,     --threads N      [%-7d] number of threads to use during computation\n", params.n_threads);
     fprintf(stderr, "  -vms N,   --voice-ms N     [%-7d] voice duration in milliseconds\n",              params.voice_ms);
+    fprintf(stderr, "  --interrupt-check-ms N     [%-7d] how often to check mic during generation (ms)\n", params.interrupt_check_ms);
+    fprintf(stderr, "  --interrupt-threshold-ms N [%-7d] how much speech to interrupt generation (ms)\n", params.interrupt_threshold_ms);
     fprintf(stderr, "  -c ID,    --capture ID     [%-7d] capture device ID\n",                           params.capture_id);
     fprintf(stderr, "  -mt N,    --max-tokens N   [%-7d] maximum number of tokens per audio chunk\n",    params.max_tokens);
     fprintf(stderr, "  -ac N,    --audio-ctx N    [%-7d] audio context size (0 - all)\n",                params.audio_ctx);
@@ -3857,43 +3868,48 @@ try
         // Это помогает ускорить инференс xtts
         if (params.sleep_before_xtts) 
             std::this_thread::sleep_for(std::chrono::milliseconds(params.sleep_before_xtts));
-        // Проверяем уровень энергии, если пользователь говорит
-        // (не вызывает распознавание whisper, только громкий шум останавливает всё)
-        if (!params.push_to_talk || (params.push_to_talk && g_hotkey_pressed == "Alt"))
-        {
-            // Получаем аудио данные (неблокирующий вызов, 2000 мс)
-            audio.get(2000, pcmf32_cur);
-            // Проверяем активность голоса (VAD - Voice Activity Detection)
-            int vad_result = ::vad_simple_int(pcmf32_cur, WHISPER_SAMPLE_RATE, params.vad_last_ms, 
-            params.vad_thold, params.freq_thold, params.print_energy, 
-            params.vad_start_thold);
 
-            // Если обнаружена активность голоса
-            if (vad_result == 1) {
-                if (speech_vad_start_ms == 0) {
-                    speech_vad_start_ms = get_current_time_ms() * 1000; // Фиксируем начало звука
-                }
-                
-                // Проверяем длительность: прерываем только если звук длится > 250 мс
-                if ((get_current_time_ms() * 1000) - speech_vad_start_ms > 250) {
-                    printf(" [Speech interruption confirmed!]\n");
-                    llama_interrupted.store(1);
-                    g_is_interrupted.store(true);
-                    allow_xtts_file(params.xtts_control_path, 0);
-                    done = true;
-                    break;
-                }
-            } else {
-                // Если звук пропал раньше чем через 250мс — это был шум, сбрасываем таймер
-                speech_vad_start_ms = 0;
-            }
-        }
+
     }
                 // Обработка исключений при создании потока
                 catch (const std::exception& ex) {
                     // Выводим сообщение об ошибке создания потока
                     std::cerr << "[Exception]: Failed to push_back mid thread: " << ex.what() << '\n';
                 }
+
+                // Проверяем уровень энергии, если пользователь говорит
+                // (не вызывает распознавание whisper, только громкий шум останавливает всё)
+                if (!params.push_to_talk || (params.push_to_talk && g_hotkey_pressed == "Alt"))
+                {
+                    // Получаем аудио данные (неблокирующий вызов, 2000 мс)
+                    audio.get(2000, pcmf32_cur);
+                    // Проверяем активность голоса (VAD - Voice Activity Detection)
+                    int vad_result = ::vad_simple_int(pcmf32_cur, WHISPER_SAMPLE_RATE, params.vad_last_ms, 
+                    params.vad_thold, params.freq_thold, params.print_energy, 
+                    params.vad_start_thold);
+
+                    // Если обнаружена активность голоса
+                    if (vad_result == 1) {
+                        if (speech_vad_start_ms == 0) {
+                            speech_vad_start_ms = get_current_time_ms() * 1000; // Фиксируем начало звука
+                        }
+                        
+                        // Проверяем длительность: прерываем только если звук длится > 250 мс
+                        if ((get_current_time_ms() * 1000) - speech_vad_start_ms > 250) {
+                            printf(" [Speech interruption confirmed!]\n");
+                            llama_interrupted.store(1);
+                            g_is_interrupted.store(true);
+                            allow_xtts_file(params.xtts_control_path, 0);
+                            done = true;
+                            break;
+                        }
+                    } else {
+                        // Если звук пропал раньше чем через 250мс — это был шум, сбрасываем таймер
+                        speech_vad_start_ms = 0;
+                    }
+                }
+
+
                 // Удаление перевода из контекста (откат после перевода)
                 if (params.translate && translation_is_going == 1)
                 {										
