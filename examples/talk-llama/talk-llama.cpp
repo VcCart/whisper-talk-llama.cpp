@@ -1625,6 +1625,36 @@ void send_tts_async(std::string text,
     trim(text);
     if (text.empty()) return;
 
+    // ========== ПАТЧИ ДЛЯ XTTS (улучшение стабильности) ==========
+    // XTTS чувствителен к некоторым знакам препинания, особенно к двоеточиям
+    // Эти замены помогают избежать артефактов и заиканий
+    
+    // Двоеточия -> запятые (XTTS плохо их переваривает)
+    text = replace(text, ":", ",");
+    
+    // Точка с запятой -> запятая (тоже нестабильно)
+    text = replace(text, ";", ",");
+    
+    // Убираем пробелы перед восклицательными и вопросительными знаками
+    try {
+        static const std::regex re_space_before_excl(R"(\s+(!))", std::regex::ECMAScript);
+        static const std::regex re_space_before_ques(R"(\s+(\?))", std::regex::ECMAScript);
+        text = std::regex_replace(text, re_space_before_excl, "$1");
+        text = std::regex_replace(text, re_space_before_ques, "$1");
+    } catch (const std::regex_error& e) {
+        // Fallback: простая замена
+        text = replace(text, " !", "!");
+        text = replace(text, " ?", "?");
+    }
+    
+    // Многоточия -> точка (если вдруг остались)
+    try {
+        static const std::regex re_ellipsis(R"(\.{3,})", std::regex::ECMAScript);
+        text = std::regex_replace(text, re_ellipsis, ".");
+    } catch (const std::regex_error& e) {
+        text = replace(text, "...", ".");
+    }
+    // ============================================================
     // Нормализация пунктуации: схлопываем повторы, многоточия в точку
     // Важно исправить некорректные последовательности для естественного звучания
     try {
@@ -2290,7 +2320,7 @@ if (llama_decode(ctx_llama, batch)) {
 	float llama_time_total = 0;
 	float llama_time_input = 0;
 	float llama_time_output = 0;
-	
+ 
 	llama_time_total = llama_end_time - llama_start_time;
 
     printf(" \nLlama start prompt: %zu/%d tokens in %.3f s at %.0f t/s\n",
@@ -2794,8 +2824,8 @@ if (params.xtts_intro && text_heard_trimmed.size())
         
         // Отправляем в TTS напрямую
         threads.emplace_back([rand_intro_text, current_voice, params]() {
-            send_tts_async(rand_intro_text, current_voice, params.language, params.xtts_url);
-        });
+                            send_tts_async(rand_intro_text, current_voice, params.language, params.xtts_url);
+                        });
     }
 }
 				
