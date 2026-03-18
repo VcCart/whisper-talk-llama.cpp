@@ -53,7 +53,8 @@ https://developer.nvidia.com/cuda-toolkit-archive
 - Загрузите LLM в ту же папку [saiga_yandexgpt_8b_Q4_K_S.gguf](https://huggingface.co/IlyaGusev/saiga_yandexgpt_8b_gguf/tree/main) Вы можете попробовать Q4_K_S или Q3_K_S, если у вас под llm запланировано мало VRAM.
 
 Теперь установим xtts-api-server и TTS От Mozer (Ссылки на свои форки я поправлю позже, если опубликую). 
-Примечание: XTTS с DeepSpeed требует PyTorch 2.1, но некоторые пакеты DeepSpeed требуют PyTorch 2.2 и выше, поэтому Depspeed придется компилировать или искать готовый whl
+Примечание: XTTS с DeepSpeed требует PyTorch 2.1, cu118 или cu121, но некоторые пакеты DeepSpeed требуют PyTorch 2.2 и выше,
+поэтому Depspeed придется компилировать или искать готовый whl
 Все представленные здесь компоненты тестировались на Python 3.11 с разными версиями PyTorch. 
 Установка окружения состоит в основном из:  Git, Python 3.11, XTTS сервера, langchain_community для google поиска и прочих модулей.
 
@@ -66,7 +67,15 @@ https://developer.nvidia.com/cuda-toolkit-archive
 
 ```
 git clone https://github.com/Mozer/xtts-api-server 
-cd c:\DATA\xtts-api-server\
+cd c:\DATA\
+```
+Переименуем xtts-api-server в xtts
+```
+ren xtts-api-server xtts
+```
+В папке xtts
+```
+cd c:\DATA\xtts\
 ```
 Создайте окружение Python в той же папке:
 ```
@@ -80,10 +89,8 @@ venv\Scripts\activate
 ```
 pip install -r requirements.txt
 pip install torch==2.1.1+cu118 torchaudio==2.1.1+cu118 --index-url https://download.pytorch.org/whl/cu118
-pip install git+https://github.com/Mozer/tts
-
 ```
-Запуск xtts сервера можно настроить в start.bat примерно такого содержания:
+Запуск xtts сервера можно настроить в xtts_start.bat примерно такого содержания:
 ```
 call venv/scripts/activate
 python -m xtts_api_server  --deepspeed --stream-play-sync --streaming-mode-improve --lowvram -d=cuda
@@ -208,13 +215,12 @@ set SDL2_DIR=SDL2\cmake
 
 cmake.exe -DWHISPER_SDL2=ON  -DGGML_CUDA=1 -DCMAKE_TOOLCHAIN_FILE=C:/DATA/vcpkg/scripts/buildsystems/vcpkg.cmake -B build
 
+Для процессоров без AVX2, надо будет билдить с ключом: -DWHISPER_NO_AVX2=1
+
+Потом две команды по очистке и сборке, ниже (вводить по отдельности)
+
 cmake.exe --build build -j --config release --target clean
 cmake.exe --build build -j --config release --parallel 8
-
-for old CPU's without AVX2 / для процессоров без AVX2: 
-
-cmake.exe -DWHISPER_NO_AVX2=1 -DWHISPER_SDL2=ON -DWHISPER_CUBLAS=0 -DGGML_CUDA=1 cmake.exe -DWHISPER_SDL2=ON  -DGGML_CUDA=1 DCMAKE_TOOLCHAIN_FILE=C:/DATA/vcpkg/scripts/buildsystems/vcpkg.cmake -B build
-Потом повторите две команды по очистке и сборке, как выше
 
 Компиляция может длиться около 10 мин и больше, в зависимости от вашего компьютерного железа.
 
