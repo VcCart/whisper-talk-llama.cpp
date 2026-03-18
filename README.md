@@ -15,16 +15,16 @@
 
 ## Новости
 - [2025.11.27] Собственные доработки, которых очень много.
-- [2025.11.01] Все изменеия из https://github.com/Mozer/talk-llama-fast/
+- [2025.11.01] Все изменения из https://github.com/Mozer/talk-llama-fast/
 
 
 ## Заметки
    -  В talk-llama.cpp был изменен сдвиг контекста под whisper.cpp > 1.8.0., и изменена работа с кэшем. В версии 1.76 это реализовывалось по другому.
    -  Диалог с talk-llama может вестись почти бесконечно — модель остаётся адекватной, серьёзных зацикливаний или повсеместных проблем не наблюдается. 
    -  Llama запоминает начальный промпт и последние N токенов контекста, но всё, что находится между ними, теряется. 
-   -  Дополнительная видеопамять (VRAM) ,больше той что уже занялась при запуске не расходуется — вы можете вести практически бесконечный диалог без потери скорости.  
+   -  Дополнительная видеопамять (VRAM), больше той что уже занята, при запуске не расходуется — вы можете вести практически бесконечный диалог без потери скорости.  
    -  talk-llama.cpp тестировался на llm модели saiga_yandexgpt_8b_Q4_K_S.gguf и Whisper модели whisper-ggml-large-v3-q4.bin
-   -  В качестве тестовой видеокарты использовалсась карта GTX1070 ti всего 8 ГБ на архитектуре Pascal. Лёгкую квантованную версию llama вполне нормально загружает.
+   -  В качестве тестовой видеокарты использовалась карта GTX1070 ti всего 8 ГБ на архитектуре Pascal. Лёгкую квантованную версию llama вполне нормально загружает.
    -  Далее была попытка запуска скомпилированных файлов на RTX 3060 12GB на архитектуре Ampere и файлы оказались несовместимы, так что проект придется перекомпилировать.
    -  Процессор желателен с AVX2 инструкциями, но и здесь можно обойти ограничение, скомпилировав проект без них; 
    -  XTTS можно запустить с флагом --lowvram или даже на CPU вместо GPU (-d=cpu, но это будет медленно), лучше сэкономить  GPU на llm, так как может llama приемлемо  работает на мощном CPU процессоре, а tts уже не справляется.
@@ -32,7 +32,7 @@
    -  Опционально: есть команда «пробуждения» — --wake-command "Эмма," (запятая после имени обязательна). Теперь только фразы, начинающиеся например, с имени «Эмма», будут отправляться в чат. Это частично поможет при работе с колонками или в шумном помещении, но лучше придумать как отключать микрофон вручную, или использовать наушники.
 
 ## Языки
-Программа Мультиязычная, но зависит от подгуженных моделей Whisper и LLM.
+Программа Мультиязычная, но зависит от подгруженных моделей Whisper и LLM.
 
 ## Примерные системные требования
 - Windows 10/11 x64
@@ -46,7 +46,7 @@
 https://developer.nvidia.com/cudnn-archive
 https://developer.nvidia.com/cuda-toolkit-archive
 Проверить версию: nvcc --version в командной строке.
-Рекомендую испоьзовать CUDA до версии 12.9x. Выше наблюдаются проблемы несовместимости.
+Рекомендую использовать CUDA до версии 12.9x. Выше наблюдаются проблемы несовместимости.
 - Загрузите [release](https://github.com/VcCart/whisper-talk-llama.cpp) или скомпилируйте самостоятельно. 
 Распакуйте в папку c:\DATA\ .
 - Загрузите модель whisper в папку c:\DATA\ с whisper-talk-llama.exe: Для Русского языка может подойти [ggml-large-v3-q4_k.bin](https://huggingface.co/adriabama06/whisper-large-v3-ggml) Или другой квантизации, в зависимости от объема VRAM.
@@ -62,7 +62,7 @@ https://developer.nvidia.com/cuda-toolkit-archive
 В оригинальном Xtts-Api-Server используется coqui-tts 0.24.1
 В Xtts-Api-Server от Mozer используется coqui-tts 0.22.0 c небольшими доработками.
 
-Откройте папку \Data, куда вы положили основные файлы с talk-llama. В этой папке откройте командную строку (cmd) и выполняйте команды построчно:
+Откройте папку \DATA\, куда вы положили основные файлы с talk-llama. В этой папке откройте командную строку (cmd) и выполняйте команды построчно:
 
 ```
 git clone https://github.com/Mozer/xtts-api-server 
@@ -76,7 +76,7 @@ python -m venv venv
 ```
 venv\Scripts\activate
 ```
-Далее можно устанвливать:
+Далее можно устанавливать:
 ```
 pip install -r requirements.txt
 pip install torch==2.1.1+cu118 torchaudio==2.1.1+cu118 --index-url https://download.pytorch.org/whl/cu118
@@ -119,7 +119,32 @@ pause
 ```
 @echo off
 chcp 866
-whisper-talk-llama.exe -mw ggml-large-v3-q4_k.bin -ml saiga_yandexgpt_8b_Q5_K.gguf --language ru -p "Друг" --speak speak --vad-last-ms 320 --vad-start-thold 0.000150  --bot-name "Эмма" --xtts-voice "Эмма" --prompt-file talk_emma_inst.txt  --xtts-url http://localhost:8020/  --instruct-preset ChatML --temp 0.20 --min_p 0.10  -ngl 30  -n 256 --ctx_size 2560  --threads 20  --allow-newline --sleep-before-xtts 1100 --flash-attn
+whisper-talk-llama.exe ^
+  --model-whisper "ggml-large-v3-q4_k.bin" ^
+  --model-llama "saiga_yandexgpt_8b_Q5_K.gguf" ^
+  --language ru ^
+  --person Друг ^
+  --bot-name Эмма ^
+  --xtts-voice Эмма ^
+  --xtts-url http://localhost:8020/ ^
+  --prompt-file "prompt_talk_emma_instruct.txt" ^
+  --instruct-preset ChatML ^
+  --temp 0.70 ^
+  --top_k 40 ^
+  --top_p 0.95 ^
+  --repeat_penalty 1.15 ^
+  --repeat_last_n 256 ^
+  --n-gpu-layers -1 ^
+  --threads 32 ^
+  --batch-size 512 ^
+  --ctx_size 4096 ^
+  --n_predict 256 ^
+  --min-tokens 20 ^
+  --flash-attn ^
+  --sleep-before-xtts 300 ^
+  --vad-thold 0.006 ^
+  --vad-start-thold 0.00027 ^
+  --vad-last-ms 250
 ```
 
 ### Настройки для видеопамяти 6 и 8 ГБ
@@ -142,7 +167,7 @@ whisper-talk-llama.exe -mw ggml-large-v3-q4_k.bin -ml saiga_yandexgpt_8b_Q5_K.gg
 - Поместите описание персонажа и несколько примеров его реплик в файл talk_emma_inst.txt для того чтобы задать свой базовый промпт ассистента.
 - В C:\DATA\instruct_presets должен быть ChatML.json с инструкциями для соответсвующей модели.
 
-- Голоса персонажей хранятсяв виде .wav-файлов в папке c:\DATA\xtts\speakers\. Вы также можете создать копии аудио с разными именами (например, Алиса или Олег). Теперь вы сможете обращаться к ним по имени.
+- Голоса персонажей хранятся в виде .wav-файлов в папке c:\DATA\xtts\speakers\. Вы также можете создать копии аудио с разными именами (например, Алиса или Олег). Теперь вы сможете обращаться к ним по имени.
 
 
 #### Опционально плагин гугл поиска
@@ -196,7 +221,7 @@ cmake.exe -DWHISPER_NO_AVX2=1 -DWHISPER_SDL2=ON -DWHISPER_CUBLAS=0 -DGGML_CUDA=1
 ```
 ## whisper-talk-llama.exe params / Параметры командной строки для bat файла
 ```
-### Базовые параметры
+Базовые параметры
   -h,       --help                [default] показать это сообщение и выйти
   -t N,     --threads N           [4      ] количество потоков для вычислений
   -vms N,   --voice-ms N          [10000  ] длительность голоса в миллисекундах
@@ -220,7 +245,7 @@ cmake.exe -DWHISPER_NO_AVX2=1 -DWHISPER_SDL2=ON -DWHISPER_CUBLAS=0 -DGGML_CUDA=1
   -ng,      --no-gpu              [false  ] отключить GPU
   -fa,      --flash-attn          [false  ] использовать flash attention
 
-### Персонажи и промпты
+Персонажи и промпты
   -p NAME,  --person NAME         [Друг   ] имя пользователя (для выбора промпта)
   -bn NAME, --bot-name NAME       [Эмма   ] имя бота (для отображения)
   -w TEXT,  --wake-command TEXT   [       ] команда пробуждения для прослушивания
@@ -229,13 +254,13 @@ cmake.exe -DWHISPER_NO_AVX2=1 -DWHISPER_SDL2=ON -DWHISPER_CUBLAS=0 -DGGML_CUDA=1
   --prompt-file FNAME             [       ] файл с пользовательским промптом для начала диалога
   --instruct-preset TEXT          [       ] preset для инструкций (без .json)
 
-### Модели и файлы
+Модели и файлы
   -mw FILE, --model-whisper       [whisper-ggml-medium-q4_0.bin]        файл модели Whisper
   -ml FILE, --model-llama         [saiga_yandexgpt_8b_Q4_K_S.gguf]      файл модели LLaMA
   --session FNAME                 [       ] файл для кэширования состояния модели
   -f FNAME, --file FNAME          [       ] имя файла для вывода текста
 
-### Параметры генерации LLaMA
+Параметры генерации LLaMA
   --ctx_size N                    [2048   ] размер контекста промпта
   -b N,     --batch-size N        [64     ] размер входного батча
   -n N,     --n_predict N         [64     ] максимальное количество токенов для предсказания
@@ -249,12 +274,12 @@ cmake.exe -DWHISPER_NO_AVX2=1 -DWHISPER_SDL2=ON -DWHISPER_CUBLAS=0 -DGGML_CUDA=1
   --min-tokens N                  [0      ] минимальное количество новых токенов на вывод
   --stop-words TEXT               [       ] стоп-слова LLaMA (разделяются ;)
 
-### GPU и распределение
+GPU и распределение
   --main-gpu N                    [0      ] ID основной GPU (начиная с 0)
   --split-mode NAME               [none   ] режим разделения GPU: 'none' или 'layer'
   --tensor-split LIST             [       ] разделение тензоров (список float: 0.5,0.5)
 
-### XTTS (озвучка)
+XTTS (озвучка)
   -s FILE,  --speak TEXT          [speak  ] команда для TTS
   -sf FILE, --speak-file          [to_speak.txt] файл для передачи в TTS
   --xtts-voice NAME               [Emma   ] голос XTTS (без расширения .wav)
@@ -267,10 +292,10 @@ cmake.exe -DWHISPER_NO_AVX2=1 -DWHISPER_SDL2=ON -DWHISPER_CUBLAS=0 -DGGML_CUDA=1
   --seqrep                        [false  ] штраф за повторения последовательностей
   --split-after N                 [0      ] разделять текст для TTS после N токенов
 
-### Сеть и интеграции
+Сеть и интеграции
   --google-url TEXT               [http://localhost:8003/]     URL сервера Google Search
 
-### Управление
+Управление
   --push-to-talk                  [false  ] зажимать Alt для разговора
 ```
 
