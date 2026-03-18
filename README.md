@@ -196,65 +196,82 @@ cmake.exe -DWHISPER_NO_AVX2=1 -DWHISPER_SDL2=ON -DWHISPER_CUBLAS=0 -DGGML_CUDA=1
 ```
 ## whisper-talk-llama.exe params / Параметры командной строки для bat файла
 ```
-  -h,       --help           [default] show this help message and exit
-  -t N,     --threads N      [4      ] number of threads to use during computation
-  -vms N,   --voice-ms N     [10000  ] voice duration in milliseconds
-  -c ID,    --capture ID     [-1     ] capture device ID
-  -mt N,    --max-tokens N   [32     ] maximum number of tokens per audio chunk
-  -ac N,    --audio-ctx N    [0      ] audio context size (0 - all)
-  -ngl N,   --n-gpu-layers N [999    ] number of layers to store in VRAM
-  -vth N,   --vad-thold N    [0.60   ] voice avg activity detection threshold
-  -vths N,  --vad-start-thold N [0.000270] vad min level to stop tts, 0: off, 0.000270: default
-  -vlm N,   --vad-last-ms N  [0      ] vad min silence after speech, ms
-  -fth N,   --freq-thold N   [100.00 ] high-pass frequency cutoff
-  -su,      --speed-up       [false  ] speed up audio by x2 (not working)
-  -tr,      --translate      [false  ] translate from source language to english
-  -ps,      --print-special  [false  ] print special tokens
-  -pe,      --print-energy   [false  ] print sound energy (for debugging)
-  --debug                    [false  ] print debug info
-  -vp,      --verbose-prompt [false  ] print prompt at start
-  --verbose                  [false  ] print speed
-  -ng,      --no-gpu         [false  ] disable GPU
-  -fa,      --flash-attn     [false  ] flash attention
-  -p NAME,  --person NAME    [Georgi ] person name (for prompt selection)
-  -bn NAME, --bot-name NAME  [LLaMA  ] bot name (to display)
-  -w TEXT,  --wake-command T [       ] wake-up command to listen for
-  -ho TEXT, --heard-ok TEXT  [       ] said by TTS before generating reply
-  -l LANG,  --language LANG  [en     ] spoken language
-  -mw FILE, --model-whisper  [models/ggml-base.en.bin] whisper model file
-  -ml FILE, --model-llama    [models/ggml-llama-7B.bin] llama model file
-  -s FILE,  --speak TEXT     [./examples/talk-llama/speak] command for TTS
-  -sf FILE, --speak-file     [./examples/talk-llama/to_speak.txt] file to pass to TTS
-  --prompt-file FNAME        [       ] file with custom prompt to start dialog
-  --instruct-preset TEXT     [       ] instruct preset to use without .json
-  --session FNAME                   file to cache model state in (may be large!) (default: none)
-  -f FNAME, --file FNAME     [       ] text output file name
-   --ctx_size N              [2048   ] Size of the prompt context
-  -b N,     --batch-size N   [64     ] Size of input batch size
-  -n N,     --n_predict N    [64     ] Max number of tokens to predict
-  --temp N                   [0.90   ] Temperature
-  --top_k N                  [40.00  ] top_k
-  --top_p N                  [1.00   ] top_p
-  --min_p N                  [0.00   ] min_p
-  --repeat_penalty N         [1.10   ] repeat_penalty
-  --repeat_last_n N          [256    ] repeat_last_n
-  --n_keep N                 [128    ] keep first n_tokens after context_shift
-  --main-gpu N               [0      ] main GPU id, starting from 0
-  --split-mode NAME          [none   ] GPU split mode: 'none' or 'layer'
-  --tensor-split NAME        [(null) ] Tensor split, list of floats: 0.5,0.5
-  --xtts-voice NAME          [emma_1 ] xtts voice without .wav
-  --xtts-url TEXT            [http://localhost:8020/] xtts/silero server URL, with trailing slash
-  --xtts-control-path FNAME  [c:\DATA\LLM\xtts\xtts_play_allowed.txt] not used anymore
-  --xtts-intro               [false  ] xtts instant short random intro like Hmmm.
-  --sleep-before-xtts        [0      ] sleep llama inference before xtts, ms.
-  --google-url TEXT          [http://localhost:8003/] langchain google-serper server URL, with /
-  --allow-newline            [false  ] allow new line in llama output
-  --multi-chars              [false  ] xtts will use same wav name as in llama output
-  --push-to-talk             [false  ] hold Alt to speak
-  --seqrep                   [false  ] sequence repetition penalty, search last 20 in 300
-  --split-after N            [0      ] split after first n tokens for tts
-  --min-tokens N             [0      ] min new tokens to output
-  --stop-words TEXT          [       ] llama stop w: separated by ;
+### Базовые параметры
+  -h,       --help                [default] показать это сообщение и выйти
+  -t N,     --threads N           [4      ] количество потоков для вычислений
+  -vms N,   --voice-ms N          [10000  ] длительность голоса в миллисекундах
+  --interrupt-check-ms N          [200    ] как часто проверять микрофон во время генерации (мс)
+  --interrupt-threshold-ms N      [250    ] сколько мс речи нужно для прерывания генерации
+  -c ID,    --capture ID          [-1     ] ID устройства захвата звука
+  -mt N,    --max-tokens N        [64     ] максимальное количество токенов на аудио-фрагмент
+  -ac N,    --audio-ctx N         [0      ] размер аудио-контекста (0 - весь)
+  -ngl N,   --n-gpu-layers N      [999    ] количество слоёв для хранения в VRAM
+  -vth N,   --vad-thold N         [0.0005 ] порог обнаружения голосовой активности
+  -vths N,  --vad-start-thold N   [0.0003 ] мин. уровень VAD для остановки TTS (0: выкл)
+  -vlm N,   --vad-last-ms N       [1500.00] мин. тишина после речи для VAD, мс
+  -fth N,   --freq-thold N        [90.00  ] частота среза высокочастотного фильтра
+  -su,      --speed-up            [false  ] ускорить аудио в 2 раза (не работает)
+  -tr,      --translate           [false  ] перевести с исходного языка на английский
+  -ps,      --print-special       [false  ] печатать специальные токены
+  -pe,      --print-energy        [false  ] печатать энергию звука (для отладки)
+  --debug                         [false  ] печатать отладочную информацию
+  -vp,      --verbose-prompt      [false  ] печатать промпт при запуске
+  --verbose                       [false  ] печатать скорость
+  -ng,      --no-gpu              [false  ] отключить GPU
+  -fa,      --flash-attn          [false  ] использовать flash attention
+
+### Персонажи и промпты
+  -p NAME,  --person NAME         [Друг   ] имя пользователя (для выбора промпта)
+  -bn NAME, --bot-name NAME       [Эмма   ] имя бота (для отображения)
+  -w TEXT,  --wake-command TEXT   [       ] команда пробуждения для прослушивания
+  -ho TEXT, --heard-ok TEXT       [       ] текст, озвучиваемый TTS перед генерацией ответа
+  -l LANG,  --language LANG       [ru     ] язык общения
+  --prompt-file FNAME             [       ] файл с пользовательским промптом для начала диалога
+  --instruct-preset TEXT          [       ] preset для инструкций (без .json)
+
+### Модели и файлы
+  -mw FILE, --model-whisper       [whisper-ggml-medium-q4_0.bin]        файл модели Whisper
+  -ml FILE, --model-llama         [saiga_yandexgpt_8b_Q4_K_S.gguf]      файл модели LLaMA
+  --session FNAME                 [       ] файл для кэширования состояния модели
+  -f FNAME, --file FNAME          [       ] имя файла для вывода текста
+
+### Параметры генерации LLaMA
+  --ctx_size N                    [2048   ] размер контекста промпта
+  -b N,     --batch-size N        [64     ] размер входного батча
+  -n N,     --n_predict N         [64     ] максимальное количество токенов для предсказания
+  --temp N                        [0.90   ] температура
+  --top_k N                       [40.00  ] top_k
+  --top_p N                       [1.00   ] top_p
+  --min_p N                       [0.00   ] min_p
+  --repeat_penalty N              [1.10   ] штраф за повторения
+  --repeat_last_n N               [256    ] количество последних токенов для штрафа
+  --n_keep N                      [128    ] сохранять первые N токенов после сдвига контекста
+  --min-tokens N                  [0      ] минимальное количество новых токенов на вывод
+  --stop-words TEXT               [       ] стоп-слова LLaMA (разделяются ;)
+
+### GPU и распределение
+  --main-gpu N                    [0      ] ID основной GPU (начиная с 0)
+  --split-mode NAME               [none   ] режим разделения GPU: 'none' или 'layer'
+  --tensor-split LIST             [       ] разделение тензоров (список float: 0.5,0.5)
+
+### XTTS (озвучка)
+  -s FILE,  --speak TEXT          [speak  ] команда для TTS
+  -sf FILE, --speak-file          [to_speak.txt] файл для передачи в TTS
+  --xtts-voice NAME               [Emma   ] голос XTTS (без расширения .wav)
+  --xtts-url TEXT                 [http://localhost:8020/]     URL сервера XTTS/Silero (с / на конце)
+  --xtts-control-path FNAME       [xtts_play_allowed.txt]      больше не используется
+  --xtts-intro                    [false  ] короткое случайное вступление XTTS (например "Хмм")
+  --sleep-before-xtts N           [0      ] пауза перед XTTS после инференса LLaMA (мс)
+  --allow-newline                 [false  ] разрешить новые строки в выводе LLaMA
+  --multi-chars                   [false  ] XTTS использует имя из вывода LLaMA для голоса
+  --seqrep                        [false  ] штраф за повторения последовательностей
+  --split-after N                 [0      ] разделять текст для TTS после N токенов
+
+### Сеть и интеграции
+  --google-url TEXT               [http://localhost:8003/]     URL сервера Google Search
+
+### Управление
+  --push-to-talk                  [false  ] зажимать Alt для разговора
 ```
 
 ## Голосовые команды:
