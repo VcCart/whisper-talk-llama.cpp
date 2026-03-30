@@ -130,7 +130,7 @@ std::vector<float> parse_float_list(const std::string& s) {
             }
         }
         
-        // Дополнительная проверка: если не нашли ни одного числа
+        // Проверка: если не нашли ни одного числа
         if (result.empty()) {
             std::cerr << "Warning: No valid float numbers found in string: '" << s << "'" << std::endl;
         }
@@ -3058,8 +3058,14 @@ console::set_display(console::reset);
                                             params.vad_thold, params.freq_thold, params.print_energy, 
                                             params.vad_start_thold);			
 
-            // Если VAD обнаружил начало речи (vad_result == 1) и это новое начало (предыдущее не было началом)
-            if (vad_result == 1 && params.vad_start_thold) // speech started
+            // =================================================================
+            // ОБНАРУЖЕНИЕ НАЧАЛА РЕЧИ (VOICE ACTIVITY DETECTION)
+            // =================================================================
+            // vad_result == 1 означает, что VAD обнаружил начало речевого сигнала
+            // params.vad_start_thold > 0.0f проверяет, что порог начала речи включён
+            // (если порог == 0, функция VAD начала речи отключена)
+            // =================================================================
+            if (vad_result == 1 && params.vad_start_thold > 0.0f) // speech started
                 {
                 if (vad_result_prev != 1) // реальное начало речи
                     {					
@@ -3524,78 +3530,92 @@ else if (user_command == "reset")
             // Удаляем всё, кроме начального промпта
             n_past_prev = past_prev_arr.front();
             past_prev_arr.clear();
-            int rollback_num = embd_inp.size()-n_past_prev;
-                if (rollback_num)
-                            {
-                                printf(" [Resetting context of %zd tokens.]\n", embd_inp.size());
-                                // Обязательно освобождаем старый контекст перед созданием нового!
-                                if (ctx_llama) {
-                                    llama_free(ctx_llama);
-                                    ctx_llama = nullptr;  // ← ДОБАВЛЕНО: обнуляем указатель после освобождения
-                                }
-                                // Пересоздаём контекст модели
-                                ctx_llama = llama_init_from_model(model_llama, lcparams);
-                                
-                                // ============================================
-                                // ПРОВЕРКА: успешно ли создан новый контекст?
-                                // ============================================
-                                if (!ctx_llama) {
-                                    fprintf(stderr, "%s : ERROR: Failed to reinitialize llama context on reset\n", __func__);
-                                    fprintf(stderr, "Cannot continue. Exiting.\n");
-                                    return 1;  // Завершаем программу, так как контекст поврежден
-                                }
+            int rollback_num = embd_inp.size() - n_past_prev;
+            if (rollback_num)
+            {
+                printf(" [Resetting context of %zd tokens.]\n", embd_inp.size());
+                
+                // ============================================
+                // 1. Освобождаем старый батч
+                // ============================================
+                llama_batch_free(batch);
+                
+                // 2. Освобождаем старый контекст
+                if (ctx_llama) {
+                    llama_free(ctx_llama);
+                    ctx_llama = nullptr;
+                }
+                
+                // 3. Пересоздаём контекст модели
+                ctx_llama = llama_init_from_model(model_llama, lcparams);
+                
+                // Проверка успешности создания контекста
+                if (!ctx_llama) {
+                    fprintf(stderr, "%s : ERROR: Failed to reinitialize llama context on reset\n", __func__);
+                    fprintf(stderr, "Cannot continue. Exiting.\n");
+                    return 1;
+                }
 
-                                // Токенизируем начальный промпт заново
-                                embd_inp = ::llama_tokenize(ctx_llama, prompt_llama, true);
-                                
-                                // ============================================
-                                // ПРОВЕРКА: успешна ли токенизация?
-                                // ============================================
-                                if (embd_inp.empty()) {
-                                    fprintf(stderr, "%s : ERROR: Failed to tokenize prompt after reset\n", __func__);
-                                    return 1;
-                                }
-                                
-                                {										
-                                    batch.n_tokens = embd_inp.size();
+                // ============================================
+                // 4. Пересоздаём батч
+                // ============================================
+                batch = llama_batch_init(2048, 0, 1);
 
-                                    for (int i = 0; i < batch.n_tokens; i++) {
-                                        batch.token[i]     = embd_inp[i];
-                                        batch.pos[i]       = i;
-                                        batch.n_seq_id[i]  = 1;
-                                        batch.seq_id[i][0] = 0;
-                                        batch.logits[i]    = i == batch.n_tokens - 1;
-                                    }
-                                }
+                // 5. Токенизируем начальный промпт заново
+                embd_inp = ::llama_tokenize(ctx_llama, prompt_llama, true);
+                
+                // Проверка успешности токенизации
+                if (embd_inp.empty()) {
+                    fprintf(stderr, "%s : ERROR: Failed to tokenize prompt after reset\n", __func__);
+                    return 1;
+                }
+                
+                // 6. Подготавливаем батч
+                {
+                    batch.n_tokens = embd_inp.size();
 
-                                // Выполняем оценку начального промпта
-                                if (llama_decode(ctx_llama, batch)) {
-                                    fprintf(stderr, "%s : failed to decode after reset\n", __func__);
-                                    return 1;
-                                }
+                    for (int i = 0; i < batch.n_tokens; i++) {
+                        batch.token[i]     = embd_inp[i];
+                        batch.pos[i]       = i;
+                        batch.n_seq_id[i]  = 1;
+                        batch.seq_id[i][0] = 0;
+                        batch.logits[i]    = i == batch.n_tokens - 1;
+                    }
+                }
 
-                                n_past = embd_inp.size();
-                                n_session_consumed = embd_inp.size();
-                                printf(" [Context is now %zu/%I32d tokens. n_past: %d]\n", embd_inp.size(), params.ctx_size, n_past);
+                // 7. Оценка промпта
+                if (llama_decode(ctx_llama, batch)) {
+                    fprintf(stderr, "%s : failed to decode after reset\n", __func__);
+                    return 1;
+                }
 
-                                // Сбрасываем переменные
-                                text_heard = "";
-                                text_heard_trimmed = "";
-                                send_tts_async("Reset whole context", params.xtts_voice, params.language, params.xtts_url);
-                                new_command_allowed = 0;
-                                last_command_time = std::time(0);
-                            }
+                // 8. Обновляем состояние
+                n_past = embd_inp.size();
+                n_session_consumed = embd_inp.size();
+                printf(" [Context is now %zu/%I32d tokens. n_past: %d]\n", embd_inp.size(), params.ctx_size, n_past);
+
+                // 9. Сбрасываем переменные диалога
+                text_heard = "";
+                text_heard_trimmed = "";
+                
+                // 10. Уведомление TTS
+                send_tts_async("Reset whole context", params.xtts_voice, params.language, params.xtts_url);
+                
+                new_command_allowed = 0;
+                last_command_time = std::time(0);
+            }
         }
         else 
-            {
-                // Если сбрасывать нечего — сообщаем об этом
-                printf(" [Nothing to reset more]\n");			
-                send_tts_async("Nothing to reset more", params.xtts_voice, params.language, params.xtts_url);
-            }
+        {
+            // Если сбрасывать нечего — сообщаем об этом
+            printf(" [Nothing to reset more]\n");			
+            send_tts_async("Nothing to reset more", params.xtts_voice, params.language, params.xtts_url);
+        }
     }
     audio.clear(); // Очищаем аудио-буфер
     continue;
 }
+
 // ОСТАНОВКА stop
 if (user_command == "stop")
     {
@@ -3875,19 +3895,53 @@ std::string resp = send_curl(url);
     float temp_next = params.temp;
     int n_discard = 0;
     int n_left = 0;
-    // text inference
+
+    // =================================================================
+    // ЦИКЛ ГЕНЕРАЦИИ ТЕКСТА (LLaMA)
+    // =================================================================
+    // В этом цикле модель генерирует токен за токеном до тех пор,
+    // пока не встретит стоп-последовательность или не достигнет лимита
+    // =================================================================
     bool done = false;
     std::string text_to_speak;
     int new_tokens = 0;
 
     while (true) {
-    // predict
-	if (new_tokens > params.n_predict) break; // 64 default
-		new_tokens++;
-            if (embd.size() > 0) {
-    		    if (n_past + (int) embd.size() > n_ctx) {
-             
-// === НОВЫЙ ПАТЧ 1: ОПТИМИЗИРОВАННАЯ РОТАЦИЯ КОНТЕКСТА ===
+        // =============================================================
+        // ПРОВЕРКА ПРЕРЫВАНИЯ ПО ГОРЯЧЕЙ КЛАВИШЕ
+        // =============================================================
+        // Каждую итерацию цикла проверяем, не нажал ли пользователь
+        // Ctrl+Space или Alt для прерывания генерации.
+        // Это позволяет мгновенно остановить генерацию, не дожидаясь
+        // окончания текущего токена или следующей итерации главного цикла.
+        // =============================================================
+        {
+            std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
+            if (!g_hotkey_pressed.empty()) {
+                // Нажата горячая клавиша — прерываем генерацию
+                llama_interrupted.store(1);
+                g_is_interrupted.store(true);
+                done = true;
+                
+                // Очищаем текст для озвучки, чтобы не отправлять в TTS
+                text_to_speak = "";
+                
+                // Сбрасываем горячую клавишу после обработки
+                g_hotkey_pressed = "";
+                
+                printf(" [Hotkey interrupt: generation stopped]\n");
+                break;
+            }
+        }
+        
+        // predict
+        if (new_tokens > params.n_predict) break; // 64 default
+        new_tokens++;
+        if (embd.size() > 0) {
+            if (n_past + (int) embd.size() > n_ctx) {
+
+
+// === РОТАЦИЯ КОНТЕКСТА ===
 // Используем штатные методы llama.cpp для сдвига контекста,
 // что должно быть быстрее и надежнее ручного управления токенами.
 if (n_past + (int)embd.size() > n_ctx) {
@@ -4271,16 +4325,39 @@ if (text_len >= 2 && new_tokens >= 5 && !person_name_is_found &&
         //fprintf(stdout, " translation_full: (%s)\n", translation_full.c_str());  // Отладочный вывод
     }
 
-    // Подготовка текста для TTS: заменяем антипромпты
-    // Проверяем, что вектор не пуст, прежде чем обращаться к первому элементу
-    if (!antiprompts.empty()) {
-        text_to_speak = ::replace(text_to_speak, antiprompts[0], ""); // Удаляем имя пользователя
-    }
-
-    // Удаляем имя бота из текста для TTS — он должен быть ТОЛЬКО на экране
+    // =================================================================
+    // ПОДГОТОВКА ТЕКСТА ДЛЯ TTS: УДАЛЕНИЕ ИМЕНИ БОТА
+    // =================================================================
+    // Удаляем имя бота из текста для TTS — оно должно быть ТОЛЬКО на экране,
+    // но не произноситься вслух (бот не должен называть себя в речи)
+    // =================================================================
     std::string bot_prefix = params.bot_name + ":";
     if (!text_to_speak.empty() && text_to_speak.substr(0, bot_prefix.size()) == bot_prefix) {
         text_to_speak = text_to_speak.substr(bot_prefix.size());
+    }
+    
+    // =================================================================
+    // ПОДГОТОВКА ТЕКСТА ДЛЯ TTS: УДАЛЕНИЕ ИМЕНИ ПОЛЬЗОВАТЕЛЯ (ТОЛЬКО ИЗ КОНЦА)
+    // =================================================================
+    // ВНИМАНИЕ: имя пользователя (antiprompts[0]) удаляется ТОЛЬКО
+    // если оно находится в КОНЦЕ текста (т.е. является маркером конца диалога)
+    // Это предотвращает удаление имени пользователя из середины предложения,
+    // например: "Я думаю, Друг: это хорошая идея" -> имя останется на месте
+    // =================================================================
+    if (!antiprompts.empty()) {
+        std::string user_name_marker = antiprompts[0]; // например "Друг:" или "Друг :"
+        
+        // Проверяем, заканчивается ли текст для озвучки на имя пользователя
+        // Если да — удаляем его, так как это маркер конца диалога
+        if (text_to_speak.size() >= user_name_marker.size()) {
+            std::string end_of_text = text_to_speak.substr(text_to_speak.size() - user_name_marker.size());
+            if (end_of_text == user_name_marker) {
+                // Удаляем имя пользователя из конца текста
+                text_to_speak = text_to_speak.substr(0, text_to_speak.size() - user_name_marker.size());
+                // Обрезаем лишние пробелы в конце, если остались
+                trim(text_to_speak);
+            }
+        }
     }
     
     // Если есть текст для озвучки (первая или средняя часть предложения)
