@@ -2793,24 +2793,36 @@ if (!params.instruct_preset.empty())
     // Вектор токенов для хранения текущей сессии
     std::vector<llama_token> session_tokens;
 
-    // --- поддержка ChatML при instruct_preset=ChatML ---
-    if (params.instruct_preset == "ChatML") {
-        // Формируем корректный ChatML формат, если он не применён ранее
-        std::string chatml_prompt;
+    // -------------------------------------------------------------------------
+    // УНИВЕРСАЛЬНАЯ ПОДДЕРЖКА INSTRUCT-PRESET (любой формат из JSON)
+    // -------------------------------------------------------------------------
+    if (!params.instruct_preset.empty()) {
+        std::string wrapped_prompt;
 
-        // Добавляем system prompt, если он задан
-        if (!params.prompt.empty()) {
-            chatml_prompt += "<|im_start|>system\n" + params.prompt + "<|im_end|>\n";
+        // 1. System prompt (если задан --prompt-file и в пресете есть префикс/суффикс)
+        if (!params.prompt.empty() &&
+            !params.instruct_preset_data["system_prompt_prefix"].empty()) {
+            wrapped_prompt += params.instruct_preset_data["system_prompt_prefix"];
+            wrapped_prompt += params.prompt;
+            wrapped_prompt += params.instruct_preset_data["system_prompt_suffix"];
         }
 
-        // Добавляем user сообщение
-        chatml_prompt += "<|im_start|>user\n" + prompt_llama + "<|im_end|>\n";
+        // 2. User message (текущий prompt_llama, уже с подстановками {0},{1}...)
+        if (!params.instruct_preset_data["user_message_prefix"].empty()) {
+            wrapped_prompt += params.instruct_preset_data["user_message_prefix"];
+        }
+        wrapped_prompt += prompt_llama;
+        if (!params.instruct_preset_data["user_message_suffix"].empty()) {
+            wrapped_prompt += params.instruct_preset_data["user_message_suffix"];
+        }
 
-        // Добавляем начало блока assistant — модель продолжит отсюда
-        chatml_prompt += "<|im_start|>assistant\n";
+        // 3. Assistant prefix (модель продолжит отсюда)
+        if (!params.instruct_preset_data["bot_message_prefix"].empty()) {
+            wrapped_prompt += params.instruct_preset_data["bot_message_prefix"];
+        }
 
-        // Заменяем оригинальный промпт на ChatML
-        prompt_llama = chatml_prompt;
+        // Заменяем исходный промпт
+        prompt_llama = wrapped_prompt;
     }
 
     // Токенизируем входной промпт (prompt_llama) в последовательность токенов
@@ -2994,97 +3006,67 @@ const int voice_id = 2;
     srand(time(NULL)); // Инициализируем генератор случайных чисел
 	int last_command_time = 0;
 	int eot_antiprompt_id_1 = 0;
-	int eot_antiprompt_id_2 = 0;
 	std::string current_voice = params.xtts_voice;
 
-// === УЛУЧШЕННЫЕ АНТИПРОМПТЫ ===
-std::vector<std::string> antiprompts = {
-    params.person + chat_symb,      // "Друг:"
-    params.person + " " + chat_symb, // "Друг :"
-};
+    // === УЛУЧШЕННЫЕ АНТИПРОМПТЫ (без хардкода) ===
+    std::vector<std::string> antiprompts = {
+        params.person + chat_symb,       // "Друг:"
+        params.person + " " + chat_symb  // "Друг :"
+    };
 
-// Добавляем перевод строки как стоп-последовательность, если не разрешены многострочные ответы
-if (!params.allow_newline) {
-    antiprompts.push_back("\n");
-}
+    // Добавляем перевод строки как стоп-последовательность, если многострочные ответы запрещены
+    if (!params.allow_newline) {
+        antiprompts.push_back("\n");
+    }
 
+    // Стоп-последовательность из JSON-пресета (обычно <|im_end|>\n или </s>)
+    if (!params.instruct_preset_data["stop_sequence"].empty()) {
+        antiprompts.push_back(params.instruct_preset_data["stop_sequence"]);
+    }
 
-// Стоп-последовательность из инструкций
-if (!params.instruct_preset_data["stop_sequence"].empty()) {
-    antiprompts.push_back(params.instruct_preset_data["stop_sequence"]);
-}
+    // Суффикс сообщения бота (EOT-маркер) — тоже стоп-слово
+    if (!params.instruct_preset_data["bot_message_suffix"].empty()) {
+        antiprompts.push_back(params.instruct_preset_data["bot_message_suffix"]);
+    }
 
-// Суффикс сообщения бота
-if (!params.instruct_preset_data["bot_message_suffix"].empty())  
-{
-    antiprompts.push_back(params.instruct_preset_data["bot_message_suffix"]);
-    // НЕ УСТАНАВЛИВАЕМ ИНДЕКСЫ ЗДЕСЬ - будем искать после добавления всех антипромптов
-    
-    // Страховка от странных тегов
-    antiprompts.push_back("</end_of_turn>");
-    // НЕ УСТАНАВЛИВАЕМ ИНДЕКСЫ ЗДЕСЬ
-}
-
-// Пользовательские стоп-слова (с фильтром коротких слов)
-if (!params.stop_words.empty())
-{
-    size_t startIndex = 0;
-    size_t endIndex = params.stop_words.find(';');
-    
-    if (endIndex == std::string::npos) {
-        // Одно слово
-        std::string word = params.stop_words;
-        if (word.length() >= 2) {
-            word = ::replace(word, "\\r", "\r");
-            word = ::replace(word, "\\n", "\n");
-            antiprompts.push_back(word);
-        }
-    } else {
-        // Несколько слов через ";"
-        while (startIndex < params.stop_words.size())
-        {
-            std::string word = params.stop_words.substr(startIndex, endIndex - startIndex);
-            if (!word.empty())
-            {
-                if (word.length() >= 2) {
-                    word = ::replace(word, "\\r", "\r");
-                    word = ::replace(word, "\\n", "\n");
-                    antiprompts.push_back(word);
-                }
+    // Пользовательские стоп-слова из --stop-words (фильтр по длине >=2)
+    if (!params.stop_words.empty()) {
+        size_t start = 0, end = params.stop_words.find(';');
+        auto add_word = [&](std::string w) {
+            if (w.length() >= 2) {
+                w = ::replace(w, "\\r", "\r");
+                w = ::replace(w, "\\n", "\n");
+                antiprompts.push_back(w);
             }
-            startIndex = endIndex + 1;
-            endIndex = params.stop_words.find(';', startIndex);
-            if (endIndex == std::string::npos) {
-                endIndex = params.stop_words.size();
+        };
+        if (end == std::string::npos) {
+            add_word(params.stop_words);
+        } else {
+            while (start < params.stop_words.size()) {
+                std::string word = params.stop_words.substr(start, end - start);
+                add_word(word);
+                start = end + 1;
+                end = params.stop_words.find(';', start);
+                if (end == std::string::npos) end = params.stop_words.size();
             }
         }
     }
-}
 
-// ============================================================
-// УСТАНОВКА ИНДЕКСОВ EOT ПОСЛЕ ДОБАВЛЕНИЯ ВСЕХ АНТИПРОМПТОВ
-// ============================================================
-// Ищем bot_message_suffix и </end_of_turn> в векторе антипромптов
-// Это гарантирует, что индексы будут правильными, даже если
-// пользователь добавил свои стоп-слова через --stop-words
-eot_antiprompt_id_1 = -1;
-eot_antiprompt_id_2 = -1;
-
-for (size_t i = 0; i < antiprompts.size(); i++) {
-    if (antiprompts[i] == params.instruct_preset_data["bot_message_suffix"]) {
-        eot_antiprompt_id_1 = (int)i;
+    // === ОПРЕДЕЛЕНИЕ ИНДЕКСА EOT (bot_message_suffix) ===
+    for (size_t i = 0; i < antiprompts.size(); ++i) {
+        if (antiprompts[i] == params.instruct_preset_data["bot_message_suffix"]) {
+            eot_antiprompt_id_1 = static_cast<int>(i);
+            break;
+        }
     }
-    if (antiprompts[i] == "</end_of_turn>") {
-        eot_antiprompt_id_2 = (int)i;
-    }
-}
+    // (eot_antiprompt_id_2 полностью удалён – больше не используется)
 
-// Выводим итоговый список стоп-слов для отладки
-printf("Llama stop words (%zu): ", antiprompts.size());
-for (const auto &prompt : antiprompts) {
-    printf("'%s', ", prompt.c_str());  // Без обрезки
-}
-printf("\n");
+    // Отладка: выводим все стоп-слова
+    printf("Llama stop words (%zu): ", antiprompts.size());
+    for (const auto& prompt : antiprompts) {
+        printf("'%s', ", prompt.c_str());
+    }
+    printf("\n");
 
 	std::thread input_thread(input_thread_func);
 	std::thread shortcut_thread([cur_window_handle]() {
@@ -4767,16 +4749,17 @@ try
                         last_output_has_username = true;
                         printf(" ");  // Добавляем пробел для визуального разделения
                     }
+                    
                     // Если это антипромпт конца текста (EOT)
-                    else if (i_antiprompt == eot_antiprompt_id_1 || i_antiprompt == eot_antiprompt_id_2) 
+                    else if (i_antiprompt == eot_antiprompt_id_1)
                     {
                         last_output_has_EOT = true;
                     }
                     
                     // Если антипромпт является суффиксом сообщения бота или тегом конца
-                    // Удаляем его из консоли визуально (затираем backspace'ами)
-                    if (antiprompt == params.instruct_preset_data["bot_message_suffix"] || 
-                        antiprompt == "</end_of_turn>" ) 
+                    // Визуально удаляем только суффикс сообщения бота (EOT-маркер), если он не пустой
+                    if (!params.instruct_preset_data["bot_message_suffix"].empty() && 
+                        antiprompt == params.instruct_preset_data["bot_message_suffix"])
                     {
                         std::string backspaces(antiprompt.length(), '\b');
                         std::string spaces(antiprompt.length(), ' ');
