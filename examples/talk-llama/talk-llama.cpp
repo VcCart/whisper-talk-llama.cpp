@@ -1521,6 +1521,58 @@ std::string emb_to_str(llama_context* ctx_llama, const std::vector<llama_token>&
     return ss;
 }
 
+// ============================================================
+// ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: преобразование URL в читаемый текст
+// ============================================================
+std::string url_to_speech(const std::string& url) {
+    std::string result;
+    
+    // Удаляем протокол
+    std::string clean_url = url;
+    clean_url = replace(clean_url, "https://", "");
+    clean_url = replace(clean_url, "http://", "");
+    clean_url = replace(clean_url, "www.", "");
+    
+    // Удаляем параметры
+    size_t qpos = clean_url.find('?');
+    if (qpos != std::string::npos) clean_url = clean_url.substr(0, qpos);
+    size_t hpos = clean_url.find('#');
+    if (hpos != std::string::npos) clean_url = clean_url.substr(0, hpos);
+    
+    // Удаляем trailing slash
+    if (!clean_url.empty() && clean_url.back() == '/') {
+        clean_url.pop_back();
+    }
+    
+    // Разбиваем на части
+    std::vector<std::string> parts;
+    std::string current;
+    
+    for (char c : clean_url) {
+        if (c == '.' || c == '/' || c == '-' || c == '_') {
+            if (!current.empty()) {
+                parts.push_back(current);
+                current.clear();
+            }
+            if (c == '.') parts.push_back("dot");
+            else if (c == '/') parts.push_back("slash");
+            else if (c == '-') parts.push_back("dash");
+            else if (c == '_') parts.push_back("underscore");
+        } else {
+            current += c;
+        }
+    }
+    if (!current.empty()) parts.push_back(current);
+    
+    // Собираем результат
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (!result.empty()) result += " ";
+        result += parts[i];
+    }
+    
+    return result;
+}
+
 // Асинхронная функция для отправки текста в TTS (Text-to-Speech) сервис
 // Все параметры передаются по значению для безопасности в многопоточном окружении.
 // ВСЕ регулярные выражения компилируются ОДИН РАЗ при первом вызове функции.
@@ -1539,7 +1591,7 @@ if (text.empty()) {
 // ============================================================
 // ЭТАП 0: ЗАЩИТА ЧИСЛОВЫХ ПАТТЕРНОВ (от последующих замен)
 // ============================================================
-// Сохраняем для num2words: время, даты, дроби, телефоны, проценты
+// Сохраняем для num2words: время, даты, дроби, телефоны, проценты, валюты
 std::vector<std::pair<std::string, std::string>> protected_patterns;
 
 // Защита времени: 15:30, 15:30:45
@@ -1634,9 +1686,9 @@ try {
     fprintf(stderr, "Regex error (date slash protection): %s\n", e.what());
 }
 
-// Защита десятичных дробей: 3.14, 0.5 (но не номера версий)
+// Защита десятичных дробей: 3.14, 0.5, 0,5 (русский формат)
 try {
-    static const std::regex re_decimal(R"(\b\d+\.\d+\b(?![\w-]))", std::regex::ECMAScript);
+    static const std::regex re_decimal(R"(\b\d+[.,]\d+\b(?![\w-]))", std::regex::ECMAScript);
     std::string processed;
     auto words_begin = std::sregex_iterator(text.begin(), text.end(), re_decimal);
     auto words_end = std::sregex_iterator();
@@ -1656,9 +1708,9 @@ try {
     fprintf(stderr, "Regex error (decimal protection): %s\n", e.what());
 }
 
-// Защита процентов: 50%, 12.5%
+// Защита процентов: 50%, 12.5%, 12,5%
 try {
-    static const std::regex re_percent(R"(\b\d+(?:[.,]\d+)?%)", std::regex::ECMAScript);
+    static const std::regex re_percent(R"(\b\d+(?:[.,]\d+)?\s*%)", std::regex::ECMAScript);
     std::string processed;
     auto words_begin = std::sregex_iterator(text.begin(), text.end(), re_percent);
     auto words_end = std::sregex_iterator();
@@ -1676,6 +1728,75 @@ try {
     text = processed;
 } catch (const std::regex_error& e) {
     fprintf(stderr, "Regex error (percent protection): %s\n", e.what());
+}
+
+// ============================================================
+// ЗАЩИТА ВАЛЮТ (УЛУЧШЕННАЯ)
+// ============================================================
+try {
+    // Улучшенный паттерн для валют:
+    // 1. Сумма + символ: 100$, 50€, 1000₽, 99.99$
+    // 2. Символ + сумма: $100, €50, £100, $99.99
+    // 3. Сумма с разделителями тысяч: 1,000$, 1.000€
+    // 4. Сумма с десятичной частью и разделителями: 1,000.50$
+    static const std::regex re_currency(
+        R"(\b\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?\s*[$€£¥₽]|\b[$€£¥₽]\s*\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)", 
+        std::regex::ECMAScript);
+    
+    std::string processed;
+    auto it_currency = std::sregex_iterator(text.begin(), text.end(), re_currency);
+    auto end_currency = std::sregex_iterator();
+    size_t last_pos = 0;
+    
+    for (auto i = it_currency; i != end_currency; ++i) {
+        std::smatch match = *i;
+        processed += text.substr(last_pos, match.position() - last_pos);
+        std::string marker = "💰CUR" + std::to_string(protected_patterns.size()) + "💰";
+        protected_patterns.emplace_back(marker, match.str());
+        processed += marker;
+        last_pos = match.position() + match.length();
+    }
+    processed += text.substr(last_pos);
+    text = processed;
+} catch (const std::regex_error& e) {
+    fprintf(stderr, "Regex error (currency protection): %s\n", e.what());
+}
+
+// ============================================================
+// ЗАЩИТА ДРОБЕЙ (УЛУЧШЕННАЯ)
+// ============================================================
+try {
+    // Улучшенный паттерн для дробей:
+    // 1. Простые дроби: 1/2, 3/4, 5/8
+    // 2. Смешанные дроби: 1 1/2, 2 3/4
+    // 3. Дроби с пробелами: 1 / 2, 3 / 4
+    static const std::regex re_fraction(
+        R"(\b\d+\s*/\s*\d+\b|\b\d+\s+\d+\s*/\s*\d+\b)", 
+        std::regex::ECMAScript);
+    
+    std::string processed;
+    auto it_fraction = std::sregex_iterator(text.begin(), text.end(), re_fraction);
+    auto end_fraction = std::sregex_iterator();
+    size_t last_pos = 0;
+    
+    for (auto i = it_fraction; i != end_fraction; ++i) {
+        std::smatch match = *i;
+        processed += text.substr(last_pos, match.position() - last_pos);
+        std::string marker = "🔢FRAC" + std::to_string(protected_patterns.size()) + "🔢";
+        
+        // Нормализация дроби: удаляем лишние пробелы
+        std::string frac_value = match.str();
+        frac_value = std::regex_replace(frac_value, std::regex(R"(\s+)"), " ");
+        frac_value = std::regex_replace(frac_value, std::regex(R"(\s*/\s*)"), "/");
+        
+        protected_patterns.emplace_back(marker, frac_value);
+        processed += marker;
+        last_pos = match.position() + match.length();
+    }
+    processed += text.substr(last_pos);
+    text = processed;
+} catch (const std::regex_error& e) {
+    fprintf(stderr, "Regex error (fraction protection): %s\n", e.what());
 }
 
 // Защита телефонов: +7 (123) 456-78-90
@@ -2132,12 +2253,63 @@ try {
     text = replace(text, "]", " ");
 }
 
-// 4.4 ССЫЛКИ (оставляем URL с паузой)
+// ============================================================
+// 4.4 ССЫЛКИ (интеллектуальное преобразование в читаемый текст)
+// ============================================================
 try {
+    // Паттерн для Markdown ссылок: [текст](url)
     static const std::regex re_link_md(R"(\[([^\]]*)\]\(([^)\s]+)\))", std::regex::ECMAScript);
-    text = std::regex_replace(text, re_link_md, "$2, ");
+    
+    // Паттерн для голых URL (без Markdown)
+    static const std::regex re_bare_url(R"(https?://[^\s<>]+|www\.[^\s<>]+)", std::regex::ECMAScript);
+    
+    // ========== ШАГ 1: Обработка Markdown ссылок ==========
+    std::string result1;
+    auto it1 = std::sregex_iterator(text.begin(), text.end(), re_link_md);
+    auto end1 = std::sregex_iterator();
+    size_t last_pos = 0;
+    
+    for (auto i = it1; i != end1; ++i) {
+        std::smatch match = *i;
+        result1 += text.substr(last_pos, match.position() - last_pos);
+        
+        std::string link_text = match[1].str();
+        std::string url = match[2].str();
+        
+        // Если текст ссылки осмысленный (>2 символов и не просто "ссылка")
+        if (link_text.length() > 2 && link_text != "ссылка" && link_text != "link") {
+            result1 += link_text + ", ";
+        } else {
+            result1 += url_to_speech(url) + ", ";
+        }
+        
+        last_pos = match.position() + match.length();
+    }
+    result1 += text.substr(last_pos);
+    text = result1;
+    
+    // ========== ШАГ 2: Обработка голых URL ==========
+    std::string result2;
+    auto it2 = std::sregex_iterator(text.begin(), text.end(), re_bare_url);
+    auto end2 = std::sregex_iterator();
+    last_pos = 0;
+    
+    for (auto i = it2; i != end2; ++i) {
+        std::smatch match = *i;
+        result2 += text.substr(last_pos, match.position() - last_pos);
+        result2 += url_to_speech(match.str()) + ", ";
+        last_pos = match.position() + match.length();
+    }
+    result2 += text.substr(last_pos);
+    text = result2;
+    
 } catch (const std::regex_error& e) {
     fprintf(stderr, "Regex error (links): %s\n", e.what());
+    // Fallback: просто удаляем Markdown-синтаксис
+    text = replace(text, "[", " ");
+    text = replace(text, "]", " ");
+    text = replace(text, "(", " ");
+    text = replace(text, ")", " ");
 }
 
 // 4.5 ИЗОБРАЖЕНИЯ (оставляем alt-текст с паузой)
@@ -3094,10 +3266,11 @@ const int voice_id = 2;
 	llama_time_total = 0.0;
     std::string user_typed = "";
     bool user_typed_this = false;
-    // === Для Патча 3: буфер накопления ввода ===
-static std::string input_accumulator = "";      // буфер накопления фраз
-static float last_input_time = 0.0f;            // время последнего ввода (секунды)
-const float INPUT_TIMEOUT_MS = 1.5f;            // 1.5 сек тишины = конец фразы
+
+    // === Для Патча : буфер накопления ввода ===
+    // static std::string input_accumulator = "";      // буфер накопления фраз
+    // static float last_input_time = 0.0f;            // время последнего ввода (секунды)
+    // const float INPUT_TIMEOUT_MS = 1.5f;            // 1.5 сек тишины = конец фразы
 
 // ### ОСНОВНОЙ ЦИКЛ РАБОТЫ ПРИЛОЖЕНИЯ ###
     while (is_running) {
@@ -3304,27 +3477,28 @@ console::set_display(console::reset);
                         text_heard = all_heard;
                     }
 
-// Выводим уровень энергии, если включён (для отладки)
-if (params.print_energy) fprintf(stdout, " [text_heard: (%s)]\n", text_heard.c_str());
+                // Выводим уровень энергии, если включён (для отладки)
+                if (params.print_energy) fprintf(stdout, " [text_heard: (%s)]\n", text_heard.c_str());
 
-// Если используется команда пробуждения — проверяем, начинается ли фраза с имени
-if (!wake_cmd.empty()) {
-    // Проверяем, начинается ли распознанный текст с команды пробуждения
-    // (эту проверку мы уже сделали раньше, но на всякий случай дублируем)
-    if (all_heard.find(wake_cmd) != 0) {
-        // Не начинается с имени — игнорируем
-        if (params.verbose) {
-            fprintf(stdout, "[wake] ignored in post-check: \"%s\"\n", all_heard.c_str());
-        }
-        audio.clear();
-        continue;
-    }
-}
+                // Если используется команда пробуждения — проверяем, начинается ли фраза с имени
+                if (!wake_cmd.empty()) {
+                    // Проверяем, начинается ли распознанный текст с команды пробуждения
+                    // (эту проверку мы уже сделали раньше, но на всякий случай дублируем)
+                    if (all_heard.find(wake_cmd) != 0) {
+                        // Не начинается с имени — игнорируем
+                        if (params.verbose) {
+                            fprintf(stdout, "[wake] ignored in post-check: \"%s\"\n", all_heard.c_str());
+                        }
+                        audio.clear();
+                        continue;
+                    }
+                }
 
-// при необходимости дайте звуковую обратную связь о том, что текущий текст обрабатывается
-if (!params.heard_ok.empty()) {
-    speak_with_file(params.speak, params.heard_ok, params.speak_file, voice_id);
-}
+                if (!params.heard_ok.empty()) {
+                    safe_thread_emplace(threads, [params, current_voice]() {
+                        send_tts_async(params.heard_ok, current_voice, params.language, params.xtts_url);
+                    });
+                }
 
                 // Удалить текст в квадратных скобках: [всё внутри], но не жадно
                 // Используем [^\\]]* вместо .*?, потому что std::regex нестабильно работает с ленивыми квантификаторами
@@ -3726,7 +3900,7 @@ else if (user_command == "reset")
                 // 8. Обновляем состояние
                 n_past = embd_inp.size();
                 n_session_consumed = embd_inp.size();
-                printf(" [Context is now %zu/%I32d tokens. n_past: %d]\n", embd_inp.size(), params.ctx_size, n_past);
+                printf(" [Context is now %zu/%d tokens. n_past: %d]\n", embd_inp.size(), params.ctx_size, n_past);
 
                 // 9. Сбрасываем переменные диалога
                 text_heard = "";
@@ -3959,7 +4133,7 @@ std::string resp = send_curl(url);
     
 // ### ЦИКЛ ГЕНЕРАЦИИ ТЕКСТА (LLaMA) ###
     // Объяви это ПЕРЕД циклом while(true) генерации LLaMA
-    int64_t speech_vad_start_ms = 0;
+    float speech_vad_start_ms = 0.0f;
     llama_start_time = get_current_time_ms();
     
     // ОПТИМИЗАЦИЯ: Убрана первичная токенизация. Проверяем только пустоту строки.
@@ -4376,10 +4550,11 @@ char out_token_symbol;
         }
         // Обработка знаков препинания и разбиение текста
         int text_len = text_to_speak.size();
-        if (text_to_speak[text_len-1] == ',') n_comas++;  // Считаем запятые
-        // Особая обработка апострофа в split_after
-        if (new_tokens == split_after && params.split_after && text_to_speak[text_len-1] == '\'') 
-            split_after++;
+
+        if (text_len > 0 && text_to_speak[text_len-1] == ',') n_comas++;
+        if (text_len > 0 && new_tokens == split_after && params.split_after && text_to_speak[text_len-1] == '\'') 
+            
+        split_after++;
         // Не разбиваем по Mr.
         if (text_to_speak.size() >= 3 && text_to_speak.substr(text_to_speak.size()-3, 3) == "Mr.") 
             text_to_speak[text_len-1] = ' ';
@@ -4544,8 +4719,8 @@ try
                     params.vad_start_thold);
 
                     if (vad_result == 1) {
-                        if (speech_vad_start_ms == 0) {
-                            speech_vad_start_ms = get_current_time_ms() * 1000;
+                        if (speech_vad_start_ms == 0.0f) {
+                            speech_vad_start_ms = get_current_time_ms() * 1000.0f;
                         }
                         
                         if ((get_current_time_ms() * 1000) - speech_vad_start_ms > params.interrupt_threshold_ms) {
