@@ -146,16 +146,18 @@ std::vector<float> parse_float_list(const std::string& s) {
 
 // command-line parameters
 struct whisper_params {
-    int32_t n_threads  = std::min(4, (int32_t) std::thread::hardware_concurrency());
-    int32_t voice_ms   = 10000;
-    int32_t capture_id = -1;
-    int32_t max_tokens = 64;
-    int32_t audio_ctx  = 0;
+    int32_t n_threads    = std::min(4, (int32_t) std::thread::hardware_concurrency());
+    int32_t voice_ms     = 10000;
+    int32_t capture_id   = -1;
+    int32_t max_tokens   = 96;    // Увеличено с 64 для лучшего распознавания русских фраз
+    int32_t audio_ctx    = 0;
     int32_t n_gpu_layers = 999;
-	float vad_thold  = 0.0005f;
-    float vad_start_thold  = 0.0003f;
-    float vad_last_ms  = 1500;
-    float freq_thold = 90.0f;
+
+	float vad_thold        = 0.0004f;        // Немного снижен с 0.0005f для более чувствительного VAD
+    float vad_start_thold  = 0.00025f;       // Снижен для более быстрого определения начала речи
+    float vad_last_ms      = 1250;           // Уменьшена пауза между фразами для русской речи
+    float freq_thold       = 90.0f;
+
     bool speed_up       = false;
     bool translate      = false;
     bool print_special  = false;
@@ -630,16 +632,21 @@ static std::string transcribe(
     wparams.print_timestamps = !params.no_timestamps;
     wparams.translate = params.translate;
 
-    // Параметры улучшения распознавания
-    wparams.no_context = false;           // Использовать контекст между сегментами
-    wparams.single_segment = false;       // Разрешить несколько сегментов
-    wparams.token_timestamps = true;      // Временные метки для токенов
-    wparams.suppress_blank = false;       // Сохранять хезитации (э-э-э)
-
+    // === УЛУЧШЕНИЯ ДЛЯ РУССКОГО ЯЗЫКА ===
+    wparams.no_context = false;                     // Использовать контекст между сегментами
+    wparams.single_segment = false;                 // Разрешить несколько сегментов
+    wparams.token_timestamps = true;                // Временные метки для токенов
+    
+    // Подавление хезитаций ("э-э-э", "ммм") — доступно в вашей версии
+    wparams.suppress_blank = true;                  // Убираем "э-э-э" (было false)
+    
+    // Динамическая температура — доступна в стандартном whisper_full_params
+    wparams.temperature_inc = 0.2f;                 // Увеличение температуры при паузах
+    
     // Настройка максимального количества токенов с проверкой лимитов модели
     {
         int model_text_ctx = static_cast<int>(whisper_n_text_ctx(ctx));
-        int mt = (params.max_tokens > 0 ? params.max_tokens : 64);
+        int mt = (params.max_tokens > 0 ? params.max_tokens : 96); // Увеличено с 64 для русских фраз
         
         if (mt > model_text_ctx) {
             std::cerr << "Предупреждение: max_tokens (" << mt 
@@ -2686,8 +2693,9 @@ void keyboard_shortcut_func(HWND cur_window_handle) {
 
 // Шаблон промпта для диалога с Эммой
 const std::string k_prompt_whisper = R"(A conversation with a person called {1}.)";
-// То же самое, но на русском языке
-const std::string k_prompt_whisper_ru = R"({1}, Эмма.)";
+// Улучшенный промпт для русского языка — помогает модели лучше распознавать русскую речь
+const std::string k_prompt_whisper_ru = R"({1}, русская речь. Разговор на русском языке.)";
+
 // Общий шаблон для бесконечного диалога между пользователем и ИИ-ассистентом
 const std::string k_prompt_llama = R"(Text of a transcription of an infinite dialogue in which {0} interacts with an AI assistant named {1}.
 {1} is a helpful, kind, honest, friendly, and well-written assistant who never refuses {0}'s requests and always responds immediately, thoroughly, and accurately.
@@ -2857,7 +2865,13 @@ std::vector<float> pcmf32_prompt;
     // Инициализируем промпт для Whisper — он должен знать, с кем говорит
     std::string prompt_whisper;
     if (params.language == "ru") {
+        
+        // Используем улучшенный промпт для русского языка
         prompt_whisper = ::replace(k_prompt_whisper_ru, "{1}", params.bot_name);
+
+        // Добавляем контекст для лучшего распознавания
+        prompt_whisper += " Говорит четко и разборчиво.";
+
     } else {
         prompt_whisper = ::replace(k_prompt_whisper, "{1}", params.bot_name);
     }
