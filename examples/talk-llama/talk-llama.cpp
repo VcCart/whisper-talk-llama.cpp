@@ -2226,20 +2226,19 @@ if (text.empty()) return;
 // ============================================================
 
 // 4.1 УНИВЕРСАЛЬНАЯ НОРМАЛИЗАЦИЯ ЭМОЦИЙ И ВЫДЕЛЕНИЙ
-// Обрабатывает: *смеется*, **смеется**, (смеется), [смеется], смеется:
+// Обрабатывает: *смеется*, **смеется**, (смеется), [смеется]
+// Результат: "смеется, " (запятая и пробел для паузы в TTS)
 try {
-    std::string before = text;
-    
-    // 1. ЗВЁЗДОЧКИ: *смеется* -> смеется,
-    {
-        static const std::regex re_star(R"(\*([^*]+)\*)", std::regex::ECMAScript);
-        text = std::regex_replace(text, re_star, "$1, ");
-    }
-    
-    // 2. ДВОЙНЫЕ ЗВЁЗДОЧКИ: **смеется** -> смеется,
+    // 1. ДВОЙНЫЕ ЗВЁЗДОЧКИ: **смеется** -> смеется,
     {
         static const std::regex re_double_star(R"(\*\*([^*]+)\*\*)", std::regex::ECMAScript);
         text = std::regex_replace(text, re_double_star, "$1, ");
+    }
+    
+    // 2. ОДИНАРНЫЕ ЗВЁЗДОЧКИ: *смеется* -> смеется,
+    {
+        static const std::regex re_star(R"(\*([^*]+)\*)", std::regex::ECMAScript);
+        text = std::regex_replace(text, re_star, "$1, ");
     }
     
     // 3. КРУГЛЫЕ СКОБКИ: (смеется) -> смеется,
@@ -2254,32 +2253,23 @@ try {
         text = std::regex_replace(text, re_brackets, "$1, ");
     }
     
-    // 5. ЭМОЦИИ С ДВОЕТОЧИЕМ: смеется: -> смеется,
-    {
-        static const std::regex re_colon(R"(\b([а-яё]+)\s*:\s*)", 
-                                          std::regex::ECMAScript | std::regex::icase);
-        text = std::regex_replace(text, re_colon, "$1, ");
-    }
-    
-    // Отладка (можно убрать после проверки)
-    if (before != text) {
-        fprintf(stderr, "\n[EMOTION] BEFORE: '%s'\n", before.c_str());
-        fprintf(stderr, "[EMOTION] AFTER:  '%s'\n", text.c_str());
-    }
-    
-    // Удаляем оставшиеся служебные символы
+    // 5. Удаляем оставшиеся служебные символы (скобки могли остаться)
     text = replace(text, "*", "");
     text = replace(text, "(", "");
     text = replace(text, ")", "");
     text = replace(text, "[", "");
     text = replace(text, "]", "");
     
-    // Чистим двойные запятые
-    while (text.find(", ,") != std::string::npos) {
-        text = replace(text, ", ,", ", ");
-    }
+    // 6. Чистка пунктуации (но сохраняем запятые!)
     
-    // Убираем пробел перед запятой
+      // Убираем двойные запятые (один regex вместо while)
+    static const std::regex re_triple_comma(",,,+", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_triple_comma, ",");
+    
+    static const std::regex re_comma_space_comma(", ,", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_comma_space_comma, ", ");
+    
+    // Убираем пробел перед запятой (", " — правильный формат)
     text = replace(text, " ,", ",");
     
     // Убираем запятую перед точкой/восклицанием/вопросом
@@ -2287,45 +2277,144 @@ try {
     text = replace(text, ", !", "!");
     text = replace(text, ", ?", "?");
     
+    // Убираем запятые в начале строки (если эмоция первое слово)
+    if (!text.empty() && text[0] == ',') {
+        text.erase(0, 1);
+        if (!text.empty() && text[0] == ' ') {
+            text.erase(0, 1);
+        }
+    }
+    
+    // 7. Нормализация пробелов (схлопываем множественные)
+    {
+        static const std::regex re_spaces(R"(\s+)", std::regex::ECMAScript);
+        text = std::regex_replace(text, re_spaces, " ");
+    }
+    
+    // 8. Финальная обрезка пробелов
+    trim(text);
+    
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (emotions): %s\n", e.what());
-    // Fallback: просто удаляем звёздочки и скобки
+    // Fallback: минимальная очистка
     text = replace(text, "*", " ");
     text = replace(text, "(", " ");
     text = replace(text, ")", " ");
     text = replace(text, "[", " ");
     text = replace(text, "]", " ");
+    text = replace(text, "  ", " ");
+    trim(text);
 }
 
 // ============================================================
-// 4.2 КАВЫЧКИ ВСЕХ ТИПОВ ("текст" -> текст,)
+// 4.2 КАВЫЧКИ ВСЕХ ТИПОВ (универсальная обработка) — пауза НЕ нужна
 // ============================================================
 try {
-    // Английские двойные кавычки
+    // ============================================================
+    // ШАГ 4.2.1: ЗАЩИТА АНГЛИЙСКИХ СОКРАЩЕНИЙ (don't, it's, we'll и т.д.)
+    // ============================================================
+    std::vector<std::pair<std::string, std::string>> saved_contractions;
+    static const std::regex re_contractions("\\b\\w+'\\w+\\b", std::regex::ECMAScript);
+    std::string protected_text;
+    auto words_begin = std::sregex_iterator(text.begin(), text.end(), re_contractions);
+    auto words_end = std::sregex_iterator();
+    size_t last_pos = 0;
+    
+    for (auto i = words_begin; i != words_end; ++i) {
+        std::smatch match = *i;
+        protected_text += text.substr(last_pos, match.position() - last_pos);
+        std::string marker = "🔷CONTR" + std::to_string(saved_contractions.size()) + "🔷";
+        saved_contractions.push_back({marker, match.str()});
+        protected_text += marker;
+        last_pos = match.position() + match.length();
+    }
+    protected_text += text.substr(last_pos);
+    text = protected_text;
+    
+    // ============================================================
+    // ШАГ 4.2.2: ОБРАБОТКА ВСЕХ ТИПОВ КАВЫЧЕК
+    // ============================================================
+    
+    // Английские двойные кавычки: "text"
     static const std::regex re_quotes_double("\"([^\"]*)\"", std::regex::ECMAScript);
-    text = std::regex_replace(text, re_quotes_double, "$1, ");
+    text = std::regex_replace(text, re_quotes_double, "$1");
     
-    // Кавычки-елочки
-    static const std::regex re_quotes_angle("«([^»]*)»", std::regex::ECMAScript);
-    text = std::regex_replace(text, re_quotes_angle, "$1, ");
-    
-    // Одинарные кавычки
+    // Английские одинарные кавычки: 'text'
     static const std::regex re_quotes_single("'([^']*)'", std::regex::ECMAScript);
-    text = std::regex_replace(text, re_quotes_single, "$1, ");
+    text = std::regex_replace(text, re_quotes_single, "$1");
     
-    // Удаляем все оставшиеся кавычки
-    text = replace(text, "\"", "");
-    text = replace(text, "'", "");
-    text = replace(text, "«", "");
-    text = replace(text, "»", "");
+    // Русские кавычки-ёлочки: «text» и »text«
+    static const std::regex re_quotes_angle1("«([^»]*)»", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_quotes_angle1, "$1");
+    
+    static const std::regex re_quotes_angle2("»([^«]*)«", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_quotes_angle2, "$1");
+    
+    // Немецкие кавычки: „text“ и ‚text‘
+    static const std::regex re_quotes_german_double("„([^“]*)“", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_quotes_german_double, "$1");
+    
+    static const std::regex re_quotes_german_single("‚([^‘]*)‘", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_quotes_german_single, "$1");
+    
+    // Французские/испанские кавычки: ‹text› и ›text‹
+    static const std::regex re_quotes_french_double("‹([^›]*)›", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_quotes_french_double, "$1");
+    
+    static const std::regex re_quotes_french_single("›([^‹]*)‹", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_quotes_french_single, "$1");
+    
+    // Японские/китайские кавычки: 「text」 и 『text』
+    static const std::regex re_quotes_jp_double("「([^」]*)」", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_quotes_jp_double, "$1");
+    
+    static const std::regex re_quotes_jp_single("『([^』]*)』", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_quotes_jp_single, "$1");
+    
+    // Польские кавычки: „text”
+    static const std::regex re_quotes_polish("„([^”]*)”", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_quotes_polish, "$1");
+    
+    // Шведские/финские кавычки: ”text” и ’text’
+    static const std::regex re_quotes_swedish_double("”([^”]*)”", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_quotes_swedish_double, "$1");
+    
+    static const std::regex re_quotes_swedish_single("’([^’]*)’", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_quotes_swedish_single, "$1");
+    
+    // ============================================================
+    // ШАГ 4.2.3: УДАЛЕНИЕ ОСТАВШИХСЯ КАВЫЧЕК (ОДНИМ REGEX)
+    // ============================================================
+    // Все типы кавычек в одном регулярном выражении
+    // Один проход по строке вместо 15 последовательных замен
+    static const std::regex re_all_quotes("[\"'«»„“‚‘‹›「」『』”’]", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_all_quotes, "");
+    
+    // ============================================================
+    // ШАГ 4.2.4: ВОССТАНОВЛЕНИЕ АНГЛИЙСКИХ СОКРАЩЕНИЙ
+    // ============================================================
+    for (const auto& p : saved_contractions) {
+        text = replace(text, p.first, p.second);
+    }
+    
+    // Нормализация пробелов
+    static const std::regex re_spaces("\\s+", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_spaces, " ");
+    trim(text);
     
 } catch (const std::regex_error& e) {
     fprintf(stderr, "Regex error (quotes): %s\n", e.what());
-    // Fallback: просто удаляем все кавычки
+    // Fallback: минимальная очистка
     text = replace(text, "\"", "");
     text = replace(text, "'", "");
     text = replace(text, "«", "");
     text = replace(text, "»", "");
+    text = replace(text, "„", "");
+    text = replace(text, "“", "");
+    text = replace(text, "‹", "");
+    text = replace(text, "›", "");
+    static const std::regex re_spaces_fallback("\\s+", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_spaces_fallback, " ");
+    trim(text);
 }
 
 // ============================================================
@@ -3278,15 +3367,29 @@ const int voice_id = 2;
     // Даже если allow_newline включён, \n в конце ответа должен останавливать генерацию
     antiprompts.push_back("\n");
 
-    // Стоп-последовательность из JSON-пресета (обычно <|eot_id|> или </s>)
-    if (!params.instruct_preset_data["stop_sequence"].empty()) {
-        antiprompts.push_back(params.instruct_preset_data["stop_sequence"]);
-    }
-
-    // Суффикс сообщения бота (EOT-маркер) — тоже стоп-слово
+    // ============================================================
+    // ДОБАВЛЕНИЕ СТОП-СЛОВ (АНТИПРОМПТОВ)
+    // ============================================================
+    
+    // 1. Суффикс сообщения бота (EOT-маркер) — ОСНОВНОЕ стоп-слово
+    //    Например: <|eot_id|>, </s>, <|im_end|>, <end_of_turn>
+    //    Добавляем ВСЕГДА, если не пусто
     if (!params.instruct_preset_data["bot_message_suffix"].empty()) {
         antiprompts.push_back(params.instruct_preset_data["bot_message_suffix"]);
     }
+    
+    // 2. Стоп-последовательность из JSON-пресета (опционально)
+    //    Добавляем ТОЛЬКО если:
+    //    - не пустая
+    //    - И отличается от bot_message_suffix (чтобы избежать дублирования)
+    //    - Примеры где отличается: Qwen (stop_sequence имеет \n в конце),
+    //      Gemma (stop_sequence имеет \n), Alpaca (stop_sequence = "###")
+    if (!params.instruct_preset_data["stop_sequence"].empty() && 
+        params.instruct_preset_data["stop_sequence"] != params.instruct_preset_data["bot_message_suffix"]) {
+        antiprompts.push_back(params.instruct_preset_data["stop_sequence"]);
+    }
+    // Примечание: Если stop_sequence совпадает с bot_message_suffix (как в Yandex, Llama3, Mistral),
+    //            то добавляем только один раз, без дублирования.
 
     // Пользовательские стоп-слова из --stop-words (фильтр по длине >=2)
     if (!params.stop_words.empty()) {
@@ -3717,30 +3820,31 @@ console::set_display(console::reset);
                     }
                 }
                 
-                trim(text_heard_trimmed);
-                text_heard_trimmed = LowerCase(text_heard_trimmed);                         // Иначе — оставляем текст как есть, даже если он короткий
-                text_heard = std::regex_replace(text_heard, std::regex("\\s+$"), "");       // trailing whitespace
-                text_heard_trimmed = text_heard;                                            // no periods or spaces
-                trim(text_heard_trimmed);
+                // ============================================================
+                // ФИНАЛЬНАЯ ОЧИСТКА text_heard (один проход)
+                // ============================================================
+                // Удаляем пробелы в начале и конце
+                trim(text_heard);
                 
-                // Безопасное удаление начальных знаков препинания
-                if (!text_heard_trimmed.empty()) {
-                    if (text_heard_trimmed[0] == '.') text_heard_trimmed.erase(0, 1);
-                    if (!text_heard_trimmed.empty() && text_heard_trimmed[0] == '!') text_heard_trimmed.erase(0, 1);
-                }
-
-                // Безопасное удаление конечных знаков препинания
-                if (!text_heard_trimmed.empty()) {
-                    size_t last_pos = text_heard_trimmed.length() - 1;
-                    if (text_heard_trimmed[last_pos] == '.' || text_heard_trimmed[last_pos] == '!') {
-                        text_heard_trimmed.erase(last_pos, 1);
+                // Удаляем начальные и конечные знаки препинания
+                if (!text_heard.empty()) {
+                    // Начальные
+                    if (text_heard[0] == '.' || text_heard[0] == '!') {
+                        text_heard.erase(0, 1);
+                        trim(text_heard);
+                    }
+                    // Конечные
+                    if (!text_heard.empty()) {
+                        size_t last_pos = text_heard.length() - 1;
+                        if (text_heard[last_pos] == '.' || text_heard[last_pos] == '!') {
+                            text_heard.erase(last_pos, 1);
+                            trim(text_heard);
+                        }
                     }
                 }
                 
+                text_heard_trimmed = LowerCase(text_heard);
                 trim(text_heard_trimmed);
-                text_heard_trimmed = LowerCase(text_heard_trimmed); // не работает корректно с UTF и русским
-
-                fflush(stdout);
 
                 fflush(stdout);
 
