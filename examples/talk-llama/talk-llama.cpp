@@ -2563,36 +2563,31 @@ try {
 }
 
 // ============================================================
-// ЭТАП 7.1: НОРМАЛИЗАЦИЯ МНОГОТОЧИЙ (сохраняем интонацию)
+// ЭТАП 7.1: НОРМАЛИЗАЦИЯ МНОГОТОЧИЙ (ОДНИМ REGEX)
 // ============================================================
 try {
-    // 1. Схлопываем разбитые многоточия: . . . -> ...
-    static const std::regex re_ellipsis_broken(R"(\.\s*\.\s*\.)", std::regex::ECMAScript);
-    text = std::regex_replace(text, re_ellipsis_broken, "...");
+    // Схлопываем любые комбинации точек и пробелов в одно многоточие
+    // Паттерн: точка + (пробелы + точка) повторяется 2+ раз -> ...
+    static const std::regex re_ellipsis(R"(\.(?:\s*\.){2,})", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_ellipsis, "...");
     
-    // 2. Схлопываем любые 3+ точки в одно многоточие: .... -> ...
-    static const std::regex re_ellipsis_multi(R"(\.{4,})", std::regex::ECMAScript);
-    text = std::regex_replace(text, re_ellipsis_multi, "...");
-    
-    // 3. Убираем точку перед многоточием: . ... -> ...
-    static const std::regex re_dot_before_ellipsis(R"(\.\s*\.\.\.)", std::regex::ECMAScript);
-    text = std::regex_replace(text, re_dot_before_ellipsis, "...");
-    
-    // 4. Убираем точку после многоточия: ... . -> ...
-    static const std::regex re_dot_after_ellipsis(R"(\.\.\.\s*\.)", std::regex::ECMAScript);
-    text = std::regex_replace(text, re_dot_after_ellipsis, "...");
+    // Убираем точку перед/после многоточия (одним проходом)
+    static const std::regex re_dot_around_ellipsis(R"(\.{1,2}\s*\.\.\.|\.\.\.\s*\.{1,2})", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_dot_around_ellipsis, "...");
     
 } catch (const std::regex_error& e) {
-    // Fallback: простая замена
-    while (text.find(". . .") != std::string::npos) {
-        text = replace(text, ". . .", "...");
+    // Fallback: быстрая замена
+    std::string temp = text;
+    size_t pos = 0;
+    while ((pos = temp.find(". . .", pos)) != std::string::npos) {
+        temp.replace(pos, 5, "...");
+        pos += 3;
     }
-    while (text.find("....") != std::string::npos) {
-        text = replace(text, "....", "...");
+    while ((pos = temp.find("....", pos)) != std::string::npos) {
+        temp.replace(pos, 4, "...");
+        pos += 3;
     }
-    while (text.find("...") != std::string::npos) {
-        // Оставляем ... как есть, не заменяем на точку!
-    }
+    text = temp;
 }
 
 // ============================================================
