@@ -2382,12 +2382,29 @@ try {
     text = std::regex_replace(text, re_quotes_swedish_single, "$1");
     
     // ============================================================
-    // ШАГ 4.2.3: УДАЛЕНИЕ ОСТАВШИХСЯ КАВЫЧЕК (ОДНИМ REGEX)
+    // ШАГ 4.2.3: УДАЛЕНИЕ ОСТАВШИХСЯ ОДИНОЧНЫХ КАВЫЧЕК (БЕЗОПАСНО)
     // ============================================================
-    // Все типы кавычек в одном регулярном выражении
-    // Один проход по строке вместо 15 последовательных замен
-    static const std::regex re_all_quotes("[\"'«»„“‚‘‹›「」『』”’]", std::regex::ECMAScript);
-    text = std::regex_replace(text, re_all_quotes, "");
+    // Удаляем только символы, которые заведомо не нужны в тексте
+    // НЕ удаляем двойные кавычки — они могут понадобиться для JSON
+    // (хотя они уже должны быть удалены или экранированы)
+    text = replace(text, "«", "");
+    text = replace(text, "»", "");
+    text = replace(text, "„", "");
+    text = replace(text, "“", "");
+    text = replace(text, "‚", "");
+    text = replace(text, "‘", "");
+    text = replace(text, "‹", "");
+    text = replace(text, "›", "");
+    text = replace(text, "「", "");
+    text = replace(text, "」", "");
+    text = replace(text, "『", "");
+    text = replace(text, "』", "");
+    text = replace(text, "”", "");
+    text = replace(text, "’", "");
+    
+    // Двойные и одинарные кавычки НЕ удаляем глобально!
+    // Они уже обработаны парными regex выше.
+    // Одиночные апострофы (don't) защищены и не будут удалены.
     
     // ============================================================
     // ШАГ 4.2.4: ВОССТАНОВЛЕНИЕ АНГЛИЙСКИХ СОКРАЩЕНИЙ
@@ -2404,8 +2421,6 @@ try {
 } catch (const std::regex_error& e) {
     fprintf(stderr, "Regex error (quotes): %s\n", e.what());
     // Fallback: минимальная очистка
-    text = replace(text, "\"", "");
-    text = replace(text, "'", "");
     text = replace(text, "«", "");
     text = replace(text, "»", "");
     text = replace(text, "„", "");
@@ -2547,12 +2562,37 @@ try {
     text = replace(text, " ?", "?");
 }
 
-// Многоточия -> точка
+// ============================================================
+// ЭТАП 7.1: НОРМАЛИЗАЦИЯ МНОГОТОЧИЙ (сохраняем интонацию)
+// ============================================================
 try {
-    static const std::regex re_ellipsis(R"(\.{3,})", std::regex::ECMAScript);
-    text = std::regex_replace(text, re_ellipsis, ".");
+    // 1. Схлопываем разбитые многоточия: . . . -> ...
+    static const std::regex re_ellipsis_broken(R"(\.\s*\.\s*\.)", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_ellipsis_broken, "...");
+    
+    // 2. Схлопываем любые 3+ точки в одно многоточие: .... -> ...
+    static const std::regex re_ellipsis_multi(R"(\.{4,})", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_ellipsis_multi, "...");
+    
+    // 3. Убираем точку перед многоточием: . ... -> ...
+    static const std::regex re_dot_before_ellipsis(R"(\.\s*\.\.\.)", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_dot_before_ellipsis, "...");
+    
+    // 4. Убираем точку после многоточия: ... . -> ...
+    static const std::regex re_dot_after_ellipsis(R"(\.\.\.\s*\.)", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_dot_after_ellipsis, "...");
+    
 } catch (const std::regex_error& e) {
-    text = replace(text, "...", ".");
+    // Fallback: простая замена
+    while (text.find(". . .") != std::string::npos) {
+        text = replace(text, ". . .", "...");
+    }
+    while (text.find("....") != std::string::npos) {
+        text = replace(text, "....", "...");
+    }
+    while (text.find("...") != std::string::npos) {
+        // Оставляем ... как есть, не заменяем на точку!
+    }
 }
 
 // ============================================================
