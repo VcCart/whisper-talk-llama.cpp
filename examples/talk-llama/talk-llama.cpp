@@ -48,36 +48,43 @@ std::atomic<bool> g_is_interrupted{false};          // Флаг прерыван
 std::atomic<int>  llama_interrupted{0};             // Флаг прерывания генерации LLaMA (связь с озвучкой)
 
 std::queue<std::string> input_queue;                // Очередь ввода с клавиатуры
-std::mutex              input_mutex;                 // Мьютекс для защиты input_queue
+std::mutex              input_mutex;                // Мьютекс для защиты input_queue
 
 std::atomic<bool> keyboard_input_running{true};     // Флаг работы потока ввода с клавиатуры
 
 std::string g_hotkey_pressed = "";                  // Последняя нажатая горячая клавиша
-std::mutex  g_hotkey_pressed_mutex;                  // Мьютекс для защиты g_hotkey_pressed
+std::mutex  g_hotkey_pressed_mutex;                 // Мьютекс для защиты g_hotkey_pressed
 
-std::mutex g_threads_mutex;                          // Мьютекс для защиты вектора потоков threads
+std::mutex g_threads_mutex;                         // Мьютекс для защиты вектора потоков threads
 
-std::string g_last_tts_text = "";                    // Последний текст, отправленный в TTS (для regenerate)
-std::mutex  g_last_tts_mutex;                         // Мьютекс для защиты g_last_tts_text
+std::string g_last_tts_text = "";                   // Последний текст, отправленный в TTS (для regenerate)
+std::mutex  g_last_tts_mutex;                       // Мьютекс для защиты g_last_tts_text
 
 // ФУНКЦИЯ ТОКЕНИЗАЦИИ ТЕКСТА
 // Преобразует текст в последовательность токенов модели LLaMA
-static std::vector<llama_token> llama_tokenize(struct llama_context * ctx, const std::string & text, bool add_bos) {
-const llama_model * model = llama_get_model(ctx);
-const llama_vocab * vocab = llama_model_get_vocab(model);
 
-    // Верхняя граница количества токенов (длина текста + BOS токен)
-    int n_tokens = text.length() + add_bos;
-    std::vector<llama_token> result(n_tokens);
-    // Выполняем токенизацию текста
-    n_tokens = llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_bos, false);
-    if (n_tokens < 0) { // Если буфер оказался мал, увеличиваем его
-        result.resize(-n_tokens);
-        int check = llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_bos, false);
-        GGML_ASSERT(check == -n_tokens); // Проверяем корректность результата
-    } else {
-        result.resize(n_tokens); // Устанавливаем точный размер
+static std::vector<llama_token> llama_tokenize(struct llama_context * ctx, const std::string & text, bool add_bos) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    // Сначала запрашиваем реальное количество токенов
+    int n_tokens = llama_tokenize(vocab, text.data(), text.length(), nullptr, 0, add_bos, false);
+    if (n_tokens <= 0) {
+        fprintf(stderr, "Error: llama_tokenize failed, n_tokens=%d\n", n_tokens);
+        return {};
     }
+    
+    // Создаем вектор точного размера
+    std::vector<llama_token> result(n_tokens);
+    int actual = llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_bos, false);
+    
+    if (actual != n_tokens) {
+        fprintf(stderr, "Warning: token count mismatch, expected %d, got %d\n", n_tokens, actual);
+        if (actual > 0) {
+            result.resize(actual);
+        }
+    }
+    
     return result;
 }
 
