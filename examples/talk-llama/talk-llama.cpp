@@ -43,7 +43,7 @@
 #include <Windows.h>           // Windows API (работа с окнами, клавиатурой)
 #endif                        
 
-// ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ И МЬЮТЕКСЫ
+// ГЛОБАЛЬНЫЕ МЬЮТЕКСЫ
 std::atomic<bool> g_is_interrupted{false};          // Флаг прерывания для сетевых запросов (curl)
 std::atomic<int>  llama_interrupted{0};             // Флаг прерывания генерации LLaMA (связь с озвучкой)
 
@@ -60,6 +60,7 @@ std::mutex g_threads_mutex;                         // Мьютекс для з�
 std::string g_last_tts_text = "";                   // Последний текст, отправленный в TTS (для regenerate)
 std::mutex  g_last_tts_mutex;                       // Мьютекс для защиты g_last_tts_text
 std::atomic<bool> g_shortcut_thread_running{true};  // Флаг работы потока горячих клавиш
+std::mutex  g_llama_mutex;                          // Мьютекс для защиты ctx_llama
 
 // ФУНКЦИЯ ТОКЕНИЗАЦИИ ТЕКСТА
 // Преобразует текст в последовательность токенов модели LLaMA
@@ -1530,7 +1531,11 @@ std::string find_name(const std::string& str) {
 std::string emb_to_str(llama_context* ctx_llama, const std::vector<llama_token>& embd) {
     std::string ss;
     for (const auto& token : embd) {
-        std::string token_str = llama_token_to_piece(ctx_llama, token);
+        std::string token_str;
+        {
+            std::lock_guard<std::mutex> lock(g_llama_mutex);
+            token_str = llama_token_to_piece(ctx_llama, token);
+        }
         ss += token_str;
     }
     return ss;
@@ -3997,60 +4002,64 @@ else if (user_command == "reset")
                 printf(" [Resetting context of %zd tokens.]\n", embd_inp.size());
                 
                 // ============================================
-                // 1. Освобождаем старый батч
+                // ⭐ БЛОКИРУЕМ ДОСТУП К ctx_llama НА ВРЕМЯ ПЕРЕСОЗДАНИЯ
                 // ============================================
-                llama_batch_free(batch);
-                
-                // 2. Освобождаем старый контекст
-                if (ctx_llama) {
-                    llama_free(ctx_llama);
-                    ctx_llama = nullptr;
-                }
-                
-                // 3. Пересоздаём контекст модели
-                ctx_llama = llama_init_from_model(model_llama, lcparams);
-                
-                // Проверка успешности создания контекста
-                if (!ctx_llama) {
-                    fprintf(stderr, "%s : ERROR: Failed to reinitialize llama context on reset\n", __func__);
-                    fprintf(stderr, "Cannot continue. Exiting.\n");
-                    return 1;
-                }
-
-                // ============================================
-                // 4. Пересоздаём батч
-                // ============================================
-                batch = llama_batch_init(2048, 0, 1);
-
-                // 5. Токенизируем начальный промпт заново
-                embd_inp = ::llama_tokenize(ctx_llama, prompt_llama, true);
-                
-                // Проверка успешности токенизации
-                if (embd_inp.empty()) {
-                    fprintf(stderr, "%s : ERROR: Failed to tokenize prompt after reset\n", __func__);
-                    return 1;
-                }
-                
-                // 6. Подготавливаем батч
                 {
-                    batch.n_tokens = embd_inp.size();
+                    std::lock_guard<std::mutex> lock(g_llama_mutex);
+                    
+                    // 1. Освобождаем старый батч
+                    llama_batch_free(batch);
+                    
+                    // 2. Освобождаем старый контекст
+                    if (ctx_llama) {
+                        llama_free(ctx_llama);
+                        ctx_llama = nullptr;
+                    }
+                    
+                    // 3. Пересоздаём контекст модели
+                    ctx_llama = llama_init_from_model(model_llama, lcparams);
+                    
+                    // Проверка успешности создания контекста
+                    if (!ctx_llama) {
+                        fprintf(stderr, "%s : ERROR: Failed to reinitialize llama context on reset\n", __func__);
+                        fprintf(stderr, "Cannot continue. Exiting.\n");
+                        return 1;
+                    }
 
-                    for (int i = 0; i < batch.n_tokens; i++) {
-                        batch.token[i]     = embd_inp[i];
-                        batch.pos[i]       = i;
-                        batch.n_seq_id[i]  = 1;
-                        batch.seq_id[i][0] = 0;
-                        batch.logits[i]    = i == batch.n_tokens - 1;
+                    // 4. Пересоздаём батч
+                    batch = llama_batch_init(2048, 0, 1);
+
+                    // 5. Токенизируем начальный промпт заново
+                    embd_inp = ::llama_tokenize(ctx_llama, prompt_llama, true);
+                    
+                    // Проверка успешности токенизации
+                    if (embd_inp.empty()) {
+                        fprintf(stderr, "%s : ERROR: Failed to tokenize prompt after reset\n", __func__);
+                        return 1;
+                    }
+                    
+                    // 6. Подготавливаем батч
+                    {
+                        batch.n_tokens = embd_inp.size();
+
+                        for (int i = 0; i < batch.n_tokens; i++) {
+                            batch.token[i]     = embd_inp[i];
+                            batch.pos[i]       = i;
+                            batch.n_seq_id[i]  = 1;
+                            batch.seq_id[i][0] = 0;
+                            batch.logits[i]    = i == batch.n_tokens - 1;
+                        }
+                    }
+
+                    // 7. Оценка промпта
+                    if (llama_decode(ctx_llama, batch)) {
+                        fprintf(stderr, "%s : failed to decode after reset\n", __func__);
+                        return 1;
                     }
                 }
-
-                // 7. Оценка промпта
-                if (llama_decode(ctx_llama, batch)) {
-                    fprintf(stderr, "%s : failed to decode after reset\n", __func__);
-                    return 1;
-                }
-
-                // 8. Обновляем состояние
+                // ⭐ МЬЮТЕКС АВТОМАТИЧЕСКИ ОСВОБОЖДЕН
+                
+                // 8. Обновляем состояние (вне мьютекса, т.к. это просто переменные)
                 n_past = embd_inp.size();
                 n_session_consumed = embd_inp.size();
                 printf(" [Context is now %zu/%d tokens. n_past: %d]\n", embd_inp.size(), params.ctx_size, n_past);
@@ -4642,6 +4651,7 @@ char out_token_symbol;
             }
         else // Нормальная температура
             {
+                std::lock_guard<std::mutex> lock(g_llama_mutex);
                 id = llama_sampler_sample(smpl, ctx_llama, -1);  // Сэмплируем с нормальной температурой
             }
         // Если токен не является токеном окончания (EOS)
