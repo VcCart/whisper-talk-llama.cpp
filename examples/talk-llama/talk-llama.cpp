@@ -2203,18 +2203,81 @@ if (text.empty()) return;
 // ЭТАП 4: ЕДИНАЯ ЛОГИКА ПАУЗ (ВСЁ ВЫДЕЛЕННОЕ -> "текст, ")
 // ============================================================
 
-// 4.1 ЭМОЦИИ В ЗВЕЗДОЧКАХ (*смеется* -> смеется,)
+// 4.1 УНИВЕРСАЛЬНАЯ НОРМАЛИЗАЦИЯ ЭМОЦИЙ И ВЫДЕЛЕНИЙ
+// Обрабатывает: *смеется*, **смеется**, (смеется), [смеется], смеется:
 try {
-    static const std::regex re_emotion(R"(\*([^*]+)\*)", std::regex::ECMAScript);
-    text = std::regex_replace(text, re_emotion, "$1, ");
+    std::string before = text;
     
-    static const std::regex re_emotion_double(R"(\*\*([^*]+)\*\*)", std::regex::ECMAScript);
-    text = std::regex_replace(text, re_emotion_double, "$1, ");
+    // 1. ЗВЁЗДОЧКИ: *смеется* -> смеется,
+    {
+        static const std::regex re_star(R"(\*([^*]+)\*)", std::regex::ECMAScript);
+        text = std::regex_replace(text, re_star, "$1, ");
+    }
+    
+    // 2. ДВОЙНЫЕ ЗВЁЗДОЧКИ: **смеется** -> смеется,
+    {
+        static const std::regex re_double_star(R"(\*\*([^*]+)\*\*)", std::regex::ECMAScript);
+        text = std::regex_replace(text, re_double_star, "$1, ");
+    }
+    
+    // 3. КРУГЛЫЕ СКОБКИ: (смеется) -> смеется,
+    {
+        static const std::regex re_parens(R"(\(([^)]+)\))", std::regex::ECMAScript);
+        text = std::regex_replace(text, re_parens, "$1, ");
+    }
+    
+    // 4. КВАДРАТНЫЕ СКОБКИ: [смеется] -> смеется,
+    {
+        static const std::regex re_brackets(R"(\[([^\]]+)\])", std::regex::ECMAScript);
+        text = std::regex_replace(text, re_brackets, "$1, ");
+    }
+    
+    // 5. ЭМОЦИИ С ДВОЕТОЧИЕМ: смеется: -> смеется,
+    {
+        static const std::regex re_colon(R"(\b([а-яё]+)\s*:\s*)", 
+                                          std::regex::ECMAScript | std::regex::icase);
+        text = std::regex_replace(text, re_colon, "$1, ");
+    }
+    
+    // Отладка (можно убрать после проверки)
+    if (before != text) {
+        fprintf(stderr, "\n[EMOTION] BEFORE: '%s'\n", before.c_str());
+        fprintf(stderr, "[EMOTION] AFTER:  '%s'\n", text.c_str());
+    }
+    
+    // Удаляем оставшиеся служебные символы
+    text = replace(text, "*", "");
+    text = replace(text, "(", "");
+    text = replace(text, ")", "");
+    text = replace(text, "[", "");
+    text = replace(text, "]", "");
+    
+    // Чистим двойные запятые
+    while (text.find(", ,") != std::string::npos) {
+        text = replace(text, ", ,", ", ");
+    }
+    
+    // Убираем пробел перед запятой
+    text = replace(text, " ,", ",");
+    
+    // Убираем запятую перед точкой/восклицанием/вопросом
+    text = replace(text, ", .", ".");
+    text = replace(text, ", !", "!");
+    text = replace(text, ", ?", "?");
+    
 } catch (const std::regex_error& e) {
     fprintf(stderr, "Regex error (emotions): %s\n", e.what());
+    // Fallback: просто удаляем звёздочки и скобки
+    text = replace(text, "*", " ");
+    text = replace(text, "(", " ");
+    text = replace(text, ")", " ");
+    text = replace(text, "[", " ");
+    text = replace(text, "]", " ");
 }
 
-/// 4.2 КАВЫЧКИ ВСЕХ ТИПОВ ("текст" -> текст,)
+// ============================================================
+// 4.2 КАВЫЧКИ ВСЕХ ТИПОВ ("текст" -> текст,)
+// ============================================================
 try {
     // Английские двойные кавычки
     static const std::regex re_quotes_double("\"([^\"]*)\"", std::regex::ECMAScript);
@@ -2228,7 +2291,7 @@ try {
     static const std::regex re_quotes_single("'([^']*)'", std::regex::ECMAScript);
     text = std::regex_replace(text, re_quotes_single, "$1, ");
     
-    // Удаляем все оставшиеся одиночные кавычки, которые не были частью пар
+    // Удаляем все оставшиеся кавычки
     text = replace(text, "\"", "");
     text = replace(text, "'", "");
     text = replace(text, "«", "");
@@ -2243,25 +2306,8 @@ try {
     text = replace(text, "»", "");
 }
 
-// 4.3 СКОБКИ (ваша оригинальная идея)
-try {
-    // Круглые скобки
-    static const std::regex re_parens(R"(\(([^)]+)\))", std::regex::ECMAScript);
-    text = std::regex_replace(text, re_parens, "$1, ");
-    
-    // Квадратные скобки
-    static const std::regex re_square(R"(\[([^\]]+)\])", std::regex::ECMAScript);
-    text = std::regex_replace(text, re_square, "$1, ");
-} catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (brackets): %s\n", e.what());
-    text = replace(text, "(", " ");
-    text = replace(text, ")", " ");
-    text = replace(text, "[", " ");
-    text = replace(text, "]", " ");
-}
-
 // ============================================================
-// 4.4 ССЫЛКИ (интеллектуальное преобразование в читаемый текст)
+// 4.3 ССЫЛКИ (интеллектуальное преобразование в читаемый текст)
 // ============================================================
 try {
     // Паттерн для Markdown ссылок: [текст](url)
@@ -2319,7 +2365,9 @@ try {
     text = replace(text, ")", " ");
 }
 
-// 4.5 ИЗОБРАЖЕНИЯ (оставляем alt-текст с паузой)
+// ============================================================
+// 4.4 ИЗОБРАЖЕНИЯ (оставляем alt-текст с паузой)
+// ============================================================
 try {
     static const std::regex re_img_md(R"(!\[([^\]]*)\]\([^)]+\))", std::regex::ECMAScript);
     text = std::regex_replace(text, re_img_md, "$1, ");
@@ -2865,7 +2913,7 @@ std::vector<float> pcmf32_prompt;
     // Инициализируем промпт для Whisper — он должен знать, с кем говорит
     std::string prompt_whisper;
     if (params.language == "ru") {
-        
+
         // Используем улучшенный промпт для русского языка
         prompt_whisper = ::replace(k_prompt_whisper_ru, "{1}", params.bot_name);
 
@@ -3194,18 +3242,18 @@ const int voice_id = 2;
 	int eot_antiprompt_id_1 = 0;
 	std::string current_voice = params.xtts_voice;
 
-    // === УЛУЧШЕННЫЕ АНТИПРОМПТЫ (без хардкода) ===
+    // === АНТИПРОМПТЫ ===
     std::vector<std::string> antiprompts = {
         params.person + chat_symb,       // "Друг:"
         params.person + " " + chat_symb  // "Друг :"
     };
 
-    // Добавляем перевод строки как стоп-последовательность, если многострочные ответы запрещены
-    if (!params.allow_newline) {
-        antiprompts.push_back("\n");
-    }
+    // Всегда добавляем перевод строки как стоп-последовательность
+    // Это нужно для корректного окончания ответа при появлении новой реплики пользователя
+    // Даже если allow_newline включён, \n в конце ответа должен останавливать генерацию
+    antiprompts.push_back("\n");
 
-    // Стоп-последовательность из JSON-пресета (обычно <|im_end|>\n или </s>)
+    // Стоп-последовательность из JSON-пресета (обычно <|eot_id|> или </s>)
     if (!params.instruct_preset_data["stop_sequence"].empty()) {
         antiprompts.push_back(params.instruct_preset_data["stop_sequence"]);
     }
@@ -3281,10 +3329,6 @@ const int voice_id = 2;
     std::string user_typed = "";
     bool user_typed_this = false;
 
-    // === Для Патча : буфер накопления ввода ===
-    // static std::string input_accumulator = "";      // буфер накопления фраз
-    // static float last_input_time = 0.0f;            // время последнего ввода (секунды)
-    // const float INPUT_TIMEOUT_MS = 1.5f;            // 1.5 сек тишины = конец фразы
 
 // ### ОСНОВНОЙ ЦИКЛ РАБОТЫ ПРИЛОЖЕНИЯ ###
     while (is_running) {
@@ -3535,30 +3579,46 @@ console::set_display(console::reset);
                 text_heard = std::regex_replace(text_heard, std::regex("^\\s+"), "");
                 text_heard = std::regex_replace(text_heard, std::regex("\\s+$"), "");
 				
-                 // Удаляем нежелательные знаки в конце строки
-				text_heard = RemoveTrailingCharactersUtf8(text_heard, U"!");
-				text_heard = RemoveTrailingCharactersUtf8(text_heard, U",");
-				text_heard = RemoveTrailingCharactersUtf8(text_heard, U".");
-				text_heard = RemoveTrailingCharactersUtf8(text_heard, U"»");
-				text_heard = RemoveTrailingCharactersUtf8(text_heard, U"[");
-				text_heard = RemoveTrailingCharactersUtf8(text_heard, U"]");
-				text_heard = RemoveTrailingCharactersUtf8(text_heard, U"\""); // удаление конечной кавычки
-				// Удаляем нежелательные символы в начале строки (только если строка не пуста)
-				if (!text_heard.empty() && text_heard[0] == '.') text_heard.erase(0, 1);
-				if (!text_heard.empty() && text_heard[0] == '!') text_heard.erase(0, 1);
-				if (!text_heard.empty() && text_heard[0] == '[') text_heard.erase(0, 1);
-				trim(text_heard);
+                // Удаляем нежелательные знаки в конце строки
+                // ! и ? НЕ удаляем — они важны для эмоциональной окраски
+                // text_heard = RemoveTrailingCharactersUtf8(text_heard, U"!");  // ЗАКОММЕНТИРОВАНО
+                text_heard = RemoveTrailingCharactersUtf8(text_heard, U",");
+                text_heard = RemoveTrailingCharactersUtf8(text_heard, U".");
+                text_heard = RemoveTrailingCharactersUtf8(text_heard, U"»");
+                text_heard = RemoveTrailingCharactersUtf8(text_heard, U"[");
+                text_heard = RemoveTrailingCharactersUtf8(text_heard, U"]");
+                text_heard = RemoveTrailingCharactersUtf8(text_heard, U"\""); // удаление конечной кавычки
+                
+                // Удаляем нежелательные символы в начале строки (только если строка не пуста)
+                if (!text_heard.empty() && text_heard[0] == '.') text_heard.erase(0, 1);
+                // ! в начале НЕ удаляем — это может быть эмоциональное восклицание
+                // if (!text_heard.empty() && text_heard[0] == '!') text_heard.erase(0, 1);  // ЗАКОММЕНТИРОВАНО
+                if (!text_heard.empty() && text_heard[0] == '[') text_heard.erase(0, 1);
+                trim(text_heard);
 				
-                // смягчённая фильтрация распознанного текста
-                // Удаляем очевидный шум / стандартные завершающие фразы, НО НЕ удаляем одиночные символы и '*'.
-                // Это даёт модели шанс среагировать на короткие фразы и односложные слова.
-                if (
-                    text_heard == "!" || text_heard == "." ||
-                    text_heard == "Sil" || text_heard == "Bye" || text_heard == "Okay" || text_heard == "Okay." ||
-                    text_heard == "Thank you." || text_heard == "Thank you" || text_heard == "Thanks." || text_heard == "Bye." ||
-                    text_heard == "Thank you for listening." || text_heard == "Спасибо" || text_heard == "Пока" ||
-                    text_heard == params.bot_name || text_heard == "*Звук!*" ||
+                // ============================================================
+                // ФИЛЬТРАЦИЯ ГАЛЛЮЦИНАЦИЙ WHISPER
+                // ============================================================
+                // Удаляем только явный мусор, который Whisper иногда генерирует:
+                // - служебные фразы из видео/аудио
+                // - одни знаки препинания без слов
+                // 
+                // ВАЖНО: НЕ удаляем вежливые фразы ("Спасибо", "Пока"),
+                // короткие ответы ("Да", "Нет"), обращения к боту.
+                // ============================================================
+                bool is_garbage = false;
+
+                // 1. Текст состоит только из знаков препинания или пустой
+                if (text_heard.empty() || 
+                    text_heard == "!" || text_heard == "." || text_heard == "?" ||
+                    text_heard == "..." || text_heard == "!!" || text_heard == "??") {
+                    is_garbage = true;
+                }
+
+                // 2. Служебные фразы из видео/аудио (Whisper часто их галлюцинирует)
+                if (!is_garbage && (
                     text_heard.find("Редактор субтитров") != std::string::npos ||
+                    text_heard.find("Субтитры") != std::string::npos ||
                     text_heard.find("Спасибо за внимание") != std::string::npos ||
                     text_heard.find("Продолжение следует") != std::string::npos ||
                     text_heard.find("End of") != std::string::npos ||
@@ -3567,19 +3627,39 @@ console::set_display(console::reset);
                     text_heard.find("Thanks for watching") != std::string::npos ||
                     text_heard.find("Thank you for watching") != std::string::npos ||
                     text_heard.find("*click*") != std::string::npos ||
-                    text_heard.find("Субтитры") != std::string::npos ||
-                    text_heard.find("До свидания") != std::string::npos ||
-                    text_heard.find("До новых встреч") != std::string::npos ||
-                    text_heard.find("ПЕСНЯ") != std::string::npos ||
-                    text_heard.find("Silence") != std::string::npos
-                ) {
-                    // оставляем это как «шум» и очищаем
-                    text_heard = "";
-                } else {
-                    // Не удаляем короткие или односимвольные распознавания: даём модели шанс ответить.
-                    // Небольшие дополнения: нормализуем пробельные символы, удаляем только длинный «мусор»
-                    // (остальные случаи позволим дальше обрабатываться)
+                    text_heard.find("Silence") != std::string::npos ||
+                    text_heard.find("ПЕСНЯ") != std::string::npos
+                )) {
+                    is_garbage = true;
                 }
+
+                // 3. Короткие служебные слова (только если это ВСЯ фраза)
+                //    "Sil", "Bye", "Okay." — часто галлюцинации
+                if (!is_garbage && (
+                    text_heard == "Sil" || text_heard == "Bye" ||
+                    text_heard == "Okay." || text_heard == "Thanks." || text_heard == "Bye."
+                )) {
+                    is_garbage = true;
+                }
+
+                // 4. Если текст — это только имя бота (без вопроса/обращения)
+                if (!is_garbage && text_heard == params.bot_name) {
+                    is_garbage = true;
+                }
+
+                // 5. Если это явный звуковой эффект из транскрипции
+                if (!is_garbage && text_heard == "*Звук!*") {
+                    is_garbage = true;
+                }
+
+                // Очищаем, если это мусор
+                if (is_garbage) {
+                    text_heard = "";
+                    if (params.verbose) {
+                        fprintf(stdout, "\n[Фильтр: удалён мусор]\n");
+                    }
+                }
+                // Иначе — оставляем текст как есть, даже если он короткий
 
 				text_heard = std::regex_replace(text_heard, std::regex("\\s+$"), ""); // trailing whitespace
 				text_heard_trimmed = text_heard; // no periods or spaces
@@ -4263,110 +4343,128 @@ std::string resp = send_curl(url);
             if (n_past + (int) embd.size() > n_ctx) {
 
 
-// === РОТАЦИЯ КОНТЕКСТА ===
-// Используем штатные методы llama.cpp для сдвига контекста,
-// что должно быть быстрее и надежнее ручного управления токенами.
+// ============================================================================
+// РОТАЦИЯ КОНТЕКСТА (CONTEXT SHIFT)
+// ============================================================================
+// Когда контекст модели (n_past + новые токены) превышает максимальный размер (n_ctx),
+// нужно удалить часть старых токенов, чтобы освободить место для новых.
+// 
+// Принцип работы:
+//   1. Сохраняем первые n_keep токенов (системный промпт, начало диалога)
+//   2. Удаляем примерно 1/4 от оставшихся токенов (самые старые)
+//   3. Сдвигаем KV-кэш модели влево, чтобы "забыть" удалённые токены
+//   4. Синхронизируем локальный буфер embd_inp с новым состоянием
+// ============================================================================
+
 if (n_past + (int)embd.size() > n_ctx) {
-    // Получаем вокабуляр для проверки BOS токена
+    // ------------------------------------------------------------------------
+    // ШАГ 1: Получаем вокабуляр для работы с BOS-токеном
+    // ------------------------------------------------------------------------
     const llama_vocab * vocab_llama = llama_model_get_vocab(model_llama);
     
-    // Безопасное вычисление n_left и n_discard с защитой от отрицательных значений
+    // ------------------------------------------------------------------------
+    // ШАГ 2: Вычисляем, сколько токенов можно удалить
+    // ------------------------------------------------------------------------
+    // n_left = количество токенов после n_keep (которые можно потенциально удалить)
     const int n_left = std::max(0, n_past - n_keep);
     
-    // Вычисляем, сколько токенов нужно выбросить. Используем ту же логику, что и была (n_left / 4),
-    // но добавляем защиту от отрицательных значений и минимум в 1 токен.
+    // n_discard = сколько токенов удаляем (1/4 от n_left, но минимум 1)
     int n_discard = 0;
     if (n_left > 0) {
-        n_discard = std::max(1, n_left / 4);
-        // Убеждаемся, что n_discard не больше, чем n_left
-        n_discard = std::min(n_discard, n_left);
+        n_discard = std::max(1, n_left / 4);           // не меньше 1
+        n_discard = std::min(n_discard, n_left);       // не больше n_left
     }
     
-    // Флаг для отслеживания, был ли выполнен сдвиг
+    // ------------------------------------------------------------------------
+    // ШАГ 3: Флаг успешного сдвига
+    // ------------------------------------------------------------------------
     bool context_updated = false;
     
-    // Дополнительная защита: проверяем валидность диапазона для удаления
+    // ------------------------------------------------------------------------
+    // ШАГ 4: Основная логика сдвига (если есть что удалять)
+    // ------------------------------------------------------------------------
     if (n_discard > 0 && n_keep + n_discard <= n_past) {
-        // Проверяем границы embd_inp для безопасности
+        // Защита от выхода за границы embd_inp
         if (n_keep >= 0 && n_keep + n_discard <= (int)embd_inp.size()) {
             
-            // 1. Удаляем диапазон [n_keep, n_keep + n_discard) из KV-кэша для последовательности 0.
-            //    Используем llama_memory_seq_rm (как в вашем оригинальном коде)
+            // 4.1 Удаляем диапазон токенов [n_keep, n_keep + n_discard) из KV-кэша модели
+            //     Это заставляет модель "забыть" эти токены
             llama_memory_seq_rm(llama_get_memory(ctx_llama), 0, n_keep, n_keep + n_discard);
             
-            // 2. Сдвигаем оставшиеся токены (с n_keep + n_discard до n_past) влево на n_discard позиций.
+            // 4.2 Сдвигаем оставшиеся токены (после удалённого диапазона) влево
+            //     Позиции токенов уменьшаются на n_discard
             if (n_keep + n_discard < n_past) {
                 llama_memory_seq_add(llama_get_memory(ctx_llama), 0, n_keep + n_discard, n_past, -n_discard);
             }
             
-            // 3. Обновляем наш локальный буфер токенов, просто удаляя соответствующий диапазон.
-            //    Это значительно быстрее, чем вручную собирать embd из обрезков.
+            // 4.3 Удаляем те же токены из локального буфера embd_inp
             embd_inp.erase(embd_inp.begin() + n_keep, embd_inp.begin() + n_keep + n_discard);
             
-            // 4. Синхронизируем session_tokens, если используется сессия.
+            // 4.4 Если используется сессия, синхронизируем её
             if (!path_session.empty() && !session_tokens.empty()) {
-                size_t session_erase_start = std::min((size_t)n_keep, session_tokens.size());
-                size_t session_erase_end = std::min((size_t)(n_keep + n_discard), session_tokens.size());
-                if (session_erase_start < session_erase_end) {
-                    session_tokens.erase(session_tokens.begin() + session_erase_start,
-                                         session_tokens.begin() + session_erase_end);
+                size_t start = std::min((size_t)n_keep, session_tokens.size());
+                size_t end = std::min((size_t)(n_keep + n_discard), session_tokens.size());
+                if (start < end) {
+                    session_tokens.erase(session_tokens.begin() + start, session_tokens.begin() + end);
                 }
             }
             
             context_updated = true;
-            printf(" [Context shifted: discarded %d tokens. New context size: %zu.]", 
-                   n_discard, embd_inp.size());
+            
+            // Короткое сообщение в консоль (русский, лаконично)
+            printf("\n[Сдвиг: удал. %d ток, ост: %zu]\n", n_discard, embd_inp.size());
         }
     }
     
-    // Если сдвиг не удался (например, из-за невалидных параметров), используем безопасный fallback
+    // ------------------------------------------------------------------------
+    // ШАГ 5: Fallback (если основной сдвиг не удался)
+    // ------------------------------------------------------------------------
     if (!context_updated) {
-        printf(" [Context shift fallback - keeping last %d tokens.]", n_keep);
-        
-        // Просто оставляем последние n_keep токенов
+        // Упрощённый вариант: оставляем только первые n_keep токенов
         size_t new_size = std::min((size_t)std::max(0, n_keep), embd_inp.size());
         if (new_size < embd_inp.size()) {
             embd_inp.resize(new_size);
             
-            // Синхронизируем session_tokens
+            // Синхронизируем сессию
             if (!path_session.empty() && !session_tokens.empty()) {
-                size_t session_new_size = std::min((size_t)std::max(0, n_keep), session_tokens.size());
-                session_tokens.resize(session_new_size);
+                session_tokens.resize(std::min((size_t)std::max(0, n_keep), session_tokens.size()));
             }
             
-            // В вашей версии API нет прямой функции для полной очистки кэша,
-            // поэтому используем существующий подход
-            printf(" [Using fallback reset]");
+            printf("\n[Сдвиг: сброс до %zu ток.]\n", embd_inp.size());
         }
     }
     
-    // ВАЖНО: Обновляем n_past после всех изменений
-    n_past = (int)embd_inp.size();
-    n_session_consumed = n_past;
+    // ------------------------------------------------------------------------
+    // ШАГ 6: Обновляем счётчики
+    // ------------------------------------------------------------------------
+    n_past = (int)embd_inp.size();           // текущая позиция в контексте
+    n_session_consumed = n_past;             // сколько токенов сессии использовано
     
-    // Проверка и восстановление BOS-токена, если нужно
+    // ------------------------------------------------------------------------
+    // ШАГ 7: Проверяем и восстанавливаем BOS-токен (beginning of sequence)
+    // ------------------------------------------------------------------------
+    // BOS-токен должен быть первым в последовательности. Если его нет — добавляем.
+    // Это важно для корректной работы модели.
     if (vocab_llama) {
-        // В вашей версии используется llama_token_bos, а не llama_vocab_bos
         const llama_token bos_token = llama_token_bos(vocab_llama);
         if (!embd_inp.empty() && embd_inp[0] != bos_token) {
             embd_inp.insert(embd_inp.begin(), bos_token);
             
-            // Синхронизируем session_tokens
             if (!session_tokens.empty()) {
                 session_tokens.insert(session_tokens.begin(), bos_token);
             }
             
             n_past = (int)embd_inp.size();
             n_session_consumed = n_past;
-            printf(" [BOS token restored.]");
+            printf("[BOS]");    // Краткое сообщение о восстановлении BOS
         }
     } else {
         fprintf(stderr, "WARNING: vocab_llama is null, cannot check BOS token\n");
     }
     
-    printf(" [Final context size: %zu. n_past: %d]", embd_inp.size(), n_past);
-    
-    // Отключаем сессию после сдвига
+    // ------------------------------------------------------------------------
+    // ШАГ 8: Отключаем сессию после сдвига (чтобы не пытаться сохранить невалидное состояние)
+    // ------------------------------------------------------------------------
     path_session = "";
 }
 } 
