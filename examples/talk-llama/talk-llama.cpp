@@ -3286,6 +3286,19 @@ const int voice_id = 2;
         }
     }
 
+    // === ФУНКЦИЯ ДЛЯ ОБНОВЛЕНИЯ АНТИПРОМПТОВ ПРИ СМЕНЕ БОТА ===
+    auto update_antiprompts = [&](const std::string& new_person, const std::string& new_bot_name) {
+        // Обновляем первые два антипромпта (имя пользователя)
+        if (antiprompts.size() >= 2) {
+            antiprompts[0] = new_person + chat_symb;           // "Друг:"
+            antiprompts[1] = new_person + " " + chat_symb;     // "Друг :"
+        }
+        // Остальные антипромпты не меняются:
+        // - "\n"
+        // - params.instruct_preset_data["stop_sequence"]
+        // - params.instruct_preset_data["bot_message_suffix"]
+    };
+
     // === ОПРЕДЕЛЕНИЕ ИНДЕКСА EOT (bot_message_suffix) ===
     for (size_t i = 0; i < antiprompts.size(); ++i) {
         if (antiprompts[i] == params.instruct_preset_data["bot_message_suffix"]) {
@@ -4210,7 +4223,15 @@ std::string resp = send_curl(url);
             std::string q = ParseCommandAndGetKeyword(text_heard, user_command);
             if (!q.empty()) {
                 fprintf(stdout, "Переключаюсь на бота: %s", q.c_str());
-                params.bot_name = q;
+                std::string old_bot_name = params.bot_name;  // сохраняем для отладки (опционально)
+                params.bot_name = q;                         // меняем имя бота
+                
+                // ✅ ОБНОВЛЯЕМ АНТИПРОМПТЫ С НОВЫМ ИМЕНЕМ ПОЛЬЗОВАТЕЛЯ
+                update_antiprompts(params.person, params.bot_name);
+                
+                if (params.verbose) {
+                    fprintf(stdout, " [antiprompts updated for bot: %s]\n", params.bot_name.c_str());
+                }
             } else {
                 fprintf(stdout, "Error: can't find bot name in text_heard_trimmed: %s", text_heard_trimmed.c_str());
             }
@@ -4219,6 +4240,7 @@ std::string resp = send_curl(url);
             // fprintf(stdout, "Команда 'call' игнорируется: режим multi_chars отключен.");
         }
     }
+    
         int translation_is_going = 0;
         int n_embd_inp_before_trans = 0;
         int tokens_in_reply = 0;
