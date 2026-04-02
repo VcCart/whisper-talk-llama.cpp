@@ -1134,43 +1134,54 @@ std::string RemoveTrailingCharacters(const std::string &inputString, const char 
     return std::string(inputString.begin(), lastNonTargetPosition.base());
 }
 
-// Удаляет ведущие справа символы Unicode (UTF-8), совпадающие с любым из targetCharacter
-std::string RemoveTrailingCharactersUtf8(const std::string& inputString, const std::u32string& targetCharacter) {
+// Удаляет ведущие справа символы (только ASCII), совпадающие с любым из targetCharacters
+// ВНИМАНИЕ: Эта функция УПРОЩЕНА и работает ТОЛЬКО с ASCII-символами (запятая, точка, скобки и т.д.)
+//           Она НЕ обрезает русские буквы и корректно обрабатывает UTF-8 многобайтовые символы.
+std::string RemoveTrailingCharactersUtf8(const std::string& inputString, const std::string& targetCharacters) {
     // Проверка на пустую строку
     if (inputString.empty()) {
         return inputString;
     }
     
-    try {
-        // Преобразуем входную строку из UTF-8 в UTF-32 для корректной работы с символами
-        std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t> converter;
-        std::u32string u32_input = converter.from_bytes(inputString);
-        
-        // Проверка на пустую строку после преобразования
-        if (u32_input.empty()) {
-            return inputString;
+    // Начинаем с конца строки
+    size_t pos = inputString.length();
+    
+    // Идём с конца, пропуская целевые символы
+    while (pos > 0) {
+        // Определяем начало последнего UTF-8 символа
+        // В UTF-8: байты 0x80-0xBF являются продолжением символа
+        size_t char_start = pos - 1;
+        while (char_start > 0 && (static_cast<unsigned char>(inputString[char_start]) & 0xC0) == 0x80) {
+            char_start--;
         }
-
-        // Ищем первую позицию с конца, где символ не содержится в targetCharacter
-        auto lastNonTargetPosition = std::find_if(u32_input.rbegin(), u32_input.rend(), 
-            [&targetCharacter](char32_t ch) {
-                return targetCharacter.find(ch) == std::u32string::npos;
-            });
-
-        // Если все символы подлежат удалению, возвращаем пустую строку
-        if (lastNonTargetPosition == u32_input.rend()) {
-            return "";
-        }
-
-        // Преобразуем результат обратно в UTF-8 и возвращаем
-        std::string result = converter.to_bytes(std::u32string(u32_input.begin(), lastNonTargetPosition.base()));
-        return result;
         
-    } catch (const std::exception& e) {
-        // При ошибке преобразования кодировки возвращаем исходную строку
-        fprintf(stderr, "RemoveTrailingCharactersUtf8 error: %s\n", e.what());
-        return inputString;
+        // Извлекаем последний символ (может быть 1-4 байта)
+        std::string last_char = inputString.substr(char_start, pos - char_start);
+        
+        // Проверяем, нужно ли удалить этот символ
+        // Удаляем ТОЛЬКО если это ASCII-символ (1 байт) из targetCharacters
+        bool should_remove = false;
+        if (last_char.size() == 1) {  // Только ASCII-символы (1 байт)
+            char c = last_char[0];
+            for (char target : targetCharacters) {
+                if (c == target) {
+                    should_remove = true;
+                    break;
+                }
+            }
+        }
+        
+        // Если символ не подлежит удалению — выходим из цикла
+        if (!should_remove) {
+            break;
+        }
+        
+        // Удаляем символ (сдвигаем позицию)
+        pos = char_start;
     }
+    
+    // Возвращаем обрезанную строку
+    return inputString.substr(0, pos);
 }
 
 // Кодирует строку в формат URL-кодирования (например, пробелы становятся %20)
@@ -3608,13 +3619,13 @@ console::set_display(console::reset);
 				
                 // Удаляем нежелательные знаки в конце строки
                 // ! и ? НЕ удаляем — они важны для эмоциональной окраски
-                // text_heard = RemoveTrailingCharactersUtf8(text_heard, U"!");  // ЗАКОММЕНТИРОВАНО
-                text_heard = RemoveTrailingCharactersUtf8(text_heard, U",");
-                text_heard = RemoveTrailingCharactersUtf8(text_heard, U".");
-                text_heard = RemoveTrailingCharactersUtf8(text_heard, U"»");
-                text_heard = RemoveTrailingCharactersUtf8(text_heard, U"[");
-                text_heard = RemoveTrailingCharactersUtf8(text_heard, U"]");
-                text_heard = RemoveTrailingCharactersUtf8(text_heard, U"\""); // удаление конечной кавычки
+                // text_heard = RemoveTrailingCharactersUtf8(text_heard, "!");  // ЗАКОММЕНТИРОВАНО
+                text_heard = RemoveTrailingCharactersUtf8(text_heard, ",");
+                text_heard = RemoveTrailingCharactersUtf8(text_heard, ".");
+                text_heard = RemoveTrailingCharactersUtf8(text_heard, "»");
+                text_heard = RemoveTrailingCharactersUtf8(text_heard, "[");
+                text_heard = RemoveTrailingCharactersUtf8(text_heard, "]");
+                text_heard = RemoveTrailingCharactersUtf8(text_heard, "\""); // удаление конечной кавычки
                 
                 // Удаляем нежелательные символы в начале строки (только если строка не пуста)
                 if (!text_heard.empty() && text_heard[0] == '.') text_heard.erase(0, 1);
@@ -5039,6 +5050,37 @@ try
             // Проверяем, заканчивается ли last_output на antiprompt
             if (end_of_output == antiprompt) 
             {
+                // ============================================================
+                // ⭐ НОВАЯ ЛОГИКА: Проверяем, нужно ли игнорировать антипромпт
+                // ============================================================
+                
+                // 1. ПРОВЕРКА MIN_TOKENS (слишком короткий ответ)
+                if (params.min_tokens > 0 && tokens_in_reply < params.min_tokens) {
+                    if (params.verbose) {
+                        printf(" [ignoring antiprompt '%s', too short (%d < %d)] ", 
+                               antiprompt.c_str(), tokens_in_reply, params.min_tokens);
+                    }
+                    continue;  // Не останавливаемся, продолжаем генерацию
+                }
+                
+                // 2. СПЕЦИАЛЬНАЯ ОБРАБОТКА ДЛЯ EOT (не обрываем предложение на полуслове)
+                bool is_eot_antiprompt = (antiprompt == "<|eot_id|>" || 
+                                           antiprompt == params.instruct_preset_data["bot_message_suffix"]);
+                
+                if (is_eot_antiprompt && !text_to_speak.empty()) {
+                    // Проверяем, закончено ли предложение (есть точка/вопрос/восклицание)
+                    char last_char = text_to_speak.back();
+                    bool sentence_finished = (last_char == '.' || last_char == '?' || last_char == '!');
+                    
+                    if (!sentence_finished && new_tokens < params.n_predict) {
+                        // Предложение не закончено — игнорируем EOT, продолжаем генерацию
+                        if (params.verbose) {
+                            printf(" [ignoring EOT, sentence not finished (last char: '%c')] ", last_char);
+                        }
+                        continue;  // Не останавливаемся!
+                    }
+                }
+                
                 // ========================================================
                 // СПЕЦИАЛЬНАЯ ОБРАБОТКА ДЛЯ ИМЕНИ ПОЛЬЗОВАТЕЛЯ
                 // ========================================================
@@ -5052,7 +5094,7 @@ try
                 bool is_user_name_antiprompt = (antiprompt == params.person + chat_symb || 
                                                   antiprompt == params.person + " " + chat_symb);
                 
-                                if (is_user_name_antiprompt) 
+                if (is_user_name_antiprompt) 
                 {
                     // Ищем позицию антипромпта в last_output
                     size_t pos = last_output.rfind(antiprompt);
@@ -5075,7 +5117,7 @@ try
                         if (params.debug) {
                             printf("\n[DEBUG] User name antiprompt in middle - IGNORED (continuing)\n");
                         }
-                        i_antiprompt++;  // ← ДОБАВЛЕНА ЭТА СТРОКА
+                        i_antiprompt++;  // Переходим к следующему антипромпту
                         continue;  // Пропускаем этот антипромпт, продолжаем проверять другие
                     }
                 }
