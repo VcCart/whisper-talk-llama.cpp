@@ -3672,18 +3672,50 @@ console::set_display(console::reset);
                         fprintf(stdout, "\n[Фильтр: удалён мусор]\n");
                     }
                 }
+
                 // Иначе — оставляем текст как есть, даже если он короткий
-
-				text_heard = std::regex_replace(text_heard, std::regex("\\s+$"), ""); // trailing whitespace
-				text_heard_trimmed = text_heard; // no periods or spaces
+                text_heard = std::regex_replace(text_heard, std::regex("\\s+$"), ""); // trailing whitespace
+                text_heard_trimmed = text_heard; // no periods or spaces
                 trim(text_heard_trimmed);
-				
-                if (!text_heard_trimmed.empty() && text_heard_trimmed[0] == '.') text_heard_trimmed.erase(0, 1);
-				if (!text_heard_trimmed.empty() && text_heard_trimmed[0] == '!') text_heard_trimmed.erase(0, 1);
+                
+                // Безопасное удаление начальных знаков препинания
+                if (!text_heard_trimmed.empty()) {
+                    if (text_heard_trimmed[0] == '.') text_heard_trimmed.erase(0, 1);
+                    if (!text_heard_trimmed.empty() && text_heard_trimmed[0] == '!') text_heard_trimmed.erase(0, 1);
+                }
 
-				if (text_heard_trimmed[text_heard_trimmed.length() - 1] == '.' || text_heard_trimmed[text_heard_trimmed.length() - 1] == '!') text_heard_trimmed.erase(text_heard_trimmed.length() - 1, 1);
-				trim(text_heard_trimmed);
-				text_heard_trimmed = LowerCase(text_heard_trimmed); // not working right with utf and russian
+                // Безопасное удаление конечных знаков препинания
+                if (!text_heard_trimmed.empty()) {
+                    size_t last_pos = text_heard_trimmed.length() - 1;
+                    if (text_heard_trimmed[last_pos] == '.' || text_heard_trimmed[last_pos] == '!') {
+                        text_heard_trimmed.erase(last_pos, 1);
+                    }
+                }
+                
+                trim(text_heard_trimmed);
+                text_heard_trimmed = LowerCase(text_heard_trimmed);                         // Иначе — оставляем текст как есть, даже если он короткий
+                text_heard = std::regex_replace(text_heard, std::regex("\\s+$"), "");       // trailing whitespace
+                text_heard_trimmed = text_heard;                                            // no periods or spaces
+                trim(text_heard_trimmed);
+                
+                // Безопасное удаление начальных знаков препинания
+                if (!text_heard_trimmed.empty()) {
+                    if (text_heard_trimmed[0] == '.') text_heard_trimmed.erase(0, 1);
+                    if (!text_heard_trimmed.empty() && text_heard_trimmed[0] == '!') text_heard_trimmed.erase(0, 1);
+                }
+
+                // Безопасное удаление конечных знаков препинания
+                if (!text_heard_trimmed.empty()) {
+                    size_t last_pos = text_heard_trimmed.length() - 1;
+                    if (text_heard_trimmed[last_pos] == '.' || text_heard_trimmed[last_pos] == '!') {
+                        text_heard_trimmed.erase(last_pos, 1);
+                    }
+                }
+                
+                trim(text_heard_trimmed);
+                text_heard_trimmed = LowerCase(text_heard_trimmed); // не работает корректно с UTF и русским
+
+                fflush(stdout);
 
                 fflush(stdout);
 
@@ -3695,94 +3727,95 @@ console::set_display(console::reset);
                     allow_xtts_file(params.xtts_control_path, 1);
                 }
 				
-				// ВВОДНОЕ предложение TTS rand для мгновенного ответа
-if (params.xtts_intro && text_heard_trimmed.size())
-{
-    rand_intro_text = tts_intros[rand() % tts_intros.size()];
-    
-    if (!rand_intro_text.empty()) {
-        // Чистим завершенные потоки
-        for (auto it = threads.begin(); it != threads.end(); ) {
-            if (it->joinable()) {
-                it->detach();
-                it = threads.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        
-        // Отправляем в TTS напрямую (безопасно, с мьютексом)
-        safe_thread_emplace(threads, [rand_intro_text, current_voice, params]() {
-            send_tts_async(rand_intro_text, current_voice, params.language, params.xtts_url);
-        });
-    }
-}
-				
-// Определяем, какая команда была произнесена пользователем
-if (text_heard_trimmed.find("regenerate") != std::string::npos || 
-    text_heard_trimmed.find("Переделай") != std::string::npos  ||
-    text_heard_trimmed.find("Переделаем") != std::string::npos || 
-    text_heard_trimmed.find("егенерируй") != std::string::npos || 
-    text_heard_trimmed.find("егенерировать") != std::string::npos) 
-{
-    user_command = "regenerate";
-}
-else if (text_heard_trimmed.find("google") != std::string::npos || 
-         text_heard_trimmed.find("Погугли") != std::string::npos ||
-         text_heard_trimmed.find("По гугл") != std::string::npos) 
-{
-    user_command = "google";
-}
-else if (text_heard_trimmed.find("reset") != std::string::npos || 
-         text_heard_trimmed.find("delete everything") != std::string::npos || 
-         text_heard_trimmed.find("Сброс") != std::string::npos || 
-         text_heard_trimmed.find("Сбросить") != std::string::npos || 
-         text_heard_trimmed.find("Удали все") != std::string::npos || 
-         text_heard_trimmed.find("Удалить все") != std::string::npos) 
-{
-    user_command = "reset";
-}
-else if (text_heard_trimmed.find("delete") != std::string::npos || 
-         text_heard_trimmed.find("please do it") != std::string::npos || 
-         text_heard_trimmed.find("Удалить сообщение") != std::string::npos || 
-         text_heard_trimmed.find("Удали сообщение") != std::string::npos || 
-         text_heard_trimmed.find("Удали два сообщения") != std::string::npos || 
-         text_heard_trimmed.find("Удали три сообщения") != std::string::npos) 
-{
-    user_command = "delete";
-}
-else if (text_heard_trimmed == "step" ||  
-         text_heard_trimmed.find("stop") != std::string::npos || 
-         text_heard_trimmed.find("Стоп") != std::string::npos || 
-         text_heard_trimmed.find("тановись") != std::string::npos ||
-         text_heard_trimmed.find("Хватит") != std::string::npos
-         ) 
-{
-    user_command = "stop";
-}
-else if (text_heard_trimmed.find("call") == 0 || 
-         text_heard_trimmed.find("can you call") != std::string::npos || 
-         text_heard_trimmed.find("let's call") != std::string::npos || 
-         text_heard_trimmed.find("please call") != std::string::npos || 
-         text_heard_trimmed.find("can you hear me") != std::string::npos || 
-         text_heard_trimmed.find("do you hear me") != std::string::npos || 
-         text_heard_trimmed.find("are you here") != std::string::npos || 
-         (text_heard_trimmed.find("what do you think") != std::string::npos && 
-         text_heard_trimmed.find("what do you think of") == std::string::npos) || 
-         text_heard_trimmed.find("позови") != std::string::npos ||
-         text_heard_trimmed.find("ты тут") != std::string::npos || 
-         text_heard_trimmed.find("Ты тут") != std::string::npos || 
-         text_heard_trimmed.find("ты меня слышишь") != std::string::npos || 
-         text_heard_trimmed.find("Ты меня слышишь") != std::string::npos || 
-         text_heard_trimmed.find("ты слышишь меня") != std::string::npos || 
-         text_heard_trimmed.find("Ты слышишь меня") != std::string::npos || 
-         text_heard_trimmed.find("Ты здесь") != std::string::npos || 
-         text_heard_trimmed.find("ты здесь") != std::string::npos || 
-         (text_heard_trimmed.find("то ты думаешь") != std::string::npos && 
-         text_heard != "Что ты думаешь?" &&
-         text_heard_trimmed.find("то ты об этом думаешь") == std::string::npos) || 
-         (text_heard_trimmed.find("то ты об этом думаешь") != std::string::npos && 
-         text_heard != "Что ты об этом думаешь?"))
+                // ВВОДНОЕ предложение TTS rand для мгновенного ответа
+                if (params.xtts_intro && text_heard_trimmed.size())
+                {
+                    rand_intro_text = tts_intros[rand() % tts_intros.size()];
+                    
+                    if (!rand_intro_text.empty()) {
+                        // Чистим завершенные потоки
+                        for (auto it = threads.begin(); it != threads.end(); ) {
+                            if (it->joinable()) {
+                                it->detach();
+                                it = threads.erase(it);
+                            } else {
+                                ++it;
+                            }
+                        }
+                        
+                        // Отправляем в TTS напрямую (безопасно, с мьютексом)
+                        safe_thread_emplace(threads, [rand_intro_text, current_voice, params]() {
+                            send_tts_async(rand_intro_text, current_voice, params.language, params.xtts_url);
+                        });
+                    }
+                }
+                                
+                // Определяем, какая команда была произнесена пользователем
+                if (text_heard_trimmed.find("regenerate") != std::string::npos || 
+                    text_heard_trimmed.find("Переделай") != std::string::npos  ||
+                    text_heard_trimmed.find("Переделаем") != std::string::npos || 
+                    text_heard_trimmed.find("егенерируй") != std::string::npos || 
+                    text_heard_trimmed.find("егенерировать") != std::string::npos) 
+                {
+                    user_command = "regenerate";
+                }
+                else if (text_heard_trimmed.find("google") != std::string::npos || 
+                        text_heard_trimmed.find("Погугли") != std::string::npos ||
+                        text_heard_trimmed.find("По гугл") != std::string::npos) 
+                {
+                    user_command = "google";
+                }
+                else if (text_heard_trimmed.find("reset") != std::string::npos || 
+                        text_heard_trimmed.find("delete everything") != std::string::npos || 
+                        text_heard_trimmed.find("Сброс") != std::string::npos || 
+                        text_heard_trimmed.find("Сбросить") != std::string::npos || 
+                        text_heard_trimmed.find("Удали все") != std::string::npos || 
+                        text_heard_trimmed.find("Удалить все") != std::string::npos) 
+                {
+                    user_command = "reset";
+                }
+                else if (text_heard_trimmed.find("delete") != std::string::npos || 
+                        text_heard_trimmed.find("please do it") != std::string::npos || 
+                        text_heard_trimmed.find("Удалить сообщение") != std::string::npos || 
+                        text_heard_trimmed.find("Удали сообщение") != std::string::npos || 
+                        text_heard_trimmed.find("Удали два сообщения") != std::string::npos || 
+                        text_heard_trimmed.find("Удали три сообщения") != std::string::npos) 
+                {
+                    user_command = "delete";
+                }
+                else if (text_heard_trimmed == "step" ||  
+                        text_heard_trimmed.find("stop") != std::string::npos || 
+                        text_heard_trimmed.find("Стоп") != std::string::npos || 
+                        text_heard_trimmed.find("тановись") != std::string::npos ||
+                        text_heard_trimmed.find("Хватит") != std::string::npos
+                        ) 
+                {
+                    user_command = "stop";
+                }
+                else if (text_heard_trimmed.find("call") == 0 || 
+                        text_heard_trimmed.find("can you call") != std::string::npos || 
+                        text_heard_trimmed.find("let's call") != std::string::npos || 
+                        text_heard_trimmed.find("please call") != std::string::npos || 
+                        text_heard_trimmed.find("can you hear me") != std::string::npos || 
+                        text_heard_trimmed.find("do you hear me") != std::string::npos || 
+                        text_heard_trimmed.find("are you here") != std::string::npos || 
+                        (text_heard_trimmed.find("what do you think") != std::string::npos && 
+                        text_heard_trimmed.find("what do you think of") == std::string::npos) || 
+                        text_heard_trimmed.find("позови") != std::string::npos ||
+                        text_heard_trimmed.find("ты тут") != std::string::npos || 
+                        text_heard_trimmed.find("Ты тут") != std::string::npos || 
+                        text_heard_trimmed.find("ты меня слышишь") != std::string::npos || 
+                        text_heard_trimmed.find("Ты меня слышишь") != std::string::npos || 
+                        text_heard_trimmed.find("ты слышишь меня") != std::string::npos || 
+                        text_heard_trimmed.find("Ты слышишь меня") != std::string::npos || 
+                        text_heard_trimmed.find("Ты здесь") != std::string::npos || 
+                        text_heard_trimmed.find("ты здесь") != std::string::npos || 
+                        (text_heard_trimmed.find("то ты думаешь") != std::string::npos && 
+                        text_heard != "Что ты думаешь?" &&
+                        text_heard_trimmed.find("то ты об этом думаешь") == std::string::npos) || 
+                        (text_heard_trimmed.find("то ты об этом думаешь") != std::string::npos && 
+                        text_heard != "Что ты об этом думаешь?"))
+
 {
     user_command = "call";
 }
@@ -3837,14 +3870,14 @@ if (user_command == "regenerate" ||
                                     text_heard = text_heard_prev;
                                     text_heard_trimmed = "";
                                     
-                                    // ✅ НОВЫЙ КОД: берём последний текст из g_last_tts_text (без массива)
+                                    // НОВЫЙ КОД: берём последний текст из g_last_tts_text (без массива)
                                     std::string text_to_respeak_safe;
                                     {
                                         std::lock_guard<std::mutex> lock(g_last_tts_mutex);
                                         text_to_respeak_safe = g_last_tts_text;
                                     }
                                     
-                                    // ✅ Отправляем в TTS, если есть что озвучивать (безопасно, с мьютексом)
+                                    // Отправляем в TTS, если есть что озвучивать (безопасно, с мьютексом)
                                     if (!text_to_respeak_safe.empty()) {
                                         safe_thread_emplace(threads, [text_to_respeak_safe, current_voice, params]() {
                                             send_tts_async(text_to_respeak_safe, current_voice, params.language, params.xtts_url);
@@ -3856,6 +3889,7 @@ if (user_command == "regenerate" ||
                             }
                         }
 				}
+
             // УДАЛЕНИЕ СООБЩЕНИЙ
             else if (user_command == "delete" || 
             text_heard_trimmed == "Please delete" || 
@@ -3863,6 +3897,7 @@ if (user_command == "regenerate" ||
             text_heard_trimmed == "Delete please" || 
             text_heard_trimmed == "Delete, please") 
                     {
+                        
             // Проверяем, можно ли выполнять команду (с учётом таймаута)
             if (new_command_allowed) 
 					{
