@@ -59,6 +59,7 @@ std::mutex g_threads_mutex;                         // Мьютекс для з�
 
 std::string g_last_tts_text = "";                   // Последний текст, отправленный в TTS (для regenerate)
 std::mutex  g_last_tts_mutex;                       // Мьютекс для защиты g_last_tts_text
+std::atomic<bool> g_shortcut_thread_running{true};  // Флаг работы потока горячих клавиш
 
 // ФУНКЦИЯ ТОКЕНИЗАЦИИ ТЕКСТА
 // Преобразует текст в последовательность токенов модели LLaMA
@@ -2656,7 +2657,7 @@ void keyboard_shortcut_func(HWND cur_window_handle) {
         g_hotkey_pressed = "";
     }
 
-    while (true) {
+    while (g_shortcut_thread_running.load()) {
         isFocused = IsConsoleWindowFocused(cur_window_handle);
         if (isFocused) {
             b_ctr_space = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SPACE) & 0x8000);
@@ -2668,6 +2669,7 @@ void keyboard_shortcut_func(HWND cur_window_handle) {
             if (b_alt) { // Обработка Alt (Push-to-Talk)
                 {
                     std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
+
                     // Устанавливаем Alt только если нет других активных горячих клавиш
                     if (g_hotkey_pressed.empty() || g_hotkey_pressed == "Alt") {
                         g_hotkey_pressed = "Alt";
@@ -2744,6 +2746,8 @@ void keyboard_shortcut_func(HWND cur_window_handle) {
 		
 		std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+    // добавлен выход из функции при завершении цикла
+    // поток завершается автоматически при выходе из функции
 }
 
 // Шаблон промпта для диалога с Эммой
@@ -5381,9 +5385,12 @@ printf("Cleanup complete.\n");
     if (input_thread.joinable()) {
         input_thread.detach(); 
     }
-    // Ожидаем завершения потока обработки горячих клавиш
-    // Метод join() блокирует основной поток до завершения shortcut_thread
-    shortcut_thread.join(); // поток обработки горячих клавиш
+    // Останавливаем поток обработки горячих клавиш
+    g_shortcut_thread_running.store(false);
+    // Ожидаем завершения потока
+    if (shortcut_thread.joinable()) {
+        shortcut_thread.join();
+    }
     // Возвращаем 0 - успешное завершение программы
     return 0;
 }
