@@ -69,22 +69,23 @@ static std::vector<llama_token> llama_tokenize(struct llama_context * ctx, const
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
-    // Сначала запрашиваем реальное количество токенов
-    int n_tokens = llama_tokenize(vocab, text.data(), text.length(), nullptr, 0, add_bos, false);
-    if (n_tokens <= 0) {
-        fprintf(stderr, "Error: llama_tokenize failed, n_tokens=%d\n", n_tokens);
-        return {};
-    }
-    
-    // Создаем вектор точного размера
+    // Начальный размер с запасом (как в старой версии)
+    int n_tokens = text.length() + add_bos;
     std::vector<llama_token> result(n_tokens);
-    int actual = llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_bos, false);
     
-    if (actual != n_tokens) {
-        fprintf(stderr, "Warning: token count mismatch, expected %d, got %d\n", n_tokens, actual);
-        if (actual > 0) {
-            result.resize(actual);
+    // Токенизация с реальным буфером
+    n_tokens = llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_bos, false);
+    
+    if (n_tokens < 0) {
+        // Если буфер мал, увеличиваем до нужного размера
+        result.resize(-n_tokens);
+        int check = llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_bos, false);
+        if (check != -n_tokens) {
+            fprintf(stderr, "Warning: token count mismatch after resize\n");
         }
+    } else {
+        // Обрезаем до реального размера
+        result.resize(n_tokens);
     }
     
     return result;
@@ -1530,13 +1531,10 @@ std::string find_name(const std::string& str) {
  */
 std::string emb_to_str(llama_context* ctx_llama, const std::vector<llama_token>& embd) {
     std::string ss;
+    // Блокируем один раз на всю функцию, а не на каждый токен
+    std::lock_guard<std::mutex> lock(g_llama_mutex);
     for (const auto& token : embd) {
-        std::string token_str;
-        {
-            std::lock_guard<std::mutex> lock(g_llama_mutex);
-            token_str = llama_token_to_piece(ctx_llama, token);
-        }
-        ss += token_str;
+        ss += llama_token_to_piece(ctx_llama, token);
     }
     return ss;
 }
@@ -4651,7 +4649,7 @@ char out_token_symbol;
             }
         else // Нормальная температура
             {
-                std::lock_guard<std::mutex> lock(g_llama_mutex);
+                // std::lock_guard<std::mutex> lock(g_llama_mutex);
                 id = llama_sampler_sample(smpl, ctx_llama, -1);  // Сэмплируем с нормальной температурой
             }
         // Если токен не является токеном окончания (EOS)
