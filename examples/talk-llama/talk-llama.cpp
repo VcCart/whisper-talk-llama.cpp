@@ -645,13 +645,13 @@ static std::string transcribe(
     // === УЛУЧШЕНИЯ ДЛЯ РУССКОГО ЯЗЫКА ===
     wparams.no_context = false;                     // Использовать контекст между сегментами
     wparams.single_segment = false;                 // Разрешить несколько сегментов
-    wparams.token_timestamps = true;                // Временные метки для токенов
-    
-    // Подавление хезитаций ("э-э-э", "ммм") — доступно в вашей версии
-    wparams.suppress_blank = true;                  // Убираем "э-э-э" (было false)
-    
-    // Динамическая температура — доступна в стандартном whisper_full_params
-    wparams.temperature_inc = 0.2f;                 // Увеличение температуры при паузах
+    wparams.token_timestamps = false;               // Временные метки для токенов false - экономим ресурсы
+
+    wparams.suppress_blank = true;                  // Подавление хезитаций "э-э-э" (было false)
+    wparams.temperature = 0.0f;                     // Жёсткий greedy (0) — меньше фантазий
+    wparams.temperature_inc = 0.1f;                 // Динамическая температура Увеличение температуры при паузах
+    wparams.length_penalty = -0.5f;                 // Штраф за длинные последовательности
+
     
     // Настройка максимального количества токенов с проверкой лимитов модели
     {
@@ -2889,9 +2889,19 @@ void keyboard_shortcut_func(HWND cur_window_handle) {
 }
 
 // Шаблон промпта для диалога с Эммой
-const std::string k_prompt_whisper = R"(A conversation with a person called {1}.)";
+const std::string k_prompt_whisper = R"({1}, English conversation. The user speaks clearly and concisely.
+Recognize only actual speech, ignore echoes, noise, and repetitions.
+Do not add words that were not spoken.
+Do not hallucinate phrases like "Thanks for watching", "End of", "Translated by", "Silence".
+If speech is unclear — recognize an empty string.)";
+
 // Улучшенный промпт для русского языка — помогает модели лучше распознавать русскую речь
-const std::string k_prompt_whisper_ru = R"({1}, русская речь. Разговор на русском языке.)";
+const std::string k_prompt_whisper_ru = R"({1}, диалог на русском языке. 
+Пользователь говорит четко, разборчиво, короткими фразами. 
+Распознавай только реальную речь, игнорируй эхо, шум и повторы.
+Не добавляй слова, которые не были произнесены.
+Не галлюцинируй фразы вроде "Спасибо за внимание", "Редактор субтитров", "End of".
+Если речь неразборчива — распознавай пустую строку.)";
 
 // Общий шаблон для бесконечного диалога между пользователем и ИИ-ассистентом
 const std::string k_prompt_llama = R"(Text of a transcription of an infinite dialogue in which {0} interacts with an AI assistant named {1}.
@@ -3065,9 +3075,6 @@ std::vector<float> pcmf32_prompt;
 
         // Используем улучшенный промпт для русского языка
         prompt_whisper = ::replace(k_prompt_whisper_ru, "{1}", params.bot_name);
-
-        // Добавляем контекст для лучшего распознавания
-        prompt_whisper += " Говорит четко и разборчиво.";
 
     } else {
         prompt_whisper = ::replace(k_prompt_whisper, "{1}", params.bot_name);
