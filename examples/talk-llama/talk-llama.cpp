@@ -159,12 +159,12 @@ struct whisper_params {
     int32_t n_threads    = std::min(4, (int32_t) std::thread::hardware_concurrency());
     int32_t voice_ms     = 10000;
     int32_t capture_id   = -1;
-    int32_t max_tokens   = 96;    // Увеличено с 64 для лучшего распознавания русских фраз
+    int32_t max_tokens   = 32;    
     int32_t audio_ctx    = 0;
     int32_t n_gpu_layers = 999;
 
-	float vad_thold        = 0.0004f;        // Немного снижен с 0.0005f для более чувствительного VAD
-    float vad_start_thold  = 0.00025f;       // Снижен для более быстрого определения начала речи
+	float vad_thold        = 0.6f;           //  VAD
+    float vad_start_thold  = 0.000270f;       // Снижен для более быстрого определения начала речи
     float vad_last_ms      = 1250;           // Уменьшена пауза между фразами для русской речи
     float freq_thold       = 90.0f;
 
@@ -630,10 +630,35 @@ static std::string transcribe(
     const auto t_start = std::chrono::high_resolution_clock::now();
 
     // Настройка параметров Whisper
+    // Настройка параметров Whisper
     whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
 
-    wparams.prompt_tokens = nullptr;
-    wparams.prompt_n_tokens = 0;
+    // ============================================================
+    // ПЕРЕДАЧА ПРОМПТА В WHISPER (фикс галлюцинаций)
+    // ============================================================
+    // Промпт помогает модели понимать контекст: кто говорит, на каком языке,
+    // какие фразы игнорировать. Без него Whisper "фантазирует" и повторяется.
+    // ============================================================
+    
+    std::vector<whisper_token> prompt_tokens_vec;
+    if (!prompt_text.empty()) {
+        // Токенизируем промпт
+        prompt_tokens_vec.resize(prompt_text.size() + 1);
+        int n_tokens = whisper_tokenize(ctx, prompt_text.c_str(), 
+                                         prompt_tokens_vec.data(), 
+                                         prompt_tokens_vec.size());
+        if (n_tokens > 0) {
+            prompt_tokens_vec.resize(n_tokens);
+            wparams.prompt_tokens = prompt_tokens_vec.data();
+            wparams.prompt_n_tokens = prompt_tokens_vec.size();
+        } else {
+            wparams.prompt_tokens = nullptr;
+            wparams.prompt_n_tokens = 0;
+        }
+    } else {
+        wparams.prompt_tokens = nullptr;
+        wparams.prompt_n_tokens = 0;
+    }
 
     // Базовые параметры вывода
     wparams.print_progress = false;
@@ -642,21 +667,26 @@ static std::string transcribe(
     wparams.print_timestamps = !params.no_timestamps;
     wparams.translate = params.translate;
 
-    // === УЛУЧШЕНИЯ ДЛЯ РУССКОГО ЯЗЫКА ===
-    wparams.no_context = false;                     // Использовать контекст между сегментами
-    wparams.single_segment = false;                 // Разрешить несколько сегментов
-    wparams.token_timestamps = false;               // Временные метки для токенов false - экономим ресурсы
-
-    wparams.suppress_blank = true;                  // Подавление хезитаций "э-э-э" (было false)
-    wparams.temperature = 0.0f;                     // Жёсткий greedy (0) — меньше фантазий
-    wparams.temperature_inc = 0.1f;                 // Динамическая температура Увеличение температуры при паузах
-    wparams.length_penalty = -0.5f;                 // Штраф за длинные последовательности
-
+    // === ОПТИМАЛЬНЫЕ НАСТРОЙКИ ДЛЯ РАСПОЗНАВАНИЯ РЕЧИ ===
+    // Основано на стабильной работе из проекта Mozer/talk-llama-fast
+    wparams.no_context       = true;   // НЕ использовать контекст между сегментами (ключевое исправление!)
+    wparams.single_segment   = true;   // Каждая фраза обрабатывается отдельно (ключевое исправление!)
+    wparams.token_timestamps = false;  // Временные метки не нужны, экономим ресурсы
     
-    // Настройка максимального количества токенов с проверкой лимитов модели
+    // Подавление мусора и хезитаций
+    wparams.suppress_blank   = true;   // Подавление "э-э-э", "ммм"
+    wparams.suppress_nst     = true;   // Подавление мусорных токенов ("Thanks for watching", "Редактор субтитров")
+    
+    // Детерминированный режим с минимальной случайностью
+    wparams.temperature      = 0.0f;   // Нулевая температура для стабильного результата
+    wparams.temperature_inc  = 0.0f;   // Без повышения температуры
+    wparams.length_penalty   = 0.0f;   // Без штрафа за длину (не поощряем и не штрафуем)
+    
+    // Настройка максимального количества токенов
     {
         int model_text_ctx = static_cast<int>(whisper_n_text_ctx(ctx));
-        int mt = (params.max_tokens > 0 ? params.max_tokens : 96); // Увеличено с 64 для русских фраз
+        // 64 токена достаточно для большинства фраз на русском языке
+        int mt = (params.max_tokens > 0 && params.max_tokens <= 64) ? params.max_tokens : 64;
         
         if (mt > model_text_ctx) {
             std::cerr << "Предупреждение: max_tokens (" << mt 
@@ -667,7 +697,7 @@ static std::string transcribe(
         wparams.max_tokens = mt;
     }
 
-    // Настройка аудиоконтекста с проверкой лимитов модели
+    // Настройка аудиоконтекста
     wparams.audio_ctx = params.audio_ctx;
     int model_audio_ctx = static_cast<int>(whisper_n_audio_ctx(ctx));
     
@@ -677,8 +707,8 @@ static std::string transcribe(
                   << "), применяется лимит модели" << std::endl;
         wparams.audio_ctx = model_audio_ctx;
     }
-
-    // Настройка языка и потоков
+    
+    // Язык и потоки
     wparams.language = params.language.empty() ? nullptr : params.language.c_str();
     wparams.n_threads = params.n_threads;
 
@@ -3658,20 +3688,70 @@ console::set_display(console::reset);
                 // Фильтруем слишком короткие или слишком длинные речевые сегменты
                 if (speech_len < 0.10) speech_len = 0;
                 else if (speech_len > 10.0) speech_len = 0;
-                //printf("%.3f found vad length: %.2f\n", get_current_time_ms(), speech_len);
+                
                 vad_result_prev = 2;
-                // Сбрасываем время начала речи
-                speech_start_ms = 0;
+                
                 // Пропускаем обработку, если длина речи нулевая и нет введённого пользователем текста
-                if (!speech_len && !user_typed.size()) continue;
-                // Добавляем небольшую "подушку" перед началом речи
-                speech_len = speech_len + 0.3; // front padding
-                // Устанавливаем минимальную длину речи (Whisper работает лучше с фразами дольше 1.1 секунды)
-                if (speech_len < 1.10) speech_len = 1.10;
-                // берём последние 10 сек из аудиобуфера целиком.
-                // Это гарантирует захват ВСЕГО, что уместилось в последние 10 сек, включая начало фразы,
-                // даже если VAD сработал с задержкой.
-                audio.get(10000, pcmf32_cur); // Получаем последние 10000 мс (10 сек) аудио
+                if (!speech_len && !user_typed.size()) {
+                    speech_start_ms = 0;
+                    continue;
+                }
+                
+                // ============================================================
+                // ТОЧНАЯ ОБРЕЗКА АУДИО ПО VAD (фикс повторного распознавания)
+                // ============================================================
+                // Вместо того чтобы брать последние 10 секунд (где могут быть обрывки
+                // предыдущих фраз), вырезаем точный речевой сегмент по времени.
+                // ============================================================
+                
+                // Добавляем подушку перед началом речи (300 мс) и после (200 мс)
+                const float front_padding_ms = 0.3f;   // 300 мс до начала речи
+                const float back_padding_ms = 0.2f;    // 200 мс после окончания речи
+                
+                float start_sec = std::max(0.0f, speech_start_ms - front_padding_ms);
+                float end_sec = speech_end_ms + back_padding_ms;
+                float duration_sec = end_sec - start_sec;
+                
+                // Ограничиваем минимальную длину (Whisper лучше работает с фразами > 1.1 сек)
+                if (duration_sec < 1.10f) {
+                    duration_sec = 1.10f;
+                    // Корректируем start_sec, чтобы сохранить подушку
+                    start_sec = std::max(0.0f, end_sec - duration_sec);
+                }
+                
+                // Получаем аудио из буфера по точному временному диапазону
+                // Функция audio.get_range() нужно добавить в audio_async класс
+                // Но пока используем существующий метод: берём последние (duration_sec + 1) секунд,
+                // а затем обрезаем вручную.
+                
+                // Берём немного больше, чем нужно (запас 0.5 сек)
+                float fetch_sec = duration_sec + 0.5f;
+                audio.get(static_cast<int>(fetch_sec * 1000), pcmf32_cur);
+                
+                // Теперь нужно вырезать точный сегмент из pcmf32_cur
+                // Вычисляем смещение в сэмплах (частота 16000 Гц)
+                if (!pcmf32_cur.empty() && start_sec > 0) {
+                    size_t sample_rate = WHISPER_SAMPLE_RATE; // 16000
+                    size_t start_sample = static_cast<size_t>(start_sec * sample_rate);
+                    size_t end_sample = static_cast<size_t>(end_sec * sample_rate);
+                    
+                    if (start_sample < pcmf32_cur.size()) {
+                        if (end_sample > pcmf32_cur.size()) {
+                            end_sample = pcmf32_cur.size();
+                        }
+                        // Вырезаем точный сегмент
+                        std::vector<float> precise_segment(
+                            pcmf32_cur.begin() + start_sample,
+                            pcmf32_cur.begin() + end_sample
+                        );
+                        pcmf32_cur = std::move(precise_segment);
+                    }
+                }
+                
+                // Сбрасываем время начала речи для следующего раза
+                speech_start_ms = 0;
+
+
                 std::string all_heard;
                 // Если пользователь ввёл текст вручную — используем его
                 if (user_typed.size())
@@ -5111,20 +5191,24 @@ try
 
 // Обработка последнего вывода и антипромптов
 {
-    std::string last_output;  // Буфер для последних выводимых токенов
-
-    // Собираем последние 10 токенов из контекста плюс текущий токен
-    // Защита от случая, когда embd_inp.size() меньше 10
-    int start_index = (embd_inp.size() > 10) ? (int)embd_inp.size() - 10 : 0;
-    for (int i = start_index; i < (int) embd_inp.size(); i++) {
-        // Проверка валидности индекса (дополнительная защита)
-        if (i >= 0 && i < (int)embd_inp.size()) {
-            last_output += llama_token_to_piece(ctx_llama, embd_inp[i]);
-        }
+    // Возвращаемся к старой, проверенной логике: собираем последние токены из embd_inp
+    // Это более стабильно для определения антипромптов, включая EOT-маркеры
+    std::string last_output;
+    
+    // Собираем последние 50 символов из контекста (не токенов, а символов!)
+    // Это даёт достаточно контекста для определения конца предложения
+    int total_chars = 0;
+    int start_index = (int)embd_inp.size() - 1;
+    
+    for (int i = start_index; i >= 0 && total_chars < 100; i--) {
+        std::string piece = llama_token_to_piece(ctx_llama, embd_inp[i]);
+        total_chars += utf8_length(piece);
+        last_output = piece + last_output;
     }
-    // Добавляем текущий токен, только если embd не пуст и содержит валидный токен
-    if (!embd.empty() && embd.size() > 0) {
-        last_output += llama_token_to_piece(ctx_llama, embd[0]);
+    
+    // Также добавляем текущий текст, который ещё не в embd_inp
+    if (!text_to_speak.empty()) {
+        last_output += text_to_speak;
     }
 
 
@@ -5209,22 +5293,20 @@ try
                     continue;  // Не останавливаемся, продолжаем генерацию
                 }
                 
-                // 2. СПЕЦИАЛЬНАЯ ОБРАБОТКА ДЛЯ EOT (не обрываем предложение на полуслове)
+                // 2. СПЕЦИАЛЬНАЯ ОБРАБОТКА ДЛЯ EOT (останавливаем генерацию)
+                // EOT — это маркер конца сообщения, он ДОЛЖЕН останавливать генерацию
+                // Не игнорируем его, даже если предложение не закончено
                 bool is_eot_antiprompt = (antiprompt == "<|eot_id|>" || 
                                            antiprompt == params.instruct_preset_data["bot_message_suffix"]);
                 
-                if (is_eot_antiprompt && !text_to_speak.empty()) {
-                    // Проверяем, закончено ли предложение (есть точка/вопрос/восклицание)
-                    char last_char = text_to_speak.back();
-                    bool sentence_finished = (last_char == '.' || last_char == '?' || last_char == '!');
-                    
-                    if (!sentence_finished && new_tokens < params.n_predict) {
-                        // Предложение не закончено — игнорируем EOT, продолжаем генерацию
-                        if (params.verbose) {
-                            printf(" [ignoring EOT, sentence not finished (last char: '%c')] ", last_char);
-                        }
-                        continue;  // Не останавливаемся!
+                if (is_eot_antiprompt) {
+                    // EOT — всегда останавливаем, но не выводим его в консоль
+                    antiprompt_matched = true;
+                    done = true;
+                    if (params.debug) {
+                        printf("\n[DEBUG] EOT antiprompt matched - stopping\n");
                     }
+                    break;  // Выходим из цикла антипромптов
                 }
                 
                 // ========================================================
@@ -5240,31 +5322,52 @@ try
                 bool is_user_name_antiprompt = (antiprompt == params.person + chat_symb || 
                                                   antiprompt == params.person + " " + chat_symb);
                 
-                if (is_user_name_antiprompt) 
+                                if (is_user_name_antiprompt) 
                 {
+                    // ⭐ ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА: если text_to_speak пустой, не останавливаемся
+                    // Это предотвращает ситуацию, когда модель сгенерировала только "Друг:" и замолкла
+                    if (text_to_speak.empty() || text_to_speak.length() < 2) {
+                        if (params.debug) {
+                            printf("\n[DEBUG] User name antiprompt but text_to_speak empty - IGNORED\n");
+                        }
+                        i_antiprompt++;
+                        continue;
+                    }
+                    
                     // Ищем позицию антипромпта в last_output
                     size_t pos = last_output.rfind(antiprompt);
                     
                     // Проверяем, что перед антипромптом есть \n или это начало строки
                     if (pos == 0 || (pos > 0 && last_output[pos-1] == '\n')) 
                     {
-                        // Это реальный конец диалога (начало новой реплики пользователя)
-                        antiprompt_matched = true;
-                        done = true;
+                        // ⭐ ДОПОЛНИТЕЛЬНО: проверяем, что после антипромпта нет других символов
+                        bool is_at_end = (pos + antiprompt.length() >= last_output.length());
                         
-                        if (params.debug) {
-                            printf("\n[DEBUG] User name antiprompt at line start - stopping\n");
+                        if (is_at_end) {
+                            // Это реальный конец диалога
+                            antiprompt_matched = true;
+                            done = true;
+                            
+                            if (params.debug) {
+                                printf("\n[DEBUG] User name antiprompt at end - stopping\n");
+                            }
+                        } else {
+                            // Антипромпт в начале строки, но после него есть текст — не останавливаемся
+                            if (params.debug) {
+                                printf("\n[DEBUG] User name antiprompt at line start but more text follows - IGNORED\n");
+                            }
+                            i_antiprompt++;
+                            continue;
                         }
                     } 
                     else 
                     {
                         // Антипромпт в середине предложения - НЕ останавливаемся
-                        // Например: "Я думаю, Друг: это хорошая идея"
                         if (params.debug) {
                             printf("\n[DEBUG] User name antiprompt in middle - IGNORED (continuing)\n");
                         }
-                        i_antiprompt++;  // Переходим к следующему антипромпту
-                        continue;  // Пропускаем этот антипромпт, продолжаем проверять другие
+                        i_antiprompt++;
+                        continue;
                     }
                 }
                 else 
@@ -5308,16 +5411,18 @@ try
                     }
                     
                     // Если антипромпт является суффиксом сообщения бота или тегом конца
-                    // Визуально удаляем только суффикс сообщения бота (EOT-маркер), если он не пустой
+                    // Визуально удаляем из вывода, но не выводим лишних символов
                     if (!params.instruct_preset_data["bot_message_suffix"].empty() && 
                         antiprompt == params.instruct_preset_data["bot_message_suffix"])
                     {
-                        std::string backspaces(antiprompt.length(), '\b');
-                        std::string spaces(antiprompt.length(), ' ');
+                        // ⭐ Более надёжное удаление: просто не выводим этот антипромпт
+                        // Убираем его из text_to_speak, если он там оказался
+                        if (text_to_speak.size() >= antiprompt.size() &&
+                            text_to_speak.substr(text_to_speak.size() - antiprompt.size()) == antiprompt) {
+                            text_to_speak = text_to_speak.substr(0, text_to_speak.size() - antiprompt.size());
+                            trim(text_to_speak);
+                        }
                         fflush(stdout);
-                        printf("%s", backspaces.c_str());  // Возвращаем курсор назад
-                        printf("%s", spaces.c_str());      // Затираем пробелами
-                        printf("%s", backspaces.c_str());  // Снова возвращаем
                         printf("\n");
                         fflush(stdout);
                     }
