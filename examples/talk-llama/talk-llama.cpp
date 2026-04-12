@@ -32,6 +32,7 @@
 #include <iterator>            // Итераторы STL
 #include <ctime>               // Работа с системным временем
 #include <filesystem>
+#include <random>              // Современный генератор случайных чисел
 // ПОЛЬЗОВАТЕЛЬСКИЕ МОДУЛИ
 #include "console.h"           // Заголовочный файл консольных функций
 #include "console.cpp"         // Реализация консольных функций
@@ -159,7 +160,7 @@ struct whisper_params {
     int32_t n_threads    = std::min(4, (int32_t) std::thread::hardware_concurrency());
     int32_t voice_ms     = 10000;
     int32_t capture_id   = -1;
-    int32_t max_tokens   = 32;    
+    int32_t max_tokens   = 64;    
     int32_t audio_ctx    = 0;
     int32_t n_gpu_layers = 999;
 
@@ -598,7 +599,7 @@ static void safe_thread_emplace(std::vector<std::thread>& threads_vec,
 // @param ctx         Контекст Whisper
 // @param params      Параметры транскрибации
 // @param pcmf32      Аудиоданные в формате float32
-// @param prompt_text Текст промпта (не используется)
+// @param prompt_text Текст промпта
 // @param prob        Средняя вероятность транскрипции (выходной параметр)
 // @param t_ms        Время выполнения в миллисекундах (выходной параметр)
 // @return Распознанный текст
@@ -607,7 +608,7 @@ static std::string transcribe(
     whisper_context* ctx,               // Контекст Whisper
     const whisper_params& params,       // Параметры транскрибации
     const std::vector<float>& pcmf32,   // Аудиоданные в формате float32
-    const std::string& prompt_text,     // Текст промпта (не используется в текущей реализации)
+    const std::string& prompt_text,     // Текст промпта
     float& prob,                        // Средняя вероятность транскрипции
     int64_t& t_ms) {                    // Время выполнения в миллисекундах
     
@@ -630,7 +631,6 @@ static std::string transcribe(
     const auto t_start = std::chrono::high_resolution_clock::now();
 
     // Настройка параметров Whisper
-    // Настройка параметров Whisper
     whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
 
     // ============================================================
@@ -640,7 +640,11 @@ static std::string transcribe(
     // какие фразы игнорировать. Без него Whisper "фантазирует" и повторяется.
     // ============================================================
     
+    // Вектор для хранения токенов промпта.
+    // ВАЖНО: должен жить всё время выполнения whisper_full(),
+    // поэтому объявлен до присвоения wparams.prompt_tokens.
     std::vector<whisper_token> prompt_tokens_vec;
+    
     if (!prompt_text.empty()) {
         // Токенизируем промпт
         prompt_tokens_vec.resize(prompt_text.size() + 1);
@@ -652,10 +656,12 @@ static std::string transcribe(
             wparams.prompt_tokens = prompt_tokens_vec.data();
             wparams.prompt_n_tokens = prompt_tokens_vec.size();
         } else {
+            // Токенизация не удалась — отключаем промпт
             wparams.prompt_tokens = nullptr;
             wparams.prompt_n_tokens = 0;
         }
     } else {
+        // Промпт пустой — отключаем
         wparams.prompt_tokens = nullptr;
         wparams.prompt_n_tokens = 0;
     }
@@ -664,8 +670,12 @@ static std::string transcribe(
     wparams.print_progress = false;
     wparams.print_special = params.print_special;
     wparams.print_realtime = false;
+    
+    // ВАЖНО: no_timestamps управляет ВЫЧИСЛЕНИЕМ меток, а не только выводом
+    // Вычисление меток резко повышает галлюцинации на тишине и шуме
     wparams.print_timestamps = !params.no_timestamps;
-    wparams.translate = params.translate;
+    wparams.no_timestamps    = params.no_timestamps;
+    wparams.translate        = params.translate;
 
     // === ОПТИМАЛЬНЫЕ НАСТРОЙКИ ДЛЯ РАСПОЗНАВАНИЯ РЕЧИ ===
     // Основано на стабильной работе из проекта Mozer/talk-llama-fast
@@ -685,8 +695,8 @@ static std::string transcribe(
     // Настройка максимального количества токенов
     {
         int model_text_ctx = static_cast<int>(whisper_n_text_ctx(ctx));
-        // 64 токена достаточно для большинства фраз на русском языке
-        int mt = (params.max_tokens > 0 && params.max_tokens <= 64) ? params.max_tokens : 64;
+        // Минимум 64 токена для русского, максимум — лимит модели
+        int mt = (params.max_tokens > 0) ? params.max_tokens : 64;
         
         if (mt > model_text_ctx) {
             std::cerr << "Предупреждение: max_tokens (" << mt 
@@ -709,16 +719,16 @@ static std::string transcribe(
     }
     
     // Язык и потоки
-    wparams.language = params.language.empty() ? nullptr : params.language.c_str();
+    wparams.language  = params.language.empty() ? nullptr : params.language.c_str();
     wparams.n_threads = params.n_threads;
 
     // Выполнение транскрипции
     if (whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size()) != 0) {
         std::cerr << "Ошибка: Не удалось выполнить транскрипцию аудио" << std::endl;
-        // Рассчёт времени выполнения даже при ошибке
+        // Расчёт времени выполнения даже при ошибке
         const auto t_end = std::chrono::high_resolution_clock::now();
         t_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
-                return "";
+        return "";
     }
 
     // Если распознавание началось, значит юзер говорит — прерываем старый TTS
@@ -2792,8 +2802,16 @@ void input_thread_func() {
 }
 
 // Только для Windows: проверяет, фокусировано ли окно консоли
-bool IsConsoleWindowFocused(HWND cur_window_handle) {
-    return (cur_window_handle == GetForegroundWindow());
+bool IsConsoleWindowFocused() {
+    HWND console_window = GetConsoleWindow();
+    if (console_window == NULL) {
+        return false;  // Окно консоли не найдено
+    }
+    HWND foreground_window = GetForegroundWindow();
+    if (foreground_window == NULL) {
+        return false;  // Нет активного окна
+    }
+    return (console_window == foreground_window);
 }
 	// Стоп: Ctrl+Space
 	// Перегенерировать: Ctrl+Right
@@ -2802,7 +2820,7 @@ bool IsConsoleWindowFocused(HWND cur_window_handle) {
 	// Функция обработки горячих клавиш, изменяет глобальную переменную g_hotkey_pressed
 	// Логика отслеживания нажатий Ctrl+..., Alt и т.д.
 
-void keyboard_shortcut_func(HWND cur_window_handle) {
+void keyboard_shortcut_func() {
 	// Логика отслеживания нажатий Ctrl+..., Alt и т.д.
     // Подробности ниже...
     bool b_ctr_space_processed = false;
@@ -2826,7 +2844,7 @@ void keyboard_shortcut_func(HWND cur_window_handle) {
     }
 
     while (g_shortcut_thread_running.load()) {
-        isFocused = IsConsoleWindowFocused(cur_window_handle);
+        isFocused = IsConsoleWindowFocused();
         if (isFocused) {
             b_ctr_space = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SPACE) & 0x8000);
             b_ctr_right = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_RIGHT) & 0x8000);
@@ -2919,19 +2937,11 @@ void keyboard_shortcut_func(HWND cur_window_handle) {
 }
 
 // Шаблон промпта для диалога с Эммой
-const std::string k_prompt_whisper = R"({1}, English conversation. The user speaks clearly and concisely.
-Recognize only actual speech, ignore echoes, noise, and repetitions.
-Do not add words that were not spoken.
-Do not hallucinate phrases like "Thanks for watching", "End of", "Translated by", "Silence".
-If speech is unclear — recognize an empty string.)";
+const std::string k_prompt_whisper = R"({1}, English conversation. The user speaks clearly and concisely.)";
 
-// Улучшенный промпт для русского языка — помогает модели лучше распознавать русскую речь
-const std::string k_prompt_whisper_ru = R"({1}, диалог на русском языке. 
-Пользователь говорит четко, разборчиво, короткими фразами. 
-Распознавай только реальную речь, игнорируй эхо, шум и повторы.
-Не добавляй слова, которые не были произнесены.
-Не галлюцинируй фразы вроде "Спасибо за внимание", "Редактор субтитров", "End of".
-Если речь неразборчива — распознавай пустую строку.)";
+
+// Упрощённый промпт: меньше инструкций — меньше шансов, что Whisper «переосмыслит» задачу
+const std::string k_prompt_whisper_ru = R"({1}: русская речь, только слова пользователя.)";
 
 // Общий шаблон для бесконечного диалога между пользователем и ИИ-ассистентом
 const std::string k_prompt_llama = R"(Text of a transcription of an infinite dialogue in which {0} interacts with an AI assistant named {1}.
@@ -2947,7 +2957,6 @@ The transcription contains only text, without any markup such as HTML or Markdow
 {1}{4} {5}, {3}.
 {0}{4})";
 
-// Основная функция run — запуск приложения
 int run(int argc, char ** argv) {
 whisper_params params;          // параметры Whisper
 std::vector<std::thread> threads;
@@ -2956,9 +2965,13 @@ std::thread t;
 int reply_part = 0;
 bool last_output_has_username = false;	
 bool last_output_has_EOT = true;	
-int input_tokens_count = 0;	
+int input_tokens_count = 0;
+
+// Инициализация указателей на сэмплеры (nullptr для безопасной очистки)
+llama_sampler * smpl = nullptr;
+llama_sampler * smpl_high_temp = nullptr;
 	
-	HWND cur_window_handle = GetForegroundWindow(); // предполагаем, что активное окно — наше
+	// HWND cur_window_handle больше не нужен — получаем хендл консоли внутри IsConsoleWindowFocused()
 
     if (whisper_params_parse(argc, argv, params) == false) {
             return 1;
@@ -3187,8 +3200,8 @@ if (!params.instruct_preset.empty())
 	const float repeat_penalty = params.repeat_penalty;						
     const int seed = 0;    
     auto sparams = llama_sampler_chain_default_params();
-    llama_sampler * smpl = llama_sampler_chain_init(sparams);
-    llama_sampler * smpl_high_temp = llama_sampler_chain_init(sparams);
+    smpl = llama_sampler_chain_init(sparams);           // ← без llama_sampler*
+    smpl_high_temp = llama_sampler_chain_init(sparams); // ← без llama_sampler*
 
     if (temp > 0.0f) {
         llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k));
@@ -3318,6 +3331,14 @@ batch = llama_batch_init(2048, 0, 1); // ←  Инициализируем с з
 
 // Подготовка батча для декодирования промпта
 {
+    // ===== ПРОВЕРКА РАЗМЕРА =====
+    if (embd_inp.size() > 2048) {
+        fprintf(stderr, "FATAL: Initial prompt size (%zu tokens) exceeds batch limit (2048)\n", 
+                embd_inp.size());
+        fprintf(stderr, "Please reduce prompt size or increase batch limit in code.\n");
+        return 1;
+    }
+    // ===========================
     batch.n_tokens = embd_inp.size();
 
     for (int i = 0; i < batch.n_tokens; i++) {
@@ -3423,7 +3444,12 @@ const int voice_id = 2;
 		tts_intros = {"Hm", "Hmm", "Well", "Well well", "Huh", "Ugh", "Uh", "Um", "Mmm", "Oh", "Ooh", "Haha", "Ha ha", "Ahh", "Whoa", "Really", "I mean", "By the way", "Anyway", "So", "Actually", "Uh-huh", "Seriously", "Whatever", "Ahh", "Like", "But", "You know", "Wait", "Ahem", "Damn", params.person};
 	}
 
-    srand(time(NULL)); // Инициализируем генератор случайных чисел
+    // Современный генератор случайных чисел (потокобезопасный через thread_local)
+    // Объявляем здесь, чтобы использовать во всём основном цикле
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<size_t> dist;
+    
 	int last_command_time = 0;
 	int eot_antiprompt_id_1 = 0;
 	std::string current_voice = params.xtts_voice;
@@ -3516,12 +3542,14 @@ const int voice_id = 2;
     printf("\n");
 
 	std::thread input_thread(input_thread_func);
-	std::thread shortcut_thread([cur_window_handle]() {
-        keyboard_shortcut_func(cur_window_handle);
+	std::thread shortcut_thread([]() {
+        keyboard_shortcut_func();
     });
     
 	printf("\nVoice commands: Stop(Ctrl+Space), Regenerate(Ctrl+Right), Delete(Ctrl+Delete), Reset(Ctrl+R)\n");
+
 	if (params.push_to_talk) printf("Type anything or hold 'Alt' to speak:\n");
+
 	else printf("Start speaking or typing:\n");
 	printf("\n\n");
     printf("%s%s ", params.person.c_str(), chat_symb.c_str());
@@ -3533,7 +3561,6 @@ const int voice_id = 2;
 	float speech_len = 0;
 	int len_in_samples = 0;
 	int64_t speech_start_sample = 0; // сохраняем номер сэмпла, когда началась речь
-	std::string all_heard_pre = "";  // инициализируем пустой строкой
 	float llama_interrupted_time = 0.0;	
 	llama_start_time = 0.0;
 	float llama_start_generation_time = 0.0; // после оперативной обработки
@@ -3592,10 +3619,9 @@ console::set_display(console::reset);
         {
             std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
             hk_copy = g_hotkey_pressed;
-            if (!hk_copy.empty() && hk_copy != "Alt") { // ← Проверка и сброс в ОДНОЙ критической секции
-                g_hotkey_pressed = ""; // ← Сбрасываем ТОЛЬКО если мы обработали событие
-            }
+            g_hotkey_pressed = "";   // Сбрасываем ВСЕГДА после копирования, чтобы избежать залипания
         }
+        
         if (!hk_copy.empty())
         {
             if (hk_copy == "Ctrl+Space") {
@@ -3607,10 +3633,10 @@ console::set_display(console::reset);
             } else if (hk_copy == "Ctrl+R") {
                 user_typed = "Reset";
             }
+            
             if (hk_copy != "Alt")
             {
                 user_typed_this = true;
-                // СБРОС УЖЕ ВЫПОЛНЕН В КРИТИЧЕСКОЙ СЕКЦИИ ВЫШЕ. НЕ НУЖНО ПОВТОРНО БЛОКИРОВАТЬ!
             }
         }
         {
@@ -3640,43 +3666,37 @@ console::set_display(console::reset);
             // (если порог == 0, функция VAD начала речи отключена)
             // =================================================================
             if (vad_result == 1 && params.vad_start_thold > 0.0f) // speech started
-                {
+            {
                 if (vad_result_prev != 1) // реальное начало речи
-                    {					
+                {					
                     // Запоминаем время начала речи
                     speech_start_ms = get_current_time_ms(); // float
-                    // Сохраняем аудиофрагмент, который VAD только что проанализировал
-
-            // Обновляем статус VAD
-			vad_result_prev = 1;
-					
-            // Выполняем "прогревку" Whisper — небольшое распознавание для инициализации (это не основное распознавание)
-            if (!params.push_to_talk || (params.push_to_talk && g_hotkey_pressed == "Alt"))
-                {
-                    all_heard_pre = ::trim(::transcribe(ctx_wsp, params, pcmf32_cur, prompt_whisper, prob0, t_ms)); // warmup - try with small size audio
-                    { // Сброс под защитой мьютекса
-                        std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
-                        g_hotkey_pressed = "";
-                    }
-
+                    
+                    // Обновляем статус VAD
+                    vad_result_prev = 1;
+                    
+                    // НИКАКОЙ ТРАНСКРИПЦИИ ЗДЕСЬ НЕ НУЖНО — только запоминаем время начала.
+                    // Раньше здесь был вызов transcribe() для "прогревки", но он:
+                    // 1. Создавал лишнюю задержку
+                    // 2. Мог сбивать внутреннее состояние Whisper
+                    // 3. Результат нигде не использовался (all_heard_pre не читается)
                 }
-			}
 
-            // Пользователь начал говорить — запрещаем воспроизведение через XTTS
+                // Пользователь начал говорить — запрещаем воспроизведение через XTTS
                 std::string current_hotkey;
                 {
                     std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
                     current_hotkey = g_hotkey_pressed;
                 }
-                    if (!params.push_to_talk || (params.push_to_talk && current_hotkey == "Alt"))
-                    {
-                        allow_xtts_file(params.xtts_control_path, 0);
-
-                        // ⭐ ДОБАВЛЕНО: устанавливаем флаги прерывания
-                        llama_interrupted.store(1);
-                        g_is_interrupted.store(true);
-                    }
-			}	
+                if (!params.push_to_talk || (params.push_to_talk && current_hotkey == "Alt"))
+                {
+                    allow_xtts_file(params.xtts_control_path, 0);
+                    
+                    // Устанавливаем флаги прерывания
+                    llama_interrupted.store(1);
+                    g_is_interrupted.store(true);
+                }
+            }		
 
             // Если VAD обнаружил конец речи (vad_result >= 2) и предыдущее состояние было началом речи, или была нажата горячая клавиша, или пользователь ввёл текст вручную
             if (vad_result >= 2 && vad_result_prev == 1 || force_speak || user_typed.size())  // speech ended or user typed
@@ -3694,59 +3714,19 @@ console::set_display(console::reset);
                 // Пропускаем обработку, если длина речи нулевая и нет введённого пользователем текста
                 if (!speech_len && !user_typed.size()) {
                     speech_start_ms = 0;
+                    audio.clear();  // ← ДОБАВИТЬ
                     continue;
                 }
                 
                 // ============================================================
-                // ТОЧНАЯ ОБРЕЗКА АУДИО ПО VAD (фикс повторного распознавания)
+                // ПРОСТОЕ И НАДЁЖНОЕ ИЗВЛЕЧЕНИЕ АУДИО
                 // ============================================================
-                // Вместо того чтобы брать последние 10 секунд (где могут быть обрывки
-                // предыдущих фраз), вырезаем точный речевой сегмент по времени.
+                // Вместо сложной и некорректной обрезки по времени (которая не работает
+                // из-за отсутствия абсолютных меток в audio_async), просто берём
+                // последние params.voice_ms миллисекунд (по умолчанию 10000 мс = 10 сек).
+                // Whisper сам отфильтрует тишину в начале и конце.
                 // ============================================================
-                
-                // Добавляем подушку перед началом речи (300 мс) и после (200 мс)
-                const float front_padding_ms = 0.3f;   // 300 мс до начала речи
-                const float back_padding_ms = 0.2f;    // 200 мс после окончания речи
-                
-                float start_sec = std::max(0.0f, speech_start_ms - front_padding_ms);
-                float end_sec = speech_end_ms + back_padding_ms;
-                float duration_sec = end_sec - start_sec;
-                
-                // Ограничиваем минимальную длину (Whisper лучше работает с фразами > 1.1 сек)
-                if (duration_sec < 1.10f) {
-                    duration_sec = 1.10f;
-                    // Корректируем start_sec, чтобы сохранить подушку
-                    start_sec = std::max(0.0f, end_sec - duration_sec);
-                }
-                
-                // Получаем аудио из буфера по точному временному диапазону
-                // Функция audio.get_range() нужно добавить в audio_async класс
-                // Но пока используем существующий метод: берём последние (duration_sec + 1) секунд,
-                // а затем обрезаем вручную.
-                
-                // Берём немного больше, чем нужно (запас 0.5 сек)
-                float fetch_sec = duration_sec + 0.5f;
-                audio.get(static_cast<int>(fetch_sec * 1000), pcmf32_cur);
-                
-                // Теперь нужно вырезать точный сегмент из pcmf32_cur
-                // Вычисляем смещение в сэмплах (частота 16000 Гц)
-                if (!pcmf32_cur.empty() && start_sec > 0) {
-                    size_t sample_rate = WHISPER_SAMPLE_RATE; // 16000
-                    size_t start_sample = static_cast<size_t>(start_sec * sample_rate);
-                    size_t end_sample = static_cast<size_t>(end_sec * sample_rate);
-                    
-                    if (start_sample < pcmf32_cur.size()) {
-                        if (end_sample > pcmf32_cur.size()) {
-                            end_sample = pcmf32_cur.size();
-                        }
-                        // Вырезаем точный сегмент
-                        std::vector<float> precise_segment(
-                            pcmf32_cur.begin() + start_sample,
-                            pcmf32_cur.begin() + end_sample
-                        );
-                        pcmf32_cur = std::move(precise_segment);
-                    }
-                }
+                audio.get(params.voice_ms, pcmf32_cur);
                 
                 // Сбрасываем время начала речи для следующего раза
                 speech_start_ms = 0;
@@ -3762,9 +3742,20 @@ console::set_display(console::reset);
                 else if (!force_speak)
                     {
                         // Если нет принудительного распознавания — транскрибируем аудио
-                        if (!params.push_to_talk || (params.push_to_talk && g_hotkey_pressed == "Alt"))
+                        if (!params.push_to_talk || (params.push_to_talk && hk_copy == "Alt"))
                         {
-                            all_heard = ::trim(::transcribe(ctx_wsp, params, pcmf32_cur, prompt_whisper, prob0, t_ms)); // real transcribe
+                            // === ФИЛЬТР ГАЛЛЮЦИНАЦИЙ ПО УВЕРЕННОСТИ ===
+                            // Если средняя вероятность токенов < 0.35 — это почти наверняка шум/мусор
+                            all_heard = ::trim(::transcribe(ctx_wsp, params, pcmf32_cur, prompt_whisper, prob0, t_ms));
+                            // Не передаём такой текст в LLaMA, чтобы не генерировать ответ на пустоту
+                            if (prob0 < 0.35f) {
+                                if (params.verbose) {
+                                    fprintf(stdout, "[Whisper] Низкая уверенность (%.3f), отбрасываю: '%s'\n", prob0, all_heard.c_str());
+                                }
+                                all_heard = "";  // Очищаем, чтобы не пошло в обработку
+                                audio.clear();
+                                continue;  // Пропускаем эту итерацию
+                            }
                             { // Сброс под защитой мьютекса
                                 std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
                                 g_hotkey_pressed = "";
@@ -3816,8 +3807,9 @@ console::set_display(console::reset);
                 }
 
                 if (!params.heard_ok.empty()) {
-                    safe_thread_emplace(threads, [params, current_voice]() {
-                        send_tts_async(params.heard_ok, current_voice, params.language, params.xtts_url);
+                    std::string voice_copy = current_voice;  // <-- КОПИЯ
+                    safe_thread_emplace(threads, [params, voice_copy]() {
+                        send_tts_async(params.heard_ok, voice_copy, params.language, params.xtts_url);
                     });
                 }
 
@@ -3981,10 +3973,10 @@ console::set_display(console::reset);
                 // ВВОДНОЕ предложение TTS rand для мгновенного ответа
                 if (params.xtts_intro && text_heard_trimmed.size())
                 {
-                    rand_intro_text = tts_intros[rand() % tts_intros.size()];
+                    dist = std::uniform_int_distribution<size_t>(0, tts_intros.size() - 1);
+                    rand_intro_text = tts_intros[dist(gen)];
                     
                     if (!rand_intro_text.empty()) {
-                        // Чистим завершенные потоки
                         for (auto it = threads.begin(); it != threads.end(); ) {
                             if (it->joinable()) {
                                 it->detach();
@@ -3994,9 +3986,9 @@ console::set_display(console::reset);
                             }
                         }
                         
-                        // Отправляем в TTS напрямую (безопасно, с мьютексом)
-                        safe_thread_emplace(threads, [rand_intro_text, current_voice, params]() {
-                            send_tts_async(rand_intro_text, current_voice, params.language, params.xtts_url);
+                        std::string voice_copy = current_voice;  // <-- КОПИЯ
+                        safe_thread_emplace(threads, [rand_intro_text, voice_copy, params]() {
+                            send_tts_async(rand_intro_text, voice_copy, params.language, params.xtts_url);
                         });
                     }
                 }
@@ -4130,8 +4122,9 @@ if (user_command == "regenerate" ||
                                     
                                     // Отправляем в TTS, если есть что озвучивать (безопасно, с мьютексом)
                                     if (!text_to_respeak_safe.empty()) {
-                                        safe_thread_emplace(threads, [text_to_respeak_safe, current_voice, params]() {
-                                            send_tts_async(text_to_respeak_safe, current_voice, params.language, params.xtts_url);
+                                        std::string voice_copy = current_voice;  // <-- КОПИЯ
+                                        safe_thread_emplace(threads, [text_to_respeak_safe, voice_copy, params]() {
+                                            send_tts_async(text_to_respeak_safe, voice_copy, params.language, params.xtts_url);
                                         });
                                     }
                                     
@@ -4202,8 +4195,9 @@ if (!past_prev_arr.empty())
                             std::string text_for_deleted_tts = "Deleted";
                             
                             if (!text_for_deleted_tts.empty()) {
-                                safe_thread_emplace(threads, [text_for_deleted_tts, current_voice, params]() {
-                                    send_tts_async(text_for_deleted_tts, current_voice, params.language, params.xtts_url);
+                                std::string voice_copy = current_voice;  // <-- КОПИЯ
+                                safe_thread_emplace(threads, [text_for_deleted_tts, voice_copy, params]() {
+                                    send_tts_async(text_for_deleted_tts, voice_copy, params.language, params.xtts_url);
                                 });
                             }
                             
@@ -4228,7 +4222,6 @@ else if (user_command == "reset")
     {
         if (!past_prev_arr.empty())
         {
-            // Удаляем всё, кроме начального промпта
             n_past_prev = past_prev_arr.front();
             past_prev_arr.clear();
             int rollback_num = embd_inp.size() - n_past_prev;
@@ -4236,74 +4229,63 @@ else if (user_command == "reset")
             {
                 printf(" [Resetting context of %zd tokens.]\n", embd_inp.size());
                 
-                // ============================================
-                // ⭐ БЛОКИРУЕМ ДОСТУП К ctx_llama НА ВРЕМЯ ПЕРЕСОЗДАНИЯ
-                // ============================================
                 {
                     std::lock_guard<std::mutex> lock(g_llama_mutex);
                     
-                    // 1. Освобождаем старый батч
                     llama_batch_free(batch);
                     
-                    // 2. Освобождаем старый контекст
                     if (ctx_llama) {
                         llama_free(ctx_llama);
                         ctx_llama = nullptr;
                     }
                     
-                    // 3. Пересоздаём контекст модели
                     ctx_llama = llama_init_from_model(model_llama, lcparams);
                     
-                    // Проверка успешности создания контекста
                     if (!ctx_llama) {
                         fprintf(stderr, "%s : ERROR: Failed to reinitialize llama context on reset\n", __func__);
-                        fprintf(stderr, "Cannot continue. Exiting.\n");
                         return 1;
                     }
 
-                    // 4. Пересоздаём батч
                     batch = llama_batch_init(2048, 0, 1);
-
-                    // 5. Токенизируем начальный промпт заново
                     embd_inp = ::llama_tokenize(ctx_llama, prompt_llama, true);
                     
-                    // Проверка успешности токенизации
                     if (embd_inp.empty()) {
                         fprintf(stderr, "%s : ERROR: Failed to tokenize prompt after reset\n", __func__);
                         return 1;
                     }
                     
-                    // 6. Подготавливаем батч
-                    {
-                        batch.n_tokens = embd_inp.size();
-
-                        for (int i = 0; i < batch.n_tokens; i++) {
-                            batch.token[i]     = embd_inp[i];
-                            batch.pos[i]       = i;
-                            batch.n_seq_id[i]  = 1;
-                            batch.seq_id[i][0] = 0;
-                            batch.logits[i]    = i == batch.n_tokens - 1;
-                        }
+                    // ===== ИСПРАВЛЕНИЕ: ПРОВЕРКА РАЗМЕРА =====
+                    if (embd_inp.size() > 2048) {
+                        fprintf(stderr, "%s : FATAL ERROR: Prompt size (%zu tokens) exceeds batch limit (2048)\n", 
+                                __func__, embd_inp.size());
+                        fprintf(stderr, "Please reduce prompt size or increase batch limit in code.\n");
+                        return 1;
                     }
-
-                    // 7. Оценка промпта
+                    // =======================================
+                    
+                    batch.n_tokens = embd_inp.size();
+                    
+                    for (int i = 0; i < batch.n_tokens; i++) {
+                        batch.token[i] = embd_inp[i];
+                        batch.pos[i] = i;
+                        batch.n_seq_id[i] = 1;
+                        batch.seq_id[i][0] = 0;
+                        batch.logits[i] = i == batch.n_tokens - 1;
+                    }
+                    
                     if (llama_decode(ctx_llama, batch)) {
                         fprintf(stderr, "%s : failed to decode after reset\n", __func__);
                         return 1;
                     }
                 }
-                // ⭐ МЬЮТЕКС АВТОМАТИЧЕСКИ ОСВОБОЖДЕН
                 
-                // 8. Обновляем состояние (вне мьютекса, т.к. это просто переменные)
                 n_past = embd_inp.size();
                 n_session_consumed = embd_inp.size();
                 printf(" [Context is now %zu/%d tokens. n_past: %d]\n", embd_inp.size(), params.ctx_size, n_past);
 
-                // 9. Сбрасываем переменные диалога
                 text_heard = "";
                 text_heard_trimmed = "";
                 
-                // 10. Уведомление TTS
                 send_tts_async("Reset whole context", params.xtts_voice, params.language, params.xtts_url);
                 
                 new_command_allowed = 0;
@@ -4312,12 +4294,11 @@ else if (user_command == "reset")
         }
         else 
         {
-            // Если сбрасывать нечего — сообщаем об этом
             printf(" [Nothing to reset more]\n");			
             send_tts_async("Nothing to reset more", params.xtts_voice, params.language, params.xtts_url);
         }
     }
-    audio.clear(); // Очищаем аудио-буфер
+    audio.clear();
     continue;
 }
 
@@ -4406,9 +4387,10 @@ if (user_command == "stop")
         auto speak_direct = [&](const std::string& msg) {
             if (msg.empty()) return;
             std::string msg_copy = msg;
+            std::string voice_copy = current_voice;  // <-- ДОБАВИТЬ КОПИЮ
             try {
-                safe_thread_emplace(threads, [msg_copy, current_voice, params]() {
-                    send_tts_async(msg_copy, current_voice, params.language, params.xtts_url);
+                safe_thread_emplace(threads, [msg_copy, voice_copy, params]() {
+                    send_tts_async(msg_copy, voice_copy, params.language, params.xtts_url);
                 });
             } catch (const std::exception& e) {
                 fprintf(stderr, "[google] TTS thread spawn failed: %s\n", e.what());
@@ -4426,8 +4408,9 @@ if (user_command == "stop")
         } else {
             // Аудио-квитанция — отправляем в TTS безопасно, с мьютексом
             std::string google_search_msg = "Ищу информацию по запросу: " + q;
-            safe_thread_emplace(threads, [google_search_msg, current_voice, params]() {
-                send_tts_async(google_search_msg, current_voice, params.language, params.xtts_url);
+            std::string voice_copy = current_voice;  // <-- КОПИЯ
+            safe_thread_emplace(threads, [google_search_msg, voice_copy, params]() {
+                send_tts_async(google_search_msg, voice_copy, params.language, params.xtts_url);
             });
 
             // (запрос к серверу, проверка resp.empty(), формирование промпта для LLaMA)
@@ -4440,8 +4423,9 @@ std::string resp = send_curl(url);
         
         // ГОЛОСОВОЕ СООБЩЕНИЕ ОБ ОШИБКЕ (безопасно, с мьютексом)
         std::string error_msg = "Извините, не удалось найти информацию по запросу: " + q;
-        safe_thread_emplace(threads, [error_msg, current_voice, params]() {
-            send_tts_async(error_msg, current_voice, params.language, params.xtts_url);
+        std::string voice_copy = current_voice;  // <-- КОПИЯ
+        safe_thread_emplace(threads, [error_msg, voice_copy, params]() {
+            send_tts_async(error_msg, voice_copy, params.language, params.xtts_url);
         });
         
         // Не прерываем цикл — просто не будем формировать спец-промпт
@@ -4843,17 +4827,29 @@ if (n_past + (int)embd.size() > n_ctx) {
                 batch.logits[i] = (i == batch.n_tokens - 1);
             }
         }
-// Выполняем декодирование
-if (llama_decode(ctx_llama, batch)) {
-    fprintf(stderr, "%s : failed to decode\n", __func__);
-    fprintf(stderr, "\n LLaMA decoding failed. Press ENTER to continue...\n");
-    fflush(stderr);
-    std::string dummy;
-    std::getline(std::cin, dummy);
-    embd.clear();
-    n_past = embd_inp.size();
-    n_session_consumed = n_past;
-    continue;
+
+// Выполняем декодирование (потокобезопасно с защитой от reset)
+{
+    std::lock_guard<std::mutex> lock(g_llama_mutex);
+    
+    // Проверяем, что контекст не был сброшен во время генерации
+    if (!ctx_llama) {
+        fprintf(stderr, "\n[Context was reset during generation - aborting]\n");
+        done = true;
+        break;
+    }
+    
+    if (llama_decode(ctx_llama, batch)) {
+        fprintf(stderr, "%s : failed to decode\n", __func__);
+        fprintf(stderr, "\n LLaMA decoding failed. Press ENTER to continue...\n");
+        fflush(stderr);
+        std::string dummy;
+        std::getline(std::cin, dummy);
+        embd.clear();
+        n_past = embd_inp.size();
+        n_session_consumed = n_past;
+        continue;
+    }
 }
 }  // Закрываем блок декодирования
 
@@ -5012,6 +5008,9 @@ char out_token_symbol;
                 llama_interrupted_time = get_current_time_ms();
                 printf(" [Speech/Stop!]\n");
                 
+                // 4. ОЧИЩАЕМ АУДИОБУФЕР, чтобы не распознавать ту же речь повторно
+                audio.clear();
+                
                 // Сигнализируем внешнему сервису
                 allow_xtts_file(params.xtts_control_path, 0);
                 done = true;
@@ -5019,7 +5018,7 @@ char out_token_symbol;
                     std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
                     g_hotkey_pressed = "";
                 }
-                // 4. Выход из цикла генерации
+                // 5. Выход из цикла генерации
                 break;
             }
         }
@@ -5114,8 +5113,9 @@ if (text_len >= 2 && new_tokens >= 5 && !person_name_is_found &&
 try 
     {
         // Захватываем ВСЁ по значению — безопасно с мьютексом
-        safe_thread_emplace(threads, [text_to_speak, current_voice, params]() {
-            send_tts_async(text_to_speak, current_voice, params.language, params.xtts_url, 0);
+        std::string voice_copy = current_voice;  // <-- КОПИЯ
+        safe_thread_emplace(threads, [text_to_speak, voice_copy, params]() {
+            send_tts_async(text_to_speak, voice_copy, params.language, params.xtts_url, 0);
         });
         // Очищаем локальную переменную
         text_to_speak = "";
@@ -5134,7 +5134,7 @@ try
                 }
 
                 // Проверяем уровень энергии, если пользователь говорит
-                if (!params.push_to_talk || (params.push_to_talk && g_hotkey_pressed == "Alt"))
+                if (!params.push_to_talk || (params.push_to_talk && hk_copy == "Alt"))
                 {
                     // Получаем аудио данные (неблокирующий вызов)
                     audio.get(params.interrupt_check_ms, pcmf32_cur);
@@ -5523,8 +5523,9 @@ try
                 }
 
                 try {
-                    safe_thread_emplace(threads, [text_to_speak_final, current_voice, params]() {
-                        send_tts_async(text_to_speak_final, current_voice, params.language, params.xtts_url);
+                    std::string voice_copy = current_voice;  // <-- КОПИЯ
+                    safe_thread_emplace(threads, [text_to_speak_final, voice_copy, params]() {
+                        send_tts_async(text_to_speak_final, voice_copy, params.language, params.xtts_url);
                     });
                     
                     text_to_speak = ""; // Очищаем оригинальную переменную
@@ -5539,37 +5540,37 @@ try
             // Используем swap + локальный вектор для безопасного join().
             {
                 std::vector<std::thread> temp_threads;
-                temp_threads.swap(threads); // Перемещаем ВСЕ потоки из threads → temp_threads. threads теперь пуст!
-            // безопасное ожидание завершения потоков с таймаутом
-            // Теперь безопасно ждём завершения всех старых потоков
-            for (auto& t : temp_threads) {
-                if (t.joinable()) {
-                    try {
-                        // Пытаемся подождать завершения не более 5 секунд
-                        using namespace std::chrono_literals;
-                        auto start = std::chrono::steady_clock::now();
-                        while (true) {
-                            // Проверяем, не завершился ли поток уже
-                            if (!t.joinable()) break;
-                            // Если прошло больше 5 секунд — выходим и отсоединяем поток
-                            if (std::chrono::steady_clock::now() - start > 5s) {
-                                std::cerr << "[warn] join timeout exceeded — detaching thread\n";
-                                t.detach();
+                temp_threads.swap(threads); // ← ИСПРАВЛЕНО: swap вместо swape
+                // безопасное ожидание завершения потоков с таймаутом
+                // Теперь безопасно ждём завершения всех старых потоков
+                for (auto& t : temp_threads) {
+                    if (t.joinable()) {
+                        try {
+                            // Пытаемся подождать завершения не более 5 секунд
+                            using namespace std::chrono_literals;
+                            auto start = std::chrono::steady_clock::now();
+                            while (true) {
+                                // Проверяем, не завершился ли поток уже
+                                if (!t.joinable()) break;
+                                // Если прошло больше 5 секунд — выходим и отсоединяем поток
+                                if (std::chrono::steady_clock::now() - start > 5s) {
+                                    std::cerr << "[warn] join timeout exceeded — detaching thread\n";
+                                    t.detach();
+                                    break;
+                                }
+                                // Пробуем join с малым сном (вместо блокировки навсегда)
+                                std::this_thread::sleep_for(100ms);
+                                // Поток успевает завершиться — теперь можно безопасно join
+                                if (t.joinable()) t.join();
                                 break;
                             }
-                            // Пробуем join с малым сном (вместо блокировки навсегда)
-                            std::this_thread::sleep_for(100ms);
-                            // Поток успевает завершиться — теперь можно безопасно join
-                            if (t.joinable()) t.join();
-                            break;
+                        } catch (...) {
+                            // Игнорируем исключения: главное — не позволить std::terminate()
+                            std::cerr << "[warn] exception caught while joining thread\n";
                         }
-                    } catch (...) {
-                        // Игнорируем исключения: главное — не позволить std::terminate()
-                        std::cerr << "[warn] exception caught while joining thread\n";
                     }
                 }
-            }
-            // temp_threads уничтожается здесь — все потоки гарантированно завершены или отсоединены
+                // temp_threads уничтожается здесь — все потоки гарантированно завершены или отсоединены
             }
             // Обработка прерывания генерации
             if (llama_interrupted.load() /*&& llama_interrupted_time - llama_start_time < 2.0*/)
@@ -5662,37 +5663,55 @@ for (auto& t : local_threads) {
 printf("Cleanup complete.\n");
 
     // ### ЗАВЕРШЕНИЕ РАБОТЫ И ОСВОБОЖДЕНИЕ РЕСУРСОВ ###
-    // Завершение работы программы
-    audio.pause();  // Приостанавливаем аудио (останавливаем запись с микрофона)
-    // Выводим временные метрики работы Whisper (время распознавания речи)
+    
+    // Приостанавливаем аудио
+    audio.pause();
+    
+    // ===== ВАЖНО: Сначала выводим статистику, потом освобождаем память =====
+    // Выводим метрики Whisper
     whisper_print_timings(ctx_wsp);
-    // Освобождаем контекст Whisper (очищаем память, занятую моделью распознавания речи)
+    
+    // Выводим статистику производительности LLaMA (ДО освобождения контекста!)
+    if (smpl) {
+        llama_perf_sampler_print(smpl);
+    }
+    if (ctx_llama) {
+        llama_perf_context_print(ctx_llama);
+    }
+    
+    // ===== Теперь безопасно освобождаем все ресурсы =====
+    // Освобождаем контекст Whisper
     whisper_free(ctx_wsp);
-    // Выводим статистику производительности сэмплера LLaMA
-    llama_perf_sampler_print(smpl);
-    // Выводим статистику производительности контекста LLaMA
-    llama_perf_context_print(ctx_llama);
-    // Освобождаем сэмплер LLaMA (очищаем память)
-    llama_sampler_free(smpl);
-    // Освобождаем батч (очищаем память, выделенную под батч-обработку)
+    
+    // Освобождаем сэмплеры LLaMA (с проверкой на nullptr)
+    if (smpl) {
+        llama_perf_sampler_print(smpl);
+        llama_sampler_free(smpl);
+    }
+    if (smpl_high_temp) {
+        llama_sampler_free(smpl_high_temp);
+    }
+    
+    // Освобождаем батч LLaMA
     llama_batch_free(batch);
-    // Освобождаем контекст LLaMA (очищаем память, занятую моделью генерации текста)
+    
+    // Освобождаем контекст LLaMA
     llama_free(ctx_llama);
-    // Освобождаем бэкенд LLaMA (завершаем работу библиотеки LLaMA)
+    
+    // Освобождаем бэкенд LLaMA
     llama_backend_free();
-    // Поток ввода висит на readline/cin, его нельзя завершить извне.
-    // Вместо join() делаем detach(), чтобы программа могла закрыться немедленно.
-    // ОС сама очистит ресурсы при завершении процесса.
+    
+    // Завершаем потоки ввода
     if (input_thread.joinable()) {
         input_thread.detach(); 
     }
-    // Останавливаем поток обработки горячих клавиш
+    
+    // Останавливаем поток горячих клавиш
     g_shortcut_thread_running.store(false);
-    // Ожидаем завершения потока
     if (shortcut_thread.joinable()) {
         shortcut_thread.join();
     }
-    // Возвращаем 0 - успешное завершение программы
+    
     return 0;
 }
 // Функция wmain - точка входа для Windows-приложений с поддержкой Unicode
