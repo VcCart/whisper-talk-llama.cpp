@@ -1334,13 +1334,14 @@ auto escape_json = [](const std::string& s) -> std::string {
         CURLcode res = curl_easy_perform(curl);
 
         // Выводим только реальные ошибки, игнорируем прерывание пользователем
+        /*
         if (res != CURLE_OK && !(res == CURLE_WRITE_ERROR && g_is_interrupted.load())) {
-            // Выводим ошибки TTS только в режиме --verbose
-            extern whisper_params params;  // нужен доступ к params
+            extern whisper_params params;
             if (params.verbose) {
                 fprintf(stderr, " [TTS Error: %s]", curl_easy_strerror(res));
             }
         }
+        */
 
 		// Очищаем заголовки
         curl_slist_free_all(headers);
@@ -2136,6 +2137,23 @@ try {
     text = replace(text, ">", " ");
 }
 
+// ============================================================
+// УДАЛЕНИЕ ЭМОДЗИ (ПРОСТОЙ ВАРИАНТ)
+// ============================================================
+static const std::regex re_emoji(
+    "[\\x{1F300}-\\x{1F9FF}]"
+    "|[\\x{2600}-\\x{27BF}]"
+    "|[\\x{FE00}-\\x{FE0F}]"
+    "|[\\x{1F680}-\\x{1F6FF}]"
+    "|[\\x{1F1E6}-\\x{1F1FF}]",
+    std::regex_constants::ECMAScript | std::regex_constants::optimize
+);
+try {
+    text = std::regex_replace(text, re_emoji, "");
+} catch (const std::regex_error& e) {
+    // Игнорируем, если вдруг что-то не так с регуляркой
+}
+
 // =================================================================
 // ДЕКОДИРОВАНИЕ HTML-СУЩНОСТЕЙ
 // =================================================================
@@ -2283,25 +2301,25 @@ try {
     // 1. ДВОЙНЫЕ ЗВЁЗДОЧКИ: **смеется** -> смеется,
     {
         static const std::regex re_double_star(R"(\*\*([^*]+)\*\*)", std::regex::ECMAScript);
-        text = std::regex_replace(text, re_double_star, "$1, ");
+        text = std::regex_replace(text, re_double_star, "$1,＃");
     }
 
     // 2. ОДИНАРНЫЕ ЗВЁЗДОЧКИ: *смеется* -> смеется,
     {
         static const std::regex re_star(R"(\*([^*]+)\*)", std::regex::ECMAScript);
-        text = std::regex_replace(text, re_star, "$1, ");
+        text = std::regex_replace(text, re_star, "$1,＃");
     }
 
     // 3. КРУГЛЫЕ СКОБКИ: (смеется) -> смеется,
     {
         static const std::regex re_parens(R"(\(([^)]+)\))", std::regex::ECMAScript);
-        text = std::regex_replace(text, re_parens, "$1, ");
+        text = std::regex_replace(text, re_parens, "$1,＃");
     }
 
     // 4. КВАДРАТНЫЕ СКОБКИ: [смеется] -> смеется,
     {
         static const std::regex re_brackets(R"(\[([^\]]+)\])", std::regex::ECMAScript);
-        text = std::regex_replace(text, re_brackets, "$1, ");
+        text = std::regex_replace(text, re_brackets, "$1,＃");
     }
 
     // 5. Удаляем оставшиеся служебные символы (скобки могли остаться)
@@ -2320,13 +2338,18 @@ try {
     static const std::regex re_comma_space_comma(", ,", std::regex::ECMAScript);
     text = std::regex_replace(text, re_comma_space_comma, ", ");
 
-    // Убираем пробел перед запятой (", " — правильный формат)
-    text = replace(text, " ,", ",");
+    // Восстанавливаем запятые из защищённых маркеров и нормализуем пунктуацию
+    text = replace(text, ",＃", ",");
 
-    // Убираем запятую перед точкой/восклицанием/вопросом
-    text = replace(text, ", .", ".");
+    // Убираем пробел между запятой и восклицательным/вопросительным знаком
     text = replace(text, ", !", "!");
     text = replace(text, ", ?", "?");
+    text = replace(text, ", .", ".");
+
+    // После этого добавляем пробел после запятой (если это не конец предложения)
+    // Заменяем запятую без пробела на запятую с пробелом, но не трогаем ",!" и ",?"
+    std::regex re_comma_space(R"(,([^ !?.]))");
+    text = std::regex_replace(text, re_comma_space, ", $1");
 
     // Убираем запятые в начале строки (если эмоция первое слово)
     if (!text.empty() && text[0] == ',') {
