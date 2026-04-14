@@ -3597,10 +3597,12 @@ if (llama_decode(ctx_llama, batch)) {
     if (!wake_cmd.empty()) {
         printf("%s : the wake-up command is: '%s%s%s'\n", __func__, "\033[1m", wake_cmd.c_str(), "\033[0m");
     }
-    printf("\n");
-    // Приглашение будет выводиться только после ответа бота,
-    // поэтому здесь не выводим лишний "Друг:"
+
+    // ---------------------------------------------
+    // ===== НАЧАЛО ДИАЛОГА: приглашение выводится ПОСЛЕ этого блока =====
+    printf("\n"); // ← просто пустая строка перед началом диалога, поэтому здесь не выводим лишний "Друг:"
     fflush(stdout);
+    // ---------------------------------------------
 
     // Очистка аудио-буфера
     audio.clear();
@@ -3715,14 +3717,20 @@ if (llama_decode(ctx_llama, batch)) {
         keyboard_shortcut_func();
     });
 
-	printf("\nVoice commands: Stop(Ctrl+Space), Regenerate(Ctrl+Right), Delete(Ctrl+Delete), Reset(Ctrl+R)\n");
+    // ===== ИНФОРМАЦИЯ О ГОРЯЧИХ КЛАВИШАХ =====
+    printf("\nVoice commands: Stop(Ctrl+Space), Regenerate(Ctrl+Right), Delete(Ctrl+Delete), Reset(Ctrl+R)\n");
 
-	if (params.push_to_talk) printf("Type anything or hold 'Alt' to speak:\n");
+    if (params.push_to_talk)
+        printf("Type anything or hold 'Alt' to speak:\n");
+    else
+        printf("Start speaking or typing:\n");
 
-	else printf("Start speaking or typing:\n");
-	printf("\n\n");
+    // ===== НАЧАЛЬНОЕ ПРИГЛАШЕНИЕ =====
+    // Одна пустая строка для отступа, затем приглашение "Друг: "
+    printf("\n");
     printf("%s%s ", params.person.c_str(), chat_symb.c_str());
     fflush(stdout);
+    // -------------------------------------------------------
 
 	int vad_result_prev = 2; // ended
 	float speech_start_ms = 0;
@@ -4707,7 +4715,7 @@ std::string resp = send_curl(url);
                 std::string old_bot_name = params.bot_name;  // сохраняем для отладки (опционально)
                 params.bot_name = q;                         // меняем имя бота
 
-                // ✅ ОБНОВЛЯЕМ АНТИПРОМПТЫ С НОВЫМ ИМЕНЕМ ПОЛЬЗОВАТЕЛЯ
+                // ОБНОВЛЯЕМ АНТИПРОМПТЫ С НОВЫМ ИМЕНЕМ ПОЛЬЗОВАТЕЛЯ
                 update_antiprompts(params.person, params.bot_name);
 
                 if (params.verbose) {
@@ -4755,15 +4763,21 @@ std::string resp = send_curl(url);
     if (params.translate) bot_name_current_ru = translit_en_ru(params.bot_name);
     int n_comas = 0;
 
-    if (last_output_has_username && !user_typed_this) {
-        text_heard.insert(0, 1, ' ');
-        text_heard_with_instruct.insert(0, 1, ' ');
-    } else {
-        text_heard.insert(0, "\n"+params.person + chat_symb + " ");
-        text_heard_with_instruct.insert(0, "\n"+params.instruct_preset_data["user_message_prefix"]+"\n"+params.person + chat_symb + " ");
-    }
-    text_heard += "\n" + params.bot_name + chat_symb;
-    text_heard_with_instruct += params.instruct_preset_data["user_message_suffix"]+"\n" + params.instruct_preset_data["bot_message_prefix"]+ "\n" + params.bot_name + chat_symb;
+// ===== ФОРМАТИРОВАНИЕ РЕПЛИКИ ПОЛЬЗОВАТЕЛЯ ДЛЯ LLAMA =====
+if (last_output_has_username && !user_typed_this) {
+    // Предыдущий ответ уже содержал имя пользователя — добавляем только пробел
+    text_heard.insert(0, 1, ' ');
+    text_heard_with_instruct.insert(0, 1, ' ');
+} else {
+    // Добавляем "Друг: " БЕЗ \n — разделение блоков будет через пустую строку в консоли
+    text_heard.insert(0, params.person + chat_symb + " ");
+    text_heard_with_instruct.insert(0, params.instruct_preset_data["user_message_prefix"] + "\n" + params.person + chat_symb + " ");
+}
+
+// ===== ФОРМАТИРОВАНИЕ ОТВЕТА БОТА =====
+// Добавляем "\n\nЭмма:" — пустая строка перед ответом бота в истории
+text_heard += "\n\n" + params.bot_name + chat_symb;
+text_heard_with_instruct += params.instruct_preset_data["user_message_suffix"] + "\n" + params.instruct_preset_data["bot_message_prefix"] + "\n" + params.bot_name + chat_symb;
 
     if (user_typed_this)
     {
@@ -5787,9 +5801,10 @@ try
                 g_hotkey_pressed = "";
             }                                   // Сбрасываем горячую клавишу
 
-            // Выводим приглашение для следующего ввода пользователя
-            // Всегда добавляем перевод строки перед приглашением для чистого форматирования
-            printf("\n%s%s ", params.person.c_str(), chat_symb.c_str());
+            // ===== ПРИГЛАШЕНИЕ ПОСЛЕ ОТВЕТА БОТА =====
+            // Выводим только пустую строку для разделения блоков диалога
+            // "Друг: " НЕ выводим — он уже есть в начале
+            printf("\n");
             fflush(stdout);
         }
     }
