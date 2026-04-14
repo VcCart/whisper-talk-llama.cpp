@@ -2137,23 +2137,6 @@ try {
     text = replace(text, ">", " ");
 }
 
-// ============================================================
-// УДАЛЕНИЕ ЭМОДЗИ (ПРОСТОЙ ВАРИАНТ)
-// ============================================================
-static const std::regex re_emoji(
-    "[\\x{1F300}-\\x{1F9FF}]"
-    "|[\\x{2600}-\\x{27BF}]"
-    "|[\\x{FE00}-\\x{FE0F}]"
-    "|[\\x{1F680}-\\x{1F6FF}]"
-    "|[\\x{1F1E6}-\\x{1F1FF}]",
-    std::regex_constants::ECMAScript | std::regex_constants::optimize
-);
-try {
-    text = std::regex_replace(text, re_emoji, "");
-} catch (const std::regex_error& e) {
-    // Игнорируем, если вдруг что-то не так с регуляркой
-}
-
 // =================================================================
 // ДЕКОДИРОВАНИЕ HTML-СУЩНОСТЕЙ
 // =================================================================
@@ -2222,13 +2205,13 @@ try {
     // Жирный, курсив, зачёркнутый — просто убираем маркеры (без пауз)
     static const std::regex re_bold1(R"(\*\*([^*]+)\*\*)", std::regex::ECMAScript);
     static const std::regex re_bold2(R"(__([^_]+)__)", std::regex::ECMAScript);
-    static const std::regex re_ital1(R"(\*([^*]+)\*)", std::regex::ECMAScript);
+    // static const std::regex re_ital1(R"(\*([^*]+)\*)", std::regex::ECMAScript);  // ← ЗАКОММЕНТИРОВАТЬ
     static const std::regex re_ital2(R"(_([^_]+)_)", std::regex::ECMAScript);
     static const std::regex re_del(R"(~~([^~]+)~~)", std::regex::ECMAScript);
 
     text = std::regex_replace(text, re_bold1, "$1");
     text = std::regex_replace(text, re_bold2, "$1");
-    text = std::regex_replace(text, re_ital1, "$1");
+    // text = std::regex_replace(text, re_ital1, "$1");  // ← ЗАКОММЕНТИРОВАТЬ
     text = std::regex_replace(text, re_ital2, "$1");
     text = std::regex_replace(text, re_del, "$1");
 
@@ -2812,13 +2795,16 @@ if (text.empty()) return;
 
         CURLcode res = curl_easy_perform(http_handle);                         // ВЫПОЛНЯЕМ ЗАПРОС (блокирующий вызов, ждёт ответа)
 
-        if (res != CURLE_OK && !(res == CURLE_WRITE_ERROR && g_is_interrupted.load())) {
+        // Ничего не выводим
+        (void)res;  // чтобы компилятор не ругался
+
+        /* if (res != CURLE_OK && !(res == CURLE_WRITE_ERROR && g_is_interrupted.load())) {
             static bool tts_error_printed = false;
             if (!tts_error_printed) {
                 fprintf(stderr, " [TTS warning: %s]", curl_easy_strerror(res));
                 tts_error_printed = true;
             }
-        }
+         }*/
 
         curl_slist_free_all(headers);                                          // Освобождаем память, занятую списком заголовков
         curl_easy_cleanup(http_handle);                                        // Освобождаем cURL handle (закрываем соединение)
