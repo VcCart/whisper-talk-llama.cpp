@@ -3726,9 +3726,8 @@ if (llama_decode(ctx_llama, batch)) {
         printf("Start speaking or typing:\n");
 
     // ===== НАЧАЛЬНОЕ ПРИГЛАШЕНИЕ =====
-    // Одна пустая строка для отступа, затем приглашение "Друг: "
-    printf("\n");
-    printf("%s%s ", params.person.c_str(), chat_symb.c_str());
+    // Формат старта должен совпадать с форматом последующих ходов
+    printf("\n\033[1m%s%s\033[0m ", params.person.c_str(), chat_symb.c_str());
     fflush(stdout);
     // -------------------------------------------------------
 
@@ -4763,34 +4762,35 @@ std::string resp = send_curl(url);
     if (params.translate) bot_name_current_ru = translit_en_ru(params.bot_name);
     int n_comas = 0;
 
-// ===== ФОРМАТИРОВАНИЕ РЕПЛИКИ ПОЛЬЗОВАТЕЛЯ ДЛЯ LLAMA =====
-if (last_output_has_username && !user_typed_this) {
-    // Предыдущий ответ уже содержал имя пользователя — добавляем только пробел
-    text_heard.insert(0, 1, ' ');
-    text_heard_with_instruct.insert(0, 1, ' ');
-} else {
-    // Добавляем "Друг: " БЕЗ \n — разделение блоков будет через пустую строку в консоли
-    text_heard.insert(0, params.person + chat_symb + " ");
-    text_heard_with_instruct.insert(0, params.instruct_preset_data["user_message_prefix"] + "\n" + params.person + chat_symb + " ");
-}
-
-// ===== ФОРМАТИРОВАНИЕ ОТВЕТА БОТА =====
-// Добавляем "\n\nЭмма:" — пустая строка перед ответом бота в истории
-text_heard += "\n\n" + params.bot_name + chat_symb;
-text_heard_with_instruct += params.instruct_preset_data["user_message_suffix"] + "\n" + params.instruct_preset_data["bot_message_prefix"] + "\n" + params.bot_name + chat_symb;
-
-    if (user_typed_this)
-    {
-        fprintf(stdout, "%s%s%s", "\033[1m", (params.bot_name + chat_symb).c_str(), "\033[0m");
-        {
-            std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
-            g_hotkey_pressed = "";
-        }
+    // ===== ФОРМАТИРОВАНИЕ РЕПЛИКИ ПОЛЬЗОВАТЕЛЯ ДЛЯ LLAMA =====
+    // Алгоритмический смысл: модели YandexGPT/Llama-3 требуют явных разделителей ролей в контексте.
+    // Мы формируем их ТОЛЬКО для embd_inp. В stdout эта разметка попадать не должна.
+    if (last_output_has_username && !user_typed_this) {
+        // Предыдущий ответ модели уже содержал имя пользователя — добавляем только пробел для склейки
+        text_heard.insert(0, 1, ' ');
+        text_heard_with_instruct.insert(0, 1, ' ');
+    } else {
+        // Стандартное начало реплики пользователя в контексте модели
+        text_heard.insert(0, params.person + chat_symb + " ");
+        text_heard_with_instruct.insert(0, params.instruct_preset_data["user_message_prefix"] + "\n" + params.person + chat_symb + " ");
     }
-    else fprintf(stdout, "%s%s%s", "\033[1m", text_heard.c_str(), "\033[0m");
 
-    if (params.instruct_preset.size()) text_heard = text_heard_with_instruct;
+    // ===== ФОРМАТИРОВАНИЕ ОТВЕТА БОТА =====
+    // Добавляем маркер начала ответа бота в контекст модели
+    text_heard += "\n\n" + params.bot_name + chat_symb;
+    text_heard_with_instruct += params.instruct_preset_data["user_message_suffix"] + "\n" + params.instruct_preset_data["bot_message_prefix"] + "\n" + params.bot_name + chat_symb;
+
+    // ===== ВЫВОД В КОНСОЛЬ (СТРОГО ПО ЗАПРОШЕННОМУ ШАБЛОНУ) =====
+    // Физический смысл: \r\033[K перезаписывает строку ожидания "Друг: ", устраняя визуальное дублирование.
+    // Терминал показывает только чистый диалог. Служебные префиксы (\n\n, ChatML-теги) остаются "под капотом".
+    // Формат вывода:
+    // Друг: <текст пользователя>
+    // Эмма: <здесь начнётся потоковый вывод токенов>
+    printf("\r\033[K\033[1m%s%s\033[0m %s\n", params.person.c_str(), chat_symb.c_str(),
+           user_typed_this ? user_typed.c_str() : text_heard_trimmed.c_str());
+    printf("\033[1m%s%s\033[0m ", params.bot_name.c_str(), chat_symb.c_str());
     fflush(stdout);
+
     int split_after = params.split_after;
 
     // ЕДИНСТВЕННАЯ ТОКЕНИЗАЦИЯ: сразу в embd
@@ -5126,13 +5126,57 @@ char out_token_symbol;
             // Добавляем токен в контекст для следующей итерации
             embd.push_back(id);
 
-            out_token_str = llama_token_to_piece(ctx_llama, id);
+        out_token_str = llama_token_to_piece(ctx_llama, id);
 
-            // Просто выводим токен в консоль и добавляем в буфер для TTS
+        // ============================================================
+        // ФИЗИЧЕСКИЙ СМЫСЛ: Замена плейсхолдеров {0}/{1} и фильтрация мусора
+        // Модели могут генерировать плейсхолдеры из весов ИЛИ разбивать их на субтокены.
+        // Обрабатываем оба случая: полную строку и частичные совпадения.
+        // ============================================================
+
+        // 1. Полная замена для обычных токенов
+        size_t pos0 = out_token_str.find("{0}");
+        if (pos0 != std::string::npos) {
+            out_token_str.replace(pos0, 3, params.person);
+        }
+        size_t pos1 = out_token_str.find("{1}");
+        if (pos1 != std::string::npos) {
+            out_token_str.replace(pos1, 3, params.bot_name);
+        }
+
+        // 2. Обработка разбитых токенов (субтокены типа "{0", "}", "{1")
+        // Алгоритмический смысл: если токен совпадает с частью плейсхолдера — заменяем целиком
+        // Это предотвращает утечку "{0" или "}" в консоль и TTS
+        if (out_token_str == "{0" || out_token_str == "{0}") {
+            out_token_str = params.person;
+        } else if (out_token_str == "{1" || out_token_str == "{1}") {
+            out_token_str = params.bot_name;
+        } else if (out_token_str == "}" && !text_to_speak.empty()) {
+            // Если пришла закрывающая скобка отдельно — проверяем, не была ли это часть {0} или {1}
+            // (это эвристическая защита, если предыдущий токен был "{0" или "{1")
+            // В идеале модель не должна так делать, но на всякий случай фильтруем
+            if (text_to_speak.size() >= 2) {
+                std::string last2 = text_to_speak.substr(text_to_speak.size() - 2);
+                if (last2 == "{0" || last2 == "{1") {
+                    // Удаляем последний символ "{" из text_to_speak и не добавляем "}"
+                    text_to_speak.pop_back();
+                    out_token_str = "";  // Пропускаем этот токен
+                }
+            }
+        }
+
+        // 3. Фильтрация управляющих маркеров YandexGPT (<|eot_id|> и др.)
+        // Если токен содержит спецсимволы модели — не выводим его в консоль и TTS
+        bool is_control_fragment = (out_token_str.find("<|") != std::string::npos ||
+                                    out_token_str.find("|>") != std::string::npos ||
+                                    out_token_str.find("<|eot") != std::string::npos);
+
+        // Выводим только очищенный и безопасный токен
+        if (!is_control_fragment && !out_token_str.empty()) {
             printf("%s", out_token_str.c_str());
             fflush(stdout);
             text_to_speak += out_token_str;
-
+        }
             tokens_in_reply += utf8_length(out_token_str);
 
             // Проверка на зацикливание последовательности
@@ -5802,9 +5846,11 @@ try
             }                                   // Сбрасываем горячую клавишу
 
             // ===== ПРИГЛАШЕНИЕ ПОСЛЕ ОТВЕТА БОТА =====
-            // Выводим только пустую строку для разделения блоков диалога
-            // "Друг: " НЕ выводим — он уже есть в начале
-            printf("\n");
+            // ФИЗИЧЕСКИЙ СМЫСЛ: завершаем поток токенов бота, сбрасываем цвет терминала,
+            // добавляем ровно одну пустую строку-разделитель и выводим приглашение для следующего хода.
+            // Это создаёт стабильную визуальную сетку диалога без склеивания реплик.
+            // Завершаем строку бота, даем один пустой отступ и выводим приглашение
+            printf("\033[0m\n\n\033[1m%s%s\033[0m ", params.person.c_str(), chat_symb.c_str());
             fflush(stdout);
         }
     }
