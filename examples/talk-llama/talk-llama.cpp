@@ -5165,19 +5165,101 @@ char out_token_symbol;
             }
         }
 
-        // 3. Фильтрация управляющих маркеров YandexGPT (<|eot_id|> и др.)
-        // Если токен содержит спецсимволы модели — не выводим его в консоль и TTS
-        bool is_control_fragment = (out_token_str.find("<|") != std::string::npos ||
-                                    out_token_str.find("|>") != std::string::npos ||
-                                    out_token_str.find("<|eot") != std::string::npos);
+        // ============================================================
+        // 3. УМНАЯ ФИЛЬТРАЦИЯ СПЕЦТОКЕНОВ (без хардкода строк)
+        // ============================================================
+        // Проблема: старый код хардкодил "<|", "|>", "<|eot" и пропускал
+        // разбитые BPE-субтокены спецтокенов.
+        //
+        // Решение:
+        // a) Проверяем ID токена по списку special_token_ids (собран из
+        //    JSON-пресета, --stop-words и базовых EOT-маркеров).
+        // b) Если токен совпал — подавляем его и сбрасываем накопительный буфер.
+        // c) Если токен НЕ совпал, но содержит '<' или '|' — накапливаем
+        //    в буфере (ждём полный спецтокен).
+        // d) Обычный токен сначала "выталкивает" буфер, потом выводится сам.
+        // e) Если накопилось > MAX_PENDING подозрительных токенов — выводим
+        //    принудительно (это не спецтокен, а обычный текст).
+        // ============================================================
+
+        // Шаг 3a: Проверяем ID токена по заранее собранному списку
+        bool is_special_id = false;
+        for (int si = 0; si < special_token_count; si++) {
+            if (id == special_token_ids[si]) {
+                is_special_id = true;
+                break;
+            }
+        }
+
+        // Шаг 3b: Дополнительно проверяем EOS через токен конца словаря
+        if (!is_special_id) {
+            llama_token eos_token = llama_vocab_eos(vocab_llama);
+            if (id == eos_token) {
+                is_special_id = true;
+            }
+        }
+
+        // Шаг 3c: Буфер для накопления подозрительных фрагментов
+        static std::string pending_fragment = "";
+        static int pending_count = 0;
+        static const int MAX_PENDING = 8;
+
+        // Шаг 3d: Определяем, похож ли токен на фрагмент спецтокена
+        bool looks_like_special = false;
+        if (!out_token_str.empty()) {
+            for (size_t ci = 0; ci < out_token_str.size(); ci++) {
+                if (out_token_str[ci] == '<' || out_token_str[ci] == '|') {
+                    looks_like_special = true;
+                    break;
+                }
+            }
+        }
+
+        bool should_print = true;
+
+        if (is_special_id) {
+            // Токен гарантированно специальный — подавляем и очищаем буфер
+            should_print = false;
+            pending_fragment = "";
+            pending_count = 0;
+        } else if (looks_like_special && !out_token_str.empty()) {
+            // Токен похож на фрагмент спецтокена — накапливаем
+            pending_fragment += out_token_str;
+            pending_count++;
+
+            if (pending_count >= MAX_PENDING) {
+                // Слишком много фрагментов — это обычный текст
+                printf("%s", pending_fragment.c_str());
+                fflush(stdout);
+                text_to_speak += pending_fragment;
+                tokens_in_reply += utf8_length(pending_fragment);
+                pending_fragment = "";
+                pending_count = 0;
+            } else {
+                should_print = false;
+            }
+        } else {
+            // Обычный токен — выводим накопленный буфер, если есть
+            if (!pending_fragment.empty()) {
+                printf("%s", pending_fragment.c_str());
+                fflush(stdout);
+                text_to_speak += pending_fragment;
+                tokens_in_reply += utf8_length(pending_fragment);
+                pending_fragment = "";
+                pending_count = 0;
+            }
+        }
 
         // Выводим только очищенный и безопасный токен
-        if (!is_control_fragment && !out_token_str.empty()) {
+        if (should_print && !out_token_str.empty()) {
             printf("%s", out_token_str.c_str());
             fflush(stdout);
             text_to_speak += out_token_str;
         }
+
+        if (should_print) {
             tokens_in_reply += utf8_length(out_token_str);
+        }
 
             // Проверка на зацикливание последовательности
             if (params.seqrep)  // Если включена проверка на повторения
