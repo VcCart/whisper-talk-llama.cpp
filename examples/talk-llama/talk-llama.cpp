@@ -2191,92 +2191,6 @@ text = replace(text, "\xE2\x80\xA6", "...");
 trim(text);
 if (text.empty()) return;
 
-// ============================================================
-// ЭТАП 2: УДАЛЕНИЕ MARKDOWN (СОХРАНЯЕМ СОДЕРЖИМОЕ)
-// ============================================================
-
-try {
-    // Код-блоки и инлайн-код — оставляем содержимое
-    static const std::regex re_code_block(R"(```(.*?)```)", std::regex::ECMAScript);
-    static const std::regex re_code_inline(R"(`([^`]*)`)", std::regex::ECMAScript);
-    text = std::regex_replace(text, re_code_block, "$1");
-    text = std::regex_replace(text, re_code_inline, "$1");
-
-    // Жирный, курсив, зачёркнутый — просто убираем маркеры (без пауз)
-    static const std::regex re_bold1(R"(\*\*([^*]+)\*\*)", std::regex::ECMAScript);
-    static const std::regex re_bold2(R"(__([^_]+)__)", std::regex::ECMAScript);
-    // static const std::regex re_ital1(R"(\*([^*]+)\*)", std::regex::ECMAScript);  // ← ЗАКОММЕНТИРОВАТЬ
-    static const std::regex re_ital2(R"(_([^_]+)_)", std::regex::ECMAScript);
-    static const std::regex re_del(R"(~~([^~]+)~~)", std::regex::ECMAScript);
-
-    text = std::regex_replace(text, re_bold1, "$1");
-    text = std::regex_replace(text, re_bold2, "$1");
-    // text = std::regex_replace(text, re_ital1, "$1");  // ← ЗАКОММЕНТИРОВАТЬ
-    text = std::regex_replace(text, re_ital2, "$1");
-    text = std::regex_replace(text, re_del, "$1");
-
-    // Заголовки и цитаты — просто убираем маркеры (без пауз)
-    static const std::regex re_heading(R"(^#+\s*)", std::regex::ECMAScript);
-    static const std::regex re_quote(R"(^>\s*)", std::regex::ECMAScript);
-    text = std::regex_replace(text, re_heading, "");
-    text = std::regex_replace(text, re_quote, "");
-
-    // Удаляем висячие маркеры
-    static const std::regex re_multi_stars(R"(\*{2,})", std::regex::ECMAScript);
-    static const std::regex re_multi_unders(R"(_{2,})", std::regex::ECMAScript);
-    static const std::regex re_multi_tildes(R"(~{2,})", std::regex::ECMAScript);
-
-    text = std::regex_replace(text, re_multi_stars, " ");
-    text = std::regex_replace(text, re_multi_unders, " ");
-    text = std::regex_replace(text, re_multi_tildes, " ");
-
-} catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (Markdown): %s\n", e.what());
-    text = replace(text, "```", " ");
-    text = replace(text, "`", " ");
-    text = replace(text, "**", " ");
-    text = replace(text, "__", " ");
-    text = replace(text, "~~", " ");
-}
-trim(text);
-if (text.empty()) return;
-
-// ============================================================
-// ЭТАП 3: УДАЛЕНИЕ МАРКЕРОВ СПИСКОВ (ваша логика)
-// ============================================================
-try {
-    static const std::regex re_list_markers(
-        R"(^\s*(\d+[\.\)]|[A-Za-zА-Яа-яЁё][\.\)]|[\-\*\+\>\|#]+)\s*)",
-        std::regex::ECMAScript
-    );
-    text = std::regex_replace(text, re_list_markers, "");
-} catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (list markers): %s\n", e.what());
-    // Fallback
-    if (text.size() > 2) {
-        if (text[0] == '-' || text[0] == '*' || text[0] == '+' || text[0] == '#') {
-            if (text[1] == ' ') text = text.substr(2);
-        }
-        else if (isdigit(text[0])) {
-            size_t i = 1;
-            while (i < text.size() && isdigit(text[i])) i++;
-            if (i < text.size() && (text[i] == '.' || text[i] == ')')) {
-                if (i + 1 < text.size() && text[i + 1] == ' ') {
-                    text = text.substr(i + 2);
-                } else {
-                    text = text.substr(i + 1);
-                }
-            }
-        }
-    }
-}
-trim(text);
-if (text.empty()) return;
-
-// ============================================================
-// ЭТАП 4: ЕДИНАЯ ЛОГИКА ПАУЗ (ВСЁ ВЫДЕЛЕННОЕ -> "текст, ")
-// ============================================================
-
 // 4.1 УНИВЕРСАЛЬНАЯ НОРМАЛИЗАЦИЯ ЭМОЦИЙ И ВЫДЕЛЕНИЙ
 // Обрабатывает: *смеется*, **смеется**, (смеется), [смеется]
 // Результат: "смеется, " (запятая и пробел для паузы в TTS)
@@ -2362,9 +2276,79 @@ try {
     trim(text);
 }
 
+
 // ============================================================
-// 4.2 КАВЫЧКИ ВСЕХ ТИПОВ (универсальная обработка) — пауза НЕ нужна
+// ЭТАП 2: УДАЛЕНИЕ MARKDOWN (СОХРАНЯЕМ СОДЕРЖИМОЕ)
 // ============================================================
+
+try {
+    // Код-блоки и инлайн-код — оставляем содержимое
+    static const std::regex re_code_block(R"(```(.*?)```)", std::regex::ECMAScript);
+    static const std::regex re_code_inline(R"(`([^`]*)`)", std::regex::ECMAScript);
+    text = std::regex_replace(text, re_code_block, "$1");
+    text = std::regex_replace(text, re_code_inline, "$1");
+
+    // Подчёркивания и зачёркнутый — просто убираем маркеры (без пауз)
+    // Звёздочки (** и *) уже обработаны в ЭТАПЕ нормализации эмоций (выше)
+    static const std::regex re_bold2(R"(__([^_]+)__)", std::regex::ECMAScript);
+    static const std::regex re_ital2(R"(_([^_]+)_)", std::regex::ECMAScript);
+    static const std::regex re_del(R"(~~([^~]+)~~)", std::regex::ECMAScript);
+
+    text = std::regex_replace(text, re_bold2, "$1");
+    text = std::regex_replace(text, re_ital2, "$1");
+    text = std::regex_replace(text, re_del, "$1");
+
+    // ... дальше заголовки (без изменений) ...
+
+    // Удаляем висячие маркеры (только подчёркивания и тильды, звёздочки уже обработаны)
+    static const std::regex re_multi_unders(R"(_{2,})", std::regex::ECMAScript);
+    static const std::regex re_multi_tildes(R"(~{2,})", std::regex::ECMAScript);
+
+    text = std::regex_replace(text, re_multi_unders, " ");
+    text = std::regex_replace(text, re_multi_tildes, " ");
+
+} catch (const std::regex_error& e) {
+    fprintf(stderr, "Regex error (Markdown): %s\n", e.what());
+    text = replace(text, "```", " ");
+    text = replace(text, "`", " ");
+    text = replace(text, "__", " ");
+    text = replace(text, "~~", " ");
+}
+trim(text);
+if (text.empty()) return;
+
+// ============================================================
+// ЭТАП 3: УДАЛЕНИЕ МАРКЕРОВ СПИСКОВ (ваша логика)
+// ============================================================
+try {
+    static const std::regex re_list_markers(
+        R"(^\s*(\d+[\.\)]|[A-Za-zА-Яа-яЁё][\.\)]|[\-\*\+\>\|#]+)\s*)",
+        std::regex::ECMAScript
+    );
+    text = std::regex_replace(text, re_list_markers, "");
+} catch (const std::regex_error& e) {
+    fprintf(stderr, "Regex error (list markers): %s\n", e.what());
+    // Fallback
+    if (text.size() > 2) {
+        if (text[0] == '-' || text[0] == '*' || text[0] == '+' || text[0] == '#') {
+            if (text[1] == ' ') text = text.substr(2);
+        }
+        else if (isdigit(text[0])) {
+            size_t i = 1;
+            while (i < text.size() && isdigit(text[i])) i++;
+            if (i < text.size() && (text[i] == '.' || text[i] == ')')) {
+                if (i + 1 < text.size() && text[i + 1] == ' ') {
+                    text = text.substr(i + 2);
+                } else {
+                    text = text.substr(i + 1);
+                }
+            }
+        }
+    }
+}
+trim(text);
+if (text.empty()) return;
+
 try {
     // ============================================================
     // ШАГ 4.2.1: ЗАЩИТА АНГЛИЙСКИХ СОКРАЩЕНИЙ (don't, it's, we'll и т.д.)
