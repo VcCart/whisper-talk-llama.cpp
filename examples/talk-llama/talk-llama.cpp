@@ -5694,6 +5694,21 @@ try
                     // --------------------------------------------------------
                     // 4. ОБРАБОТКА ОСТАЛЬНЫХ АНТИПРОМПТОВ (\n, --stop-words и т.д.)
                     // --------------------------------------------------------
+
+                    // Если это \n — проверяем, не продолжение ли это списка
+                    if (antiprompt == "\n" && !text_to_speak.empty()) {
+                        // Смотрим последние символы вывода: если там ":\n" — это начало перечисления
+                        size_t last_nl = text_to_speak.rfind('\n');
+                        if (last_nl != std::string::npos && last_nl + 1 < text_to_speak.length()) {
+                            char after_nl = text_to_speak[last_nl + 1];
+                            // После \n идёт маркер списка — продолжаем генерацию
+                            if (after_nl == '-' || after_nl == '*' || isdigit(after_nl)) {
+                                i_antiprompt++;
+                                continue;
+                            }
+                        }
+                    }
+
                     antiprompt_matched = true;
                     done = true;
 
