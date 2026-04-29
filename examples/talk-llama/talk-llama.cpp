@@ -2592,15 +2592,22 @@ if (text.empty()) return;
 // Точка с запятой -> запятая (XTTS на ; заикается)
 text = replace(text, ";", ",");
 
-// Убираем пробелы перед ! и ?
+// Одиночные двойные кавычки — удаляем (XTTS их не понимает)
+// ВАЖНО: апострофы ' не трогаем — они защищены в Этапе 4.2.1 (don't, it's)
+text = replace(text, "\"", "");
+
+// Убираем пробелы перед ! ? .
 try {
     static const std::regex re_space_before_excl(R"(\s+(!))", std::regex::ECMAScript);
     static const std::regex re_space_before_ques(R"(\s+(\?))", std::regex::ECMAScript);
+    static const std::regex re_space_before_dot(R"(\s+(\.))", std::regex::ECMAScript);
     text = std::regex_replace(text, re_space_before_excl, "$1");
     text = std::regex_replace(text, re_space_before_ques, "$1");
+    text = std::regex_replace(text, re_space_before_dot, "$1");
 } catch (const std::regex_error& e) {
     text = replace(text, " !", "!");
     text = replace(text, " ?", "?");
+    text = replace(text, " .", ".");
 }
 
 // ============================================================
@@ -2736,6 +2743,10 @@ speaker_wav = replace(speaker_wav, "*", "_");
 trim(speaker_wav);
 if (speaker_wav.size() < 2) speaker_wav = "default";
 
+// Финальная зачистка: убираем все переводы строк и невидимые символы
+text = replace(text, "\r\n", " ");
+text = replace(text, "\r", " ");
+text = replace(text, "\n", " ");
 trim(text);
 if (text.empty()) return;
 
