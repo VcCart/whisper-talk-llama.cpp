@@ -1661,8 +1661,7 @@ std::string url_to_speech(const std::string& url) {
 void send_tts_async(std::string text,
                     std::string speaker_wav = "Emma",
                     std::string language = "ru",
-                    std::string tts_url = "http://localhost:8020/",
-                    int reply_part = 0) {
+                    std::string tts_url = "http://localhost:8020/") {
 
 // Быстрая защита: если пусто — сразу выходим
 if (text.empty()) {
@@ -2775,8 +2774,7 @@ if (text.empty()) return;
 
     std::string data = "{\"text\":\"" + escape_json(text) + "\", "
                        "\"language\":\"" + escape_json(language) + "\", "
-                       "\"speaker_wav\":\"" + escape_json(speaker_wav) + "\", "
-                       "\"reply_part\":" + std::to_string(reply_part) + "}";
+                       "\"speaker_wav\":\"" + escape_json(speaker_wav) + "\"}";
 
         // Формируем URL и делаем запрос через cURL
     std::string full_url = tts_url + "tts_to_audio/";                          // Собираем полный URL: http://localhost:8020/tts_to_audio/
@@ -5485,7 +5483,7 @@ try
         // Захватываем ВСЁ по значению — безопасно с мьютексом
         std::string voice_copy = current_voice;  // <-- КОПИЯ
         safe_thread_emplace(threads, [text_to_speak, voice_copy, params]() {
-            send_tts_async(text_to_speak, voice_copy, params.language, params.xtts_url, 0);
+            send_tts_async(text_to_speak, voice_copy, params.language, params.xtts_url);
         });
         // Очищаем локальную переменную
         text_to_speak = "";
