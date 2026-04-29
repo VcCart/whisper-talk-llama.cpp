@@ -44,6 +44,34 @@
 #include <Windows.h>           // Windows API (работа с окнами, клавиатурой)
 #endif
 
+// ============================================================
+// ФУНКЦИИ ДЛЯ ЦВЕТНОГО ВЫВОДА (кроссплатформенные)
+// ============================================================
+#ifdef _WIN32
+static HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+static WORD originalColors = 0;
+
+static void init_console_colors() {
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (GetConsoleScreenBufferInfo(hConsole, &csbi)) {
+        originalColors = csbi.wAttributes;
+    }
+}
+
+static void set_console_color(WORD color) {
+    SetConsoleTextAttribute(hConsole, color);
+}
+
+static void reset_console_color() {
+    SetConsoleTextAttribute(hConsole, originalColors);
+}
+#else
+// Для Linux/macOS используем ANSI
+#define set_console_color(x)
+#define reset_console_color() printf("\033[0m")
+static inline void init_console_colors() {}
+#endif
+
 // ГЛОБАЛЬНЫЕ МЬЮТЕКСЫ
 std::atomic<bool> g_is_interrupted{false};          // Флаг прерывания для сетевых запросов (curl)
 std::atomic<int>  llama_interrupted{0};             // Флаг прерывания генерации LLaMA (связь с озвучкой)
@@ -3014,6 +3042,10 @@ llama_sampler * smpl_high_temp = nullptr;
             exit(0);
         }
 
+#ifdef _WIN32
+    init_console_colors();
+#endif
+
 	allow_xtts_file(params.xtts_control_path, 1);  // разрешаем воспроизведение звука XTTS
 
     // Инициализация Whisper
@@ -3332,24 +3364,26 @@ if (!params.instruct_preset.empty())
     prompt_llama = ::replace(prompt_llama, "{0}", params.person);
     prompt_llama = ::replace(prompt_llama, "{1}", params.bot_name);
 
-    // Добавляем подсказку о поле бота для правильного склонения глаголов
+    // Добавляем подсказку о поле для правильного склонения глаголов
     if (params.language == "ru") {
         if (bot_is_female) {
-            prompt_llama += "\n" + params.bot_name + " — девушка, говорит о себе в женском роде (сказала, подумала, решила).";
+            prompt_llama += "\nЖенский род: сделала, сказала, подумала, пошла. Запрещён мужской род.";
         } else {
-            prompt_llama += "\n" + params.bot_name + " — парень, говорит о себе в мужском роде (сказал, подумал, решил).";
+            prompt_llama += "\nМужской род: сделал, сказал, подумал, пошёл. Запрещён женский род.";
         }
     } else {
         if (bot_is_female) {
-            prompt_llama += "\n" + params.bot_name + " is female (she/her) and speaks about herself in feminine form.";
+            prompt_llama += "\nFeminine: I did, I said, I thought. No masculine forms.";
         } else {
-            prompt_llama += "\n" + params.bot_name + " is male (he/him) and speaks about himself in masculine form.";
+            prompt_llama += "\nMasculine: I did, I said, I thought. No feminine forms.";
         }
     }
 
+    // ВЫНОСИМ ОБЪЯВЛЕНИЕ ПЕРЕМЕННЫХ НАРУЖУ (будут видны в цикле генерации)
+    std::string time_str, year_str, ymd;
+
     {
         // Получаем текущее время
-        std::string time_str;
         {
             time_t t = time(0);
             struct tm * now = localtime(&t);
@@ -3361,20 +3395,18 @@ if (!params.instruct_preset.empty())
     }
     {
         // Получаем текущий год
-        std::string year_str;
-		std::string ymd;
         {
             time_t t = time(0);
             struct tm * now = localtime(&t);
             char buf[128];
             strftime(buf, sizeof(buf), "%Y", now);
             year_str = buf;
-			strftime(buf, sizeof(buf), "%Y-%m-%d", now);
+            strftime(buf, sizeof(buf), "%Y-%m-%d", now);
             ymd = buf;
         }
         prompt_llama = ::replace(prompt_llama, "{3}", year_str);
-		prompt_llama = ::replace(prompt_llama, "{5}", ymd);
-        }
+        prompt_llama = ::replace(prompt_llama, "{5}", ymd);
+    }
     prompt_llama = ::replace(prompt_llama, "{4}", chat_symb);
 
     // llama_batch batch = llama_batch_init(2048, 0, 1); // <-- ВСЕГДА ИНИЦИАЛИЗИРУЕМ С n_tokens=0!
@@ -3416,43 +3448,45 @@ if (!params.instruct_preset.empty())
     // Вектор токенов для хранения текущей сессии
     std::vector<llama_token> session_tokens;
 
-    // -------------------------------------------------------------------------
-    // УНИВЕРСАЛЬНАЯ ПОДДЕРЖКА INSTRUCT-PRESET (любой формат из JSON)
-    // -------------------------------------------------------------------------
-    if (!params.instruct_preset.empty()) {
-        std::string wrapped_prompt;
+// -------------------------------------------------------------------------
+// УНИВЕРСАЛЬНАЯ ПОДДЕРЖКА INSTRUCT-PRESET (любой формат из JSON)
+// -------------------------------------------------------------------------
+if (!params.instruct_preset.empty()) {
+    std::string wrapped_prompt;
 
-        // 1. System prompt (если задан --prompt-file и в пресете есть префикс/суффикс)
-        if (!params.prompt.empty() &&
-            !params.instruct_preset_data["system_prompt_prefix"].empty()) {
-            wrapped_prompt += params.instruct_preset_data["system_prompt_prefix"];
-            wrapped_prompt += params.prompt;
-            wrapped_prompt += params.instruct_preset_data["system_prompt_suffix"];
-        }
-
-        // 2. User message — только если НЕТ кастомного промпта из файла
-        //    Если --prompt-file указан, то системный промпт уже содержит всё необходимое,
-        //    и пользовательская часть должна быть пустой (диалог начнёт пользователь).
-        if (params.prompt.empty()) {
-            // Нет кастомного промпта — используем k_prompt_llama как начальный диалог
-            if (!params.instruct_preset_data["user_message_prefix"].empty()) {
-                wrapped_prompt += params.instruct_preset_data["user_message_prefix"];
-            }
-            wrapped_prompt += prompt_llama;      // k_prompt_llama с примерами диалога
-            if (!params.instruct_preset_data["user_message_suffix"].empty()) {
-                wrapped_prompt += params.instruct_preset_data["user_message_suffix"];
-            }
-        }
-        // Если --prompt-file указан (params.prompt не пуст) — пользовательская часть остаётся ПУСТОЙ
-
-        // 3. Assistant prefix (модель продолжит отсюда)
-        if (!params.instruct_preset_data["bot_message_prefix"].empty()) {
-            wrapped_prompt += params.instruct_preset_data["bot_message_prefix"];
-        }
-
-        // Заменяем исходный промпт
-        prompt_llama = wrapped_prompt;
+    // 1. System prompt (если задан --prompt-file и в пресете есть префикс/суффикс)
+    // ИСПРАВЛЕНО: используем prompt_llama вместо params.prompt
+    if (!prompt_llama.empty() &&
+        !params.instruct_preset_data["system_prompt_prefix"].empty()) {
+        wrapped_prompt += params.instruct_preset_data["system_prompt_prefix"];
+        wrapped_prompt += prompt_llama;
+        wrapped_prompt += params.instruct_preset_data["system_prompt_suffix"];
     }
+
+    // 2. User message — только если НЕТ кастомного промпта
+    //    (проверяем params.prompt, он может быть пустым или нет)
+    if (params.prompt.empty()) {
+        if (!params.instruct_preset_data["user_message_prefix"].empty()) {
+            wrapped_prompt += params.instruct_preset_data["user_message_prefix"];
+        }
+        // Добавляем пользовательскую часть ТОЛЬКО если system не был добавлен
+        // Иначе контекст уже содержит всё необходимое
+        if (prompt_llama.empty() || wrapped_prompt.find(prompt_llama) == std::string::npos) {
+            wrapped_prompt += prompt_llama;
+        }
+        if (!params.instruct_preset_data["user_message_suffix"].empty()) {
+            wrapped_prompt += params.instruct_preset_data["user_message_suffix"];
+        }
+    }
+
+    // 3. Assistant prefix (модель продолжит отсюда)
+    if (!params.instruct_preset_data["bot_message_prefix"].empty()) {
+        wrapped_prompt += params.instruct_preset_data["bot_message_prefix"];
+    }
+
+    // Заменяем исходный промпт
+    prompt_llama = wrapped_prompt;
+}
 
     // Токенизируем входной промпт (prompt_llama) в последовательность токенов
     auto embd_inp = ::llama_tokenize(ctx_llama, prompt_llama, true);
@@ -3685,32 +3719,78 @@ if (llama_decode(ctx_llama, batch)) {
         }
     }
 
-    // === ФУНКЦИЯ ДЛЯ ОБНОВЛЕНИЯ АНТИПРОМПТОВ ПРИ СМЕНЕ БОТА ===
+     // === ФУНКЦИЯ ДЛЯ ОБНОВЛЕНИЯ АНТИПРОМПТОВ ПРИ СМЕНЕ БОТА ===
     // Вызывается при команде "call" в режиме --multi-chars.
-    // Обновляет только имя пользователя, остальные стоп-слова остаются.
-    auto update_antiprompts = [&](const std::string& new_person, const std::string& /*new_bot_name*/) {
+    // Обновляет имя пользователя И добавляет стоп-слова для старого/нового бота.
+    auto update_antiprompts = [&](const std::string& new_person, const std::string& new_bot_name) {
+        // 1. Обновляем антипромпты для имени пользователя (Друг:)
         if (antiprompts.size() >= 2) {
             antiprompts[0] = "\n" + new_person + chat_symb;       // "\nНовыйДруг:"
             antiprompts[1] = "\n" + new_person + " " + chat_symb; // "\nНовыйДруг :"
         }
+
+        // 2. Добавляем антипромпты для старого имени бота (чтобы модель не продолжала его речь)
+        //    Это предотвращает ситуацию, когда модель говорит и от старого, и от нового бота.
+        static std::vector<std::string> old_bot_antiprompts;
+
+        // Сохраняем старые антипромпты бота (если они есть) в отдельный вектор
+        // Они будут работать как стоп-слова, но не будут мешать новому боту.
+        std::string old_bot_pattern1 = "\n" + params.bot_name + chat_symb;
+        std::string old_bot_pattern2 = "\n" + params.bot_name + " " + chat_symb;
+
+        // Проверяем, не добавлены ли уже
+        bool found1 = false, found2 = false;
+        for (const auto& ap : antiprompts) {
+            if (ap == old_bot_pattern1) found1 = true;
+            if (ap == old_bot_pattern2) found2 = true;
+        }
+
+        // Добавляем старые паттерны бота в антипромпты (как стоп-слова)
+        if (!found1 && !old_bot_pattern1.empty() && old_bot_pattern1 != "\n" + new_person + chat_symb) {
+            antiprompts.push_back(old_bot_pattern1);
+        }
+        if (!found2 && !old_bot_pattern2.empty() && old_bot_pattern2 != "\n" + new_person + " " + chat_symb) {
+            antiprompts.push_back(old_bot_pattern2);
+        }
+
+        // 3. Опционально: добавляем стоп-последовательность из JSON-пресета (например <|eot_id|>)
+        //    Она уже есть в special_token_ids, но на всякий случай продублируем в антипромпты
+        if (!params.instruct_preset_data["stop_sequence"].empty()) {
+            std::string stop_seq = params.instruct_preset_data["stop_sequence"];
+            bool stop_seq_found = false;
+            for (const auto& ap : antiprompts) {
+                if (ap == stop_seq) { stop_seq_found = true; break; }
+            }
+            if (!stop_seq_found && !stop_seq.empty()) {
+                antiprompts.push_back(stop_seq);
+            }
+        }
+
+        // Отладочный вывод (если включён verbose)
+        if (params.verbose) {
+            printf("\n[DEBUG] Antiprompts updated. New bot: '%s'. Total antiprompts: %zu\n",
+                   new_bot_name.c_str(), antiprompts.size());
+        }
     };
 
-
-    // Отладка: выводим ВСЕ стоп-слова для полного контроля
+    // Отладка: выводим ВСЕ стоп-слова для полного контроля (красиво)
     printf("Llama stop words (%zu total): ", antiprompts.size());
-
     for (size_t i = 0; i < antiprompts.size(); i++) {
-        // Для перевода строки показываем \n вместо реального символа
-        if (antiprompts[i] == "\n") {
-            printf("'\\n' ");
-        } else {
-            printf("'%s' ", antiprompts[i].c_str());
+        // Экранируем спецсимволы для читаемости
+        std::string display = antiprompts[i];
+        if (display == "\n") {
+            display = "\\n";
+        } else if (display == "\r") {
+            display = "\\r";
+        } else if (display == "\t") {
+            display = "\\t";
         }
+        printf("%s'%s'", i > 0 ? ", " : "", display.c_str());
     }
 
     // Дополнительно показываем пользовательские стоп-слова отдельно
     if (!params.stop_words.empty()) {
-        printf("[+ from --stop-words: %s] ", params.stop_words.c_str());
+        printf(" [+ from --stop-words: %s]", params.stop_words.c_str());
     }
 
     printf("\n");
@@ -3730,8 +3810,15 @@ if (llama_decode(ctx_llama, batch)) {
 
     // ===== НАЧАЛЬНОЕ ПРИГЛАШЕНИЕ =====
     // Формат старта должен совпадать с форматом последующих ходов
-    printf("\n\033[1m%s%s\033[0m ", params.person.c_str(), chat_symb.c_str());
-    fflush(stdout);
+    printf("\n");
+    #ifdef _WIN32
+        set_console_color(FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+    #else
+        printf("\033[32m");
+    #endif
+        printf("%s%s\n", params.bot_name.c_str(), chat_symb.c_str());
+        reset_console_color();
+        fflush(stdout);
     // -------------------------------------------------------
 
 	int vad_result_prev = 2; // ended
@@ -4779,25 +4866,35 @@ std::string resp = send_curl(url);
     }
 
     // ===== ФОРМАТИРОВАНИЕ ОТВЕТА БОТА =====
-    // Добавляем маркер начала ответа бота в контекст модели
     text_heard += "\n\n" + params.bot_name + chat_symb;
     text_heard_with_instruct += params.instruct_preset_data["user_message_suffix"] + "\n" + params.instruct_preset_data["bot_message_prefix"] + "\n" + params.bot_name + chat_symb;
 
-    // ===== ВЫВОД В КОНСОЛЬ (СТРОГО ПО ЗАПРОШЕННОМУ ШАБЛОНУ) =====
-    // Физический смысл: \r\033[K перезаписывает строку ожидания "Друг: ", устраняя визуальное дублирование.
-    // Терминал показывает только чистый диалог. Служебные префиксы (\n\n, ChatML-теги) остаются "под капотом".
-    // Формат вывода:
-    // Друг: <текст пользователя>
-    // Эмма: <здесь начнётся потоковый вывод токенов>
-    printf("\r\033[K\033[1m%s%s\033[0m %s\n", params.person.c_str(), chat_symb.c_str(),
-           user_typed_this ? user_typed.c_str() : text_heard_trimmed.c_str());
-    printf("\033[1m%s%s\033[0m ", params.bot_name.c_str(), chat_symb.c_str());
+    // ===== ВЫВОД В КОНСОЛЬ =====
+    // Перезаписываем строку ожидания и выводим реплику пользователя
+    printf("\r");
+#ifdef _WIN32
+    set_console_color(FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+#else
+    printf("\033[32m");
+#endif
+    printf("%s%s ", params.person.c_str(), chat_symb.c_str());
+    reset_console_color();
+    printf("%s\n", user_typed_this ? user_typed.c_str() : text_heard_trimmed.c_str());
+
+    // Выводим имя бота (цветной)
+#ifdef _WIN32
+    set_console_color(FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+#else
+    printf("\033[32m");
+#endif
+    printf("%s%s", params.bot_name.c_str(), chat_symb.c_str());
+    reset_console_color();
     fflush(stdout);
 
     int split_after = params.split_after;
 
     // ЕДИНСТВЕННАЯ ТОКЕНИЗАЦИЯ: сразу в embd
-    embd = ::llama_tokenize(ctx_llama, text_heard, false);
+    embd = ::llama_tokenize(ctx_llama, text_heard_with_instruct, false);
     input_tokens_count = embd.size();
 
     // Append the new input tokens to the session_tokens vector
@@ -4819,6 +4916,7 @@ std::string resp = send_curl(url);
     bool done = false;
     std::string text_to_speak;
     int new_tokens = 0;
+    bool first_token_after_bot = true;  // ← СБРАСЫВАЕМ ФЛАГ ПЕРЕД КАЖДОЙ НОВОЙ ГЕНЕРАЦИЕЙ
 
     while (true) {
         // =============================================================
@@ -5146,24 +5244,36 @@ char out_token_symbol;
         if (pos1 != std::string::npos) {
             out_token_str.replace(pos1, 3, params.bot_name);
         }
+        size_t pos2 = out_token_str.find("{2}");
+        if (pos2 != std::string::npos) {
+            out_token_str.replace(pos2, 3, time_str);
+        }
+        size_t pos3 = out_token_str.find("{3}");
+        if (pos3 != std::string::npos) {
+            out_token_str.replace(pos3, 3, year_str);
+        }
+        size_t pos5 = out_token_str.find("{5}");
+        if (pos5 != std::string::npos) {
+            out_token_str.replace(pos5, 3, ymd);
+        }
 
         // 2. Обработка разбитых токенов (субтокены типа "{0", "}", "{1")
-        // Алгоритмический смысл: если токен совпадает с частью плейсхолдера — заменяем целиком
-        // Это предотвращает утечку "{0" или "}" в консоль и TTS
         if (out_token_str == "{0" || out_token_str == "{0}") {
             out_token_str = params.person;
         } else if (out_token_str == "{1" || out_token_str == "{1}") {
             out_token_str = params.bot_name;
+        } else if (out_token_str == "{2" || out_token_str == "{2}") {
+            out_token_str = time_str;
+        } else if (out_token_str == "{3" || out_token_str == "{3}") {
+            out_token_str = year_str;
+        } else if (out_token_str == "{5" || out_token_str == "{5}") {
+            out_token_str = ymd;
         } else if (out_token_str == "}" && !text_to_speak.empty()) {
-            // Если пришла закрывающая скобка отдельно — проверяем, не была ли это часть {0} или {1}
-            // (это эвристическая защита, если предыдущий токен был "{0" или "{1")
-            // В идеале модель не должна так делать, но на всякий случай фильтруем
             if (text_to_speak.size() >= 2) {
                 std::string last2 = text_to_speak.substr(text_to_speak.size() - 2);
-                if (last2 == "{0" || last2 == "{1") {
-                    // Удаляем последний символ "{" из text_to_speak и не добавляем "}"
+                if (last2 == "{0" || last2 == "{1" || last2 == "{2" || last2 == "{3" || last2 == "{5") {
                     text_to_speak.pop_back();
-                    out_token_str = "";  // Пропускаем этот токен
+                    out_token_str = "";
                 }
             }
         }
@@ -5252,6 +5362,13 @@ char out_token_symbol;
                 pending_count = 0;
             }
         }
+
+        // Убираем лишний пробел в начале первого токена после имени бота
+        static bool first_token_after_bot = true;
+        if (first_token_after_bot && !out_token_str.empty() && out_token_str[0] == ' ') {
+            out_token_str.erase(0, 1);  // убираем первый пробел
+        }
+        first_token_after_bot = false;
 
         // Выводим только очищенный и безопасный токен
         if (should_print && !out_token_str.empty()) {
@@ -5932,11 +6049,14 @@ try
             }                                   // Сбрасываем горячую клавишу
 
             // ===== ПРИГЛАШЕНИЕ ПОСЛЕ ОТВЕТА БОТА =====
-            // ФИЗИЧЕСКИЙ СМЫСЛ: завершаем поток токенов бота, сбрасываем цвет терминала,
-            // добавляем ровно одну пустую строку-разделитель и выводим приглашение для следующего хода.
-            // Это создаёт стабильную визуальную сетку диалога без склеивания реплик.
-            // Завершаем строку бота, даем один пустой отступ и выводим приглашение
-            printf("\033[0m\n\n\033[1m%s%s\033[0m ", params.person.c_str(), chat_symb.c_str());
+            printf("\n");
+#ifdef _WIN32
+            set_console_color(FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+#else
+            printf("\033[32m");
+#endif
+            printf("%s%s ", params.person.c_str(), chat_symb.c_str());
+            reset_console_color();
             fflush(stdout);
         }
     }
