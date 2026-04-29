@@ -3647,9 +3647,8 @@ if (llama_decode(ctx_llama, batch)) {
     // или перевод строки (новый абзац). Спецтокены типа <|eot_id|> обрабатываются
     // отдельно через special_token_ids (остановка по ID).
     std::vector<std::string> antiprompts = {
-        params.person + chat_symb,       // "Друг:" — начало реплики пользователя
-        params.person + " " + chat_symb, // "Друг :" — вариант с пробелом
-        "\n"                             // Перевод строки (универсальный разделитель)
+        "\n" + params.person + chat_symb,       // "\nДруг:" на новой строке
+        "\n" + params.person + " " + chat_symb, // "\nДруг :"
     };
 
     // Пользовательские стоп-слова из --stop-words (если нужны)
@@ -3682,8 +3681,8 @@ if (llama_decode(ctx_llama, batch)) {
     // Обновляет только имя пользователя, остальные стоп-слова остаются.
     auto update_antiprompts = [&](const std::string& new_person, const std::string& /*new_bot_name*/) {
         if (antiprompts.size() >= 2) {
-            antiprompts[0] = new_person + chat_symb;           // "НовыйДруг:"
-            antiprompts[1] = new_person + " " + chat_symb;     // "НовыйДруг :"
+            antiprompts[0] = "\n" + new_person + chat_symb;       // "\nНовыйДруг:"
+            antiprompts[1] = "\n" + new_person + " " + chat_symb; // "\nНовыйДруг :"
         }
     };
 
@@ -5397,6 +5396,7 @@ if (text_len >= 2 && new_tokens >= 5 && !person_name_is_found &&
         text_to_speak[text_len-1] == '.' ||    // Конец предложения
         text_to_speak[text_len-1] == '?' ||    // Вопрос
         text_to_speak[text_len-1] == '!' ||    // Восклицание
+        text_to_speak[text_len-1] == ':' ||    // ← двоеточие перед перечислением
         text_to_speak[text_len-1] == '\n' ||   // Новая строка (разделитель)
 
         // РЕЖИМ ПРИНУДИТЕЛЬНОГО РАЗБИЕНИЯ
@@ -5646,17 +5646,15 @@ try
                 }
 
                 // --------------------------------------------------------
-                // 2. СПЕЦИАЛЬНАЯ ОБРАБОТКА ДЛЯ EOT (хардкод УДАЛЁН!)
-                //    Спецтокены <|eot_id|> и bot_message_suffix уже обработаны
-                //    в Patche 1 через special_token_ids. Здесь они НЕ нужны.
+                // 2. СПЕЦИАЛЬНАЯ ОБРАБОТКА ДЛЯ EOT
+                //    Спецтокены <|eot_id|> и bot_message_suffix уже обработанычерез special_token_ids.
                 // --------------------------------------------------------
-                // (Весь блок is_eot_antiprompt УДАЛЁН)
 
                 // --------------------------------------------------------
                 // 3. ОБРАБОТКА ИМЕНИ ПОЛЬЗОВАТЕЛЯ (Друг:, Друг :)
                 // --------------------------------------------------------
-                bool is_user_name_antiprompt = (antiprompt == params.person + chat_symb ||
-                                                  antiprompt == params.person + " " + chat_symb);
+                bool is_user_name_antiprompt = (antiprompt == "\n" + params.person + chat_symb ||
+                                                antiprompt == "\n" + params.person + " " + chat_symb);
 
                 if (is_user_name_antiprompt)
                 {
@@ -5703,23 +5701,10 @@ try
                 else
                 {
                     // --------------------------------------------------------
-                    // 4. ОБРАБОТКА ОСТАЛЬНЫХ АНТИПРОМПТОВ (\n, --stop-words и т.д.)
+                    // 4. ОБРАБОТКА ОСТАЛЬНЫХ АНТИПРОМПТОВ (пользовательские --stop-words)
+                    //    Примечание: \n больше не является антипромптом, поэтому
+                    //    проверка на списки после \n не требуется.
                     // --------------------------------------------------------
-
-                    // Если это \n — проверяем, не продолжение ли это списка
-                    if (antiprompt == "\n" && !text_to_speak.empty()) {
-                        // Смотрим последние символы вывода: если там ":\n" — это начало перечисления
-                        size_t last_nl = text_to_speak.rfind('\n');
-                        if (last_nl != std::string::npos && last_nl + 1 < text_to_speak.length()) {
-                            char after_nl = text_to_speak[last_nl + 1];
-                            // После \n идёт маркер списка — продолжаем генерацию
-                            if (after_nl == '-' || after_nl == '*' || isdigit(after_nl)) {
-                                i_antiprompt++;
-                                continue;
-                            }
-                        }
-                    }
-
                     antiprompt_matched = true;
                     done = true;
 
