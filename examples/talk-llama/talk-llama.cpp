@@ -1171,24 +1171,24 @@ if (command == "call")
 
     // Общие замены через regex
     if (sanitizedInput.size() >= 2) {
-        static const std::regex re_male_genitive_ogo_ego(R"((.+)([оe]го)$)", std::regex_constants::icase); // Ивана́ его -> Иван
-        static const std::regex re_male_u(R"((.+)у$)", std::regex_constants::icase);        // Ивану -> Иван
-        static const std::regex re_male_a(R"((.+)а$)", std::regex_constants::icase);        // Ивана -> Иван
-        static const std::regex re_male_om(R"((.+)ом$)", std::regex_constants::icase);      // Иваном -> Иван
-        static const std::regex re_male_em(R"((.+)ем$)", std::regex_constants::icase);      // Андреем -> Андрей
-        static const std::regex re_male_yu(R"((.+)ю$)", std::regex_constants::icase);       // Сергею -> Сергей
-        static const std::regex re_male_yem(R"((.+)еем$)", std::regex_constants::icase);    // Дмитрием -> Дмитрий
+        thread_local const std::regex re_male_genitive_ogo_ego(R"((.+)([оe]го)$)", std::regex_constants::icase); // Ивана́ его -> Иван
+        thread_local const std::regex re_male_u(R"((.+)у$)", std::regex_constants::icase);        // Ивану -> Иван
+        thread_local const std::regex re_male_a(R"((.+)а$)", std::regex_constants::icase);        // Ивана -> Иван
+        thread_local const std::regex re_male_om(R"((.+)ом$)", std::regex_constants::icase);      // Иваном -> Иван
+        thread_local const std::regex re_male_em(R"((.+)ем$)", std::regex_constants::icase);      // Андреем -> Андрей
+        thread_local const std::regex re_male_yu(R"((.+)ю$)", std::regex_constants::icase);       // Сергею -> Сергей
+        thread_local const std::regex re_male_yem(R"((.+)еем$)", std::regex_constants::icase);    // Дмитрием -> Дмитрий
 
-        static const std::regex re_female_e(R"((.+)е$)", std::regex_constants::icase);      // Маше -> Маша
-        static const std::regex re_female_oj(R"((.+)ой$)", std::regex_constants::icase);    // Ольгой -> Ольга
-        static const std::regex re_female_y(R"((.+)ы$)", std::regex_constants::icase);      // Эммы -> Эмма
-        static const std::regex re_female_i(R"((.+)и$)", std::regex_constants::icase);      // Маши -> Маша
-        static const std::regex re_female_ej(R"((.+)ей$)", std::regex_constants::icase);    // Наташей -> Наташа
-        static const std::regex re_female_yu(R"((.+)ю$)", std::regex_constants::icase);     // Алёну -> Алёна
+        thread_local const std::regex re_female_e(R"((.+)е$)", std::regex_constants::icase);      // Маше -> Маша
+        thread_local const std::regex re_female_oj(R"((.+)ой$)", std::regex_constants::icase);    // Ольгой -> Ольга
+        thread_local const std::regex re_female_y(R"((.+)ы$)", std::regex_constants::icase);      // Эммы -> Эмма
+        thread_local const std::regex re_female_i(R"((.+)и$)", std::regex_constants::icase);      // Маши -> Маша
+        thread_local const std::regex re_female_ej(R"((.+)ей$)", std::regex_constants::icase);    // Наташей -> Наташа
+        thread_local const std::regex re_female_yu(R"((.+)ю$)", std::regex_constants::icase);     // Алёну -> Алёна
 
         // Новое: имена на -ь (Любовь)
-        static const std::regex re_female_instr_lyubov(R"((.+)ью$)", std::regex_constants::icase);  // Любовью -> Любовь
-        static const std::regex re_female_dat_lyubov(R"((.+)и$)", std::regex_constants::icase);     // Любови -> Любовь
+        thread_local const std::regex re_female_instr_lyubov(R"((.+)ью$)", std::regex_constants::icase);  // Любовью -> Любовь
+        thread_local const std::regex re_female_dat_lyubov(R"((.+)и$)", std::regex_constants::icase);     // Любови -> Любовь
 
         sanitizedInput = std::regex_replace(sanitizedInput, re_male_genitive_ogo_ego, "$1");
         sanitizedInput = std::regex_replace(sanitizedInput, re_male_om, "$1");
@@ -1723,7 +1723,7 @@ std::vector<std::pair<std::string, std::string>> protected_patterns;
 
 // Защита времени: 15:30, 15:30:45
 try {
-    static const std::regex re_time(R"(\b([01]?[0-9]|2[0-3]):([0-5][0-9])(?::([0-5][0-9]))?\b)",
+    thread_local const std::regex re_time(R"(\b([01]?[0-9]|2[0-3]):([0-5][0-9])(?::([0-5][0-9]))?\b)",
                                     std::regex::ECMAScript);
     std::string processed;
     auto words_begin = std::sregex_iterator(text.begin(), text.end(), re_time);
@@ -1746,7 +1746,7 @@ try {
 
 // Защита дат: 31.12.2025
 try {
-    static const std::regex re_date_dots(R"(\b(0[1-9]|[12][0-9]|3[01])\.(0[1-9]|1[0-2])\.(\d{4})\b)",
+    thread_local const std::regex re_date_dots(R"(\b(0[1-9]|[12][0-9]|3[01])\.(0[1-9]|1[0-2])\.(\d{4})\b)",
                                          std::regex::ECMAScript);
     std::string processed;
     auto words_begin = std::sregex_iterator(text.begin(), text.end(), re_date_dots);
@@ -1769,7 +1769,7 @@ try {
 
 // Защита дат: 2025-12-31 (ISO формат)
 try {
-    static const std::regex re_date_iso(R"(\b(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])\b)",
+    thread_local const std::regex re_date_iso(R"(\b(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])\b)",
                                         std::regex::ECMAScript);
     std::string processed;
     auto words_begin = std::sregex_iterator(text.begin(), text.end(), re_date_iso);
@@ -1792,7 +1792,7 @@ try {
 
 // Защита дат: 12/31/2025 (американский формат)
 try {
-    static const std::regex re_date_slash(R"(\b(0[1-9]|1[0-2])/(0[1-9]|[12][0-9]|3[01])/(\d{4})\b)",
+    thread_local const std::regex re_date_slash(R"(\b(0[1-9]|1[0-2])/(0[1-9]|[12][0-9]|3[01])/(\d{4})\b)",
                                           std::regex::ECMAScript);
     std::string processed;
     auto words_begin = std::sregex_iterator(text.begin(), text.end(), re_date_slash);
@@ -1815,7 +1815,7 @@ try {
 
 // Защита десятичных дробей: 3.14, 0.5, 0,5 (русский формат)
 try {
-    static const std::regex re_decimal(R"(\b\d+[.,]\d+\b(?![\w-]))", std::regex::ECMAScript);
+    thread_local const std::regex re_decimal(R"(\b\d+[.,]\d+\b(?![\w-]))", std::regex::ECMAScript);
     std::string processed;
     auto words_begin = std::sregex_iterator(text.begin(), text.end(), re_decimal);
     auto words_end = std::sregex_iterator();
@@ -1837,7 +1837,7 @@ try {
 
 // Защита процентов: 50%, 12.5%, 12,5%
 try {
-    static const std::regex re_percent(R"(\b\d+(?:[.,]\d+)?\s*%)", std::regex::ECMAScript);
+    thread_local const std::regex re_percent(R"(\b\d+(?:[.,]\d+)?\s*%)", std::regex::ECMAScript);
     std::string processed;
     auto words_begin = std::sregex_iterator(text.begin(), text.end(), re_percent);
     auto words_end = std::sregex_iterator();
@@ -1866,7 +1866,7 @@ try {
     // 2. Символ + сумма: $100, €50, £100, $99.99
     // 3. Сумма с разделителями тысяч: 1,000$, 1.000€
     // 4. Сумма с десятичной частью и разделителями: 1,000.50$
-    static const std::regex re_currency(
+    thread_local const std::regex re_currency(
         R"(\b\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?\s*[$€£¥₽]|\b[$€£¥₽]\s*\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)",
         std::regex::ECMAScript);
 
@@ -1897,7 +1897,7 @@ try {
     // 1. Простые дроби: 1/2, 3/4, 5/8
     // 2. Смешанные дроби: 1 1/2, 2 3/4
     // 3. Дроби с пробелами: 1 / 2, 3 / 4
-    static const std::regex re_fraction(
+    thread_local const std::regex re_fraction(
         R"(\b\d+\s*/\s*\d+\b|\b\d+\s+\d+\s*/\s*\d+\b)",
         std::regex::ECMAScript);
 
@@ -1928,7 +1928,7 @@ try {
 
 // Защита телефонов: +7 (123) 456-78-90
 try {
-    static const std::regex re_phone(R"(\+?[\d\s\-\(\)]{7,})", std::regex::ECMAScript);
+    thread_local const std::regex re_phone(R"(\+?[\d\s\-\(\)]{7,})", std::regex::ECMAScript);
     std::string processed;
     auto words_begin = std::sregex_iterator(text.begin(), text.end(), re_phone);
     auto words_end = std::sregex_iterator();
@@ -1950,7 +1950,7 @@ try {
 
 // Защита URL
 try {
-    static const std::regex re_url(R"(https?://[^\s]+)", std::regex::ECMAScript);
+    thread_local const std::regex re_url(R"(https?://[^\s]+)", std::regex::ECMAScript);
     std::string processed;
     auto words_begin = std::sregex_iterator(text.begin(), text.end(), re_url);
     auto words_end = std::sregex_iterator();
@@ -1972,7 +1972,7 @@ try {
 
 // Защита email
 try {
-    static const std::regex re_email(R"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
+    thread_local const std::regex re_email(R"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
                                      std::regex::ECMAScript);
     std::string processed;
     auto words_begin = std::sregex_iterator(text.begin(), text.end(), re_email);
@@ -2000,7 +2000,7 @@ std::vector<std::pair<std::string, std::string>> protected_dots;
 
 try {
     // Сначала защищаем IP-адреса (если вдруг не попали в ЭТАП 0)
-    static const std::regex re_ip(R"(\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b)",
+    thread_local const std::regex re_ip(R"(\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b)",
                                    std::regex::ECMAScript);
 
     std::string processed;
@@ -2162,7 +2162,7 @@ try {
 
 // Унификация переводов строки - просто заменяем на пробел
 try {
-    static const std::regex re_newline(R"(\r\n|\r|\n)", std::regex::ECMAScript);
+    thread_local const std::regex re_newline(R"(\r\n|\r|\n)", std::regex::ECMAScript);
     text = std::regex_replace(text, re_newline, " ");
 } catch (const std::regex_error& e) {
     fprintf(stderr, "Regex error (newline): %s\n", e.what());
@@ -2175,7 +2175,7 @@ if (text.empty()) return;
 
 // Удаление HTML-тегов (питону они не нужны)
 try {
-    static const std::regex re_html_tag(R"(<[^>]*>)", std::regex::ECMAScript);
+    thread_local const std::regex re_html_tag(R"(<[^>]*>)", std::regex::ECMAScript);
     text = std::regex_replace(text, re_html_tag, " ");
 } catch (const std::regex_error& e) {
     fprintf(stderr, "Regex error (HTML): %s\n", e.what());
@@ -2243,25 +2243,25 @@ if (text.empty()) return;
 try {
     // 1. ДВОЙНЫЕ ЗВЁЗДОЧКИ: **смеется** -> смеется,
     {
-        static const std::regex re_double_star(R"(\*\*([^*]+)\*\*)", std::regex::ECMAScript);
+        thread_local const std::regex re_double_star(R"(\*\*([^*]+)\*\*)", std::regex::ECMAScript);
         text = std::regex_replace(text, re_double_star, "$1,＃");
     }
 
     // 2. ОДИНАРНЫЕ ЗВЁЗДОЧКИ: *смеется* -> смеется,
     {
-        static const std::regex re_star(R"(\*([^*]+)\*)", std::regex::ECMAScript);
+        thread_local const std::regex re_star(R"(\*([^*]+)\*)", std::regex::ECMAScript);
         text = std::regex_replace(text, re_star, "$1,＃");
     }
 
     // 3. КРУГЛЫЕ СКОБКИ: (смеется) -> смеется,
     {
-        static const std::regex re_parens(R"(\(([^)]+)\))", std::regex::ECMAScript);
+        thread_local const std::regex re_parens(R"(\(([^)]+)\))", std::regex::ECMAScript);
         text = std::regex_replace(text, re_parens, "$1,＃");
     }
 
     // 4. КВАДРАТНЫЕ СКОБКИ: [смеется] -> смеется,
     {
-        static const std::regex re_brackets(R"(\[([^\]]+)\])", std::regex::ECMAScript);
+        thread_local const std::regex re_brackets(R"(\[([^\]]+)\])", std::regex::ECMAScript);
         text = std::regex_replace(text, re_brackets, "$1,＃");
     }
 
@@ -2275,10 +2275,10 @@ try {
     // 6. Чистка пунктуации (но сохраняем запятые!)
 
       // Убираем двойные запятые (один regex вместо while)
-    static const std::regex re_triple_comma(",,,+", std::regex::ECMAScript);
+    thread_local const std::regex re_triple_comma(",,,+", std::regex::ECMAScript);
     text = std::regex_replace(text, re_triple_comma, ",");
 
-    static const std::regex re_comma_space_comma(", ,", std::regex::ECMAScript);
+    thread_local const std::regex re_comma_space_comma(", ,", std::regex::ECMAScript);
     text = std::regex_replace(text, re_comma_space_comma, ", ");
 
     // Восстанавливаем запятые из защищённых маркеров и нормализуем пунктуацию
@@ -2295,7 +2295,7 @@ try {
     text = std::regex_replace(text, re_comma_space, ", $1");
 
     // Страховка: схлопываем двойные пробелы, если где-то остались
-    static const std::regex re_double_space("  +");
+    thread_local const std::regex re_double_space("  +");
     text = std::regex_replace(text, re_double_space, " ");
 
     // Убираем запятые в начале строки (если эмоция первое слово)
@@ -2308,7 +2308,7 @@ try {
 
     // 7. Нормализация пробелов (схлопываем множественные)
     {
-        static const std::regex re_spaces(R"(\s+)", std::regex::ECMAScript);
+        thread_local const std::regex re_spaces(R"(\s+)", std::regex::ECMAScript);
         text = std::regex_replace(text, re_spaces, " ");
     }
 
@@ -2333,16 +2333,16 @@ try {
 
 try {
     // Код-блоки и инлайн-код — оставляем содержимое
-    static const std::regex re_code_block(R"(```(.*?)```)", std::regex::ECMAScript);
-    static const std::regex re_code_inline(R"(`([^`]*)`)", std::regex::ECMAScript);
+    thread_local const std::regex re_code_block(R"(```(.*?)```)", std::regex::ECMAScript);
+    thread_local const std::regex re_code_inline(R"(`([^`]*)`)", std::regex::ECMAScript);
     text = std::regex_replace(text, re_code_block, "$1");
     text = std::regex_replace(text, re_code_inline, "$1");
 
     // Подчёркивания и зачёркнутый — просто убираем маркеры (без пауз)
     // Звёздочки (** и *) уже обработаны в ЭТАПЕ нормализации эмоций (выше)
-    static const std::regex re_bold2(R"(__([^_]+)__)", std::regex::ECMAScript);
-    static const std::regex re_ital2(R"(_([^_]+)_)", std::regex::ECMAScript);
-    static const std::regex re_del(R"(~~([^~]+)~~)", std::regex::ECMAScript);
+    thread_local const std::regex re_bold2(R"(__([^_]+)__)", std::regex::ECMAScript);
+    thread_local const std::regex re_ital2(R"(_([^_]+)_)", std::regex::ECMAScript);
+    thread_local const std::regex re_del(R"(~~([^~]+)~~)", std::regex::ECMAScript);
 
     text = std::regex_replace(text, re_bold2, "$1");
     text = std::regex_replace(text, re_ital2, "$1");
@@ -2351,8 +2351,8 @@ try {
     // ... дальше заголовки (без изменений) ...
 
     // Удаляем висячие маркеры (только подчёркивания и тильды, звёздочки уже обработаны)
-    static const std::regex re_multi_unders(R"(_{2,})", std::regex::ECMAScript);
-    static const std::regex re_multi_tildes(R"(~{2,})", std::regex::ECMAScript);
+    thread_local const std::regex re_multi_unders(R"(_{2,})", std::regex::ECMAScript);
+    thread_local const std::regex re_multi_tildes(R"(~{2,})", std::regex::ECMAScript);
 
     text = std::regex_replace(text, re_multi_unders, " ");
     text = std::regex_replace(text, re_multi_tildes, " ");
@@ -2371,7 +2371,7 @@ if (text.empty()) return;
 // ЭТАП 3: УДАЛЕНИЕ МАРКЕРОВ СПИСКОВ (ваша логика)
 // ============================================================
 try {
-    static const std::regex re_list_markers(
+    thread_local const std::regex re_list_markers(
         R"(^\s*(\d+[\.\)]|[A-Za-zА-Яа-яЁё][\.\)]|[\-\*\+\>\|#]+)\s*)",
         std::regex::ECMAScript
     );
@@ -2404,7 +2404,7 @@ try {
     // ШАГ 4.2.1: ЗАЩИТА АНГЛИЙСКИХ СОКРАЩЕНИЙ (don't, it's, we'll и т.д.)
     // ============================================================
     std::vector<std::pair<std::string, std::string>> saved_contractions;
-    static const std::regex re_contractions("\\b\\w+'\\w+\\b", std::regex::ECMAScript);
+    thread_local const std::regex re_contractions("\\b\\w+'\\w+\\b", std::regex::ECMAScript);
     std::string protected_text;
     auto words_begin = std::sregex_iterator(text.begin(), text.end(), re_contractions);
     auto words_end = std::sregex_iterator();
@@ -2426,50 +2426,50 @@ try {
     // ============================================================
 
     // Английские двойные кавычки: "text"
-    static const std::regex re_quotes_double("\"([^\"]*)\"", std::regex::ECMAScript);
+    thread_local const std::regex re_quotes_double("\"([^\"]*)\"", std::regex::ECMAScript);
     text = std::regex_replace(text, re_quotes_double, "$1");
 
     // Английские одинарные кавычки: 'text'
-    static const std::regex re_quotes_single("'([^']*)'", std::regex::ECMAScript);
+    thread_local const std::regex re_quotes_single("'([^']*)'", std::regex::ECMAScript);
     text = std::regex_replace(text, re_quotes_single, "$1");
 
     // Русские кавычки-ёлочки: «text» и »text«
-    static const std::regex re_quotes_angle1("«([^»]*)»", std::regex::ECMAScript);
+    thread_local const std::regex re_quotes_angle1("«([^»]*)»", std::regex::ECMAScript);
     text = std::regex_replace(text, re_quotes_angle1, "$1");
 
-    static const std::regex re_quotes_angle2("»([^«]*)«", std::regex::ECMAScript);
+    thread_local const std::regex re_quotes_angle2("»([^«]*)«", std::regex::ECMAScript);
     text = std::regex_replace(text, re_quotes_angle2, "$1");
 
     // Немецкие кавычки: „text“ и ‚text‘
-    static const std::regex re_quotes_german_double("„([^“]*)“", std::regex::ECMAScript);
+    thread_local const std::regex re_quotes_german_double("„([^“]*)“", std::regex::ECMAScript);
     text = std::regex_replace(text, re_quotes_german_double, "$1");
 
-    static const std::regex re_quotes_german_single("‚([^‘]*)‘", std::regex::ECMAScript);
+    thread_local const std::regex re_quotes_german_single("‚([^‘]*)‘", std::regex::ECMAScript);
     text = std::regex_replace(text, re_quotes_german_single, "$1");
 
     // Французские/испанские кавычки: ‹text› и ›text‹
-    static const std::regex re_quotes_french_double("‹([^›]*)›", std::regex::ECMAScript);
+    thread_local const std::regex re_quotes_french_double("‹([^›]*)›", std::regex::ECMAScript);
     text = std::regex_replace(text, re_quotes_french_double, "$1");
 
-    static const std::regex re_quotes_french_single("›([^‹]*)‹", std::regex::ECMAScript);
+    thread_local const std::regex re_quotes_french_single("›([^‹]*)‹", std::regex::ECMAScript);
     text = std::regex_replace(text, re_quotes_french_single, "$1");
 
     // Японские/китайские кавычки: 「text」 и 『text』
-    static const std::regex re_quotes_jp_double("「([^」]*)」", std::regex::ECMAScript);
+    thread_local const std::regex re_quotes_jp_double("「([^」]*)」", std::regex::ECMAScript);
     text = std::regex_replace(text, re_quotes_jp_double, "$1");
 
-    static const std::regex re_quotes_jp_single("『([^』]*)』", std::regex::ECMAScript);
+    thread_local const std::regex re_quotes_jp_single("『([^』]*)』", std::regex::ECMAScript);
     text = std::regex_replace(text, re_quotes_jp_single, "$1");
 
     // Польские кавычки: „text”
-    static const std::regex re_quotes_polish("„([^”]*)”", std::regex::ECMAScript);
+    thread_local const std::regex re_quotes_polish("„([^”]*)”", std::regex::ECMAScript);
     text = std::regex_replace(text, re_quotes_polish, "$1");
 
     // Шведские/финские кавычки: ”text” и ’text’
-    static const std::regex re_quotes_swedish_double("”([^”]*)”", std::regex::ECMAScript);
+    thread_local const std::regex re_quotes_swedish_double("”([^”]*)”", std::regex::ECMAScript);
     text = std::regex_replace(text, re_quotes_swedish_double, "$1");
 
-    static const std::regex re_quotes_swedish_single("’([^’]*)’", std::regex::ECMAScript);
+    thread_local const std::regex re_quotes_swedish_single("’([^’]*)’", std::regex::ECMAScript);
     text = std::regex_replace(text, re_quotes_swedish_single, "$1");
 
     // ============================================================
@@ -2505,7 +2505,7 @@ try {
     }
 
     // Нормализация пробелов
-    static const std::regex re_spaces("\\s+", std::regex::ECMAScript);
+    thread_local const std::regex re_spaces("\\s+", std::regex::ECMAScript);
     text = std::regex_replace(text, re_spaces, " ");
     trim(text);
 
@@ -2518,7 +2518,7 @@ try {
     text = replace(text, "“", "");
     text = replace(text, "‹", "");
     text = replace(text, "›", "");
-    static const std::regex re_spaces_fallback("\\s+", std::regex::ECMAScript);
+    thread_local const std::regex re_spaces_fallback("\\s+", std::regex::ECMAScript);
     text = std::regex_replace(text, re_spaces_fallback, " ");
     trim(text);
 }
@@ -2528,10 +2528,10 @@ try {
 // ============================================================
 try {
     // Паттерн для Markdown ссылок: [текст](url)
-    static const std::regex re_link_md(R"(\[([^\]]*)\]\(([^)\s]+)\))", std::regex::ECMAScript);
+    thread_local const std::regex re_link_md(R"(\[([^\]]*)\]\(([^)\s]+)\))", std::regex::ECMAScript);
 
     // Паттерн для голых URL (без Markdown)
-    static const std::regex re_bare_url(R"(https?://[^\s<>]+|www\.[^\s<>]+)", std::regex::ECMAScript);
+    thread_local const std::regex re_bare_url(R"(https?://[^\s<>]+|www\.[^\s<>]+)", std::regex::ECMAScript);
 
     // ========== ШАГ 1: Обработка Markdown ссылок ==========
     std::string result1;
@@ -2586,7 +2586,7 @@ try {
 // 4.4 ИЗОБРАЖЕНИЯ (оставляем alt-текст с паузой)
 // ============================================================
 try {
-    static const std::regex re_img_md(R"(!\[([^\]]*)\]\([^)]+\))", std::regex::ECMAScript);
+    thread_local const std::regex re_img_md(R"(!\[([^\]]*)\]\([^)]+\))", std::regex::ECMAScript);
     text = std::regex_replace(text, re_img_md, "$1, ");
 } catch (const std::regex_error& e) {
     fprintf(stderr, "Regex error (images): %s\n", e.what());
@@ -2596,7 +2596,7 @@ try {
 // ЭТАП 5: УДАЛЕНИЕ ФИГУРНЫХ СКОБОК (технический мусор)
 // ============================================================
 try {
-    static const std::regex re_curly(R"(\{[^{}]*\})", std::regex::ECMAScript);
+    thread_local const std::regex re_curly(R"(\{[^{}]*\})", std::regex::ECMAScript);
     bool changed = true;
     int max_iterations = 100;  // ← ДОБАВЛЕНО: защита от бесконечного цикла
     int iteration = 0;
@@ -2624,7 +2624,7 @@ if (text.empty()) return;
 // ЭТАП 6: УДАЛЕНИЕ МУСОРНЫХ СИМВОЛОВ
 // ============================================================
 try {
-    static const std::regex re_noise(R"([#\|\\])", std::regex::ECMAScript);
+    thread_local const std::regex re_noise(R"([#\|\\])", std::regex::ECMAScript);
     text = std::regex_replace(text, re_noise, " ");
 } catch (const std::regex_error& e) {
     fprintf(stderr, "Regex error (noise): %s\n", e.what());
@@ -2648,9 +2648,9 @@ text = replace(text, "\"", "");
 
 // Убираем пробелы перед ! ? .
 try {
-    static const std::regex re_space_before_excl(R"(\s+(!))", std::regex::ECMAScript);
-    static const std::regex re_space_before_ques(R"(\s+(\?))", std::regex::ECMAScript);
-    static const std::regex re_space_before_dot(R"(\s+(\.))", std::regex::ECMAScript);
+    thread_local const std::regex re_space_before_excl(R"(\s+(!))", std::regex::ECMAScript);
+    thread_local const std::regex re_space_before_ques(R"(\s+(\?))", std::regex::ECMAScript);
+    thread_local const std::regex re_space_before_dot(R"(\s+(\.))", std::regex::ECMAScript);
     text = std::regex_replace(text, re_space_before_excl, "$1");
     text = std::regex_replace(text, re_space_before_ques, "$1");
     text = std::regex_replace(text, re_space_before_dot, "$1");
@@ -2669,7 +2669,7 @@ try {
 
     // ШАГ 1: Точки с пробелами между ними → убираем пробелы между точками
     // ". . ." → "...", ". ." → "..", " . . . " → "..."
-    static const std::regex re_spaced_dots(R"(\.\s+\.)");  // точка-пробел(ы)-точка
+    thread_local const std::regex re_spaced_dots(R"(\.\s+\.)");  // точка-пробел(ы)-точка
     int dots_max_iterations = 10;  // ← защита от бесконечного цикла
     while (dots_max_iterations-- > 0 && std::regex_search(text, re_spaced_dots)) {
         text = std::regex_replace(text, re_spaced_dots, "..");
@@ -2680,19 +2680,19 @@ try {
 
     // ШАГ 2: Убираем пробелы вокруг групп точек
     // " ... " → "...", "hello ... world" → "hello...world"
-    static const std::regex re_spaces_around_dots(R"(\s*(\.{2,})\s*)");
+    thread_local const std::regex re_spaces_around_dots(R"(\s*(\.{2,})\s*)");
     text = std::regex_replace(text, re_spaces_around_dots, "$1");
 
     // ШАГ 3: Любые 2+ точек подряд → одна точка
-    static const std::regex re_any_dots(R"(\.{2,})");
+    thread_local const std::regex re_any_dots(R"(\.{2,})");
     text = std::regex_replace(text, re_any_dots, ".");
 
     // ШАГ 4: Убираем пробел перед точкой (если остался)
-    static const std::regex re_space_before_dot(R"(\s+\.)");
+    thread_local const std::regex re_space_before_dot(R"(\s+\.)");
     text = std::regex_replace(text, re_space_before_dot, ".");
 
     // ШАГ 5: Страховка — дублирующиеся точки
-    static const std::regex re_double_dots(R"(\.{2,})");
+    thread_local const std::regex re_double_dots(R"(\.{2,})");
     text = std::regex_replace(text, re_double_dots, ".");
 
 } catch (const std::regex_error& e) {
@@ -2712,8 +2712,8 @@ try {
 // ============================================================
 try {
     // Схлопываем только явные повторы
-    static const std::regex re_bangs(R"(!{2,})", std::regex::ECMAScript);
-    static const std::regex re_qmarks(R"(\?{2,})", std::regex::ECMAScript);
+    thread_local const std::regex re_bangs(R"(!{2,})", std::regex::ECMAScript);
+    thread_local const std::regex re_qmarks(R"(\?{2,})", std::regex::ECMAScript);
 
     text = std::regex_replace(text, re_bangs, "!");
     text = std::regex_replace(text, re_qmarks, "?");
@@ -2738,7 +2738,7 @@ if (text.empty()) return;
 // ЭТАП 9: НОРМАЛИЗАЦИЯ ПРОБЕЛОВ (финальная)
 // ============================================================
 try {
-    static const std::regex re_spaces(R"(\s+)", std::regex::ECMAScript);
+    thread_local const std::regex re_spaces(R"(\s+)", std::regex::ECMAScript);
     text = std::regex_replace(text, re_spaces, " ");
 } catch (const std::regex_error& e) {
     fprintf(stderr, "Regex error (spaces): %s\n", e.what());
