@@ -3392,7 +3392,7 @@ if (!params.instruct_preset.empty())
     }
 
     // ============================================================
-    // ПАТЧ №3 (фикс): Разделение Raw/Instruct для начального промпта
+    // Разделение Raw/Instruct для начального промпта
     // Подсказка о роде вставляется ПЕРЕД примерами диалога,
     // а НЕ дописывается в конец (где она ломала структуру)
     // ============================================================
@@ -3400,33 +3400,52 @@ if (!params.instruct_preset.empty())
         // RAW-РЕЖИМ: заменяем плейсхолдеры {0} и {1} здесь
         prompt_llama = ::replace(prompt_llama, "{0}", params.person);
         prompt_llama = ::replace(prompt_llama, "{1}", params.bot_name);
-        // {2}, {3}, {4}, {5} заменяются ниже, после получения времени
 
-        // Грамматическая подсказка — вставляем ПЕРЕД первым примером диалога,
-        // чтобы она была частью системных инструкций, а не репликой пользователя
+        // Грамматическая подсказка (без запретов) — вставляем ТОЛЬКО если
+        // в промпте ещё нет явного указания рода.
         std::string gender_hint;
-        if (params.language == "ru") {
-            if (bot_is_female) {
-                gender_hint = "\n[Ты женщина. Женский род: сделала, сказала, подумала, пошла. Запрещён мужской род.]\n";
+
+        // Проверяем, не содержит ли промпт уже гендерную инструкцию
+        bool already_has_gender = false;
+        {
+            std::string lower_prompt = prompt_llama;
+            std::transform(lower_prompt.begin(), lower_prompt.end(), lower_prompt.begin(), ::tolower);
+            if (params.language == "ru") {
+                if (lower_prompt.find("женский род") != std::string::npos ||
+                    lower_prompt.find("мужской род") != std::string::npos) {
+                    already_has_gender = true;
+                }
             } else {
-                gender_hint = "\n[Ты мужчина. Мужской род: сделал, сказал, подумал, пошёл. Запрещён женский род.]\n";
-            }
-        } else {
-            if (bot_is_female) {
-                gender_hint = "\n[You are female. Use: she did, she said, she thought. Male gender forbidden.]\n";
-            } else {
-                gender_hint = "\n[You are male. Use: he did, he said, he thought. Female gender forbidden.]\n";
+                if (lower_prompt.find("female gender") != std::string::npos ||
+                    lower_prompt.find("male gender") != std::string::npos) {
+                    already_has_gender = true;
+                }
             }
         }
-        // Ищем начало примеров диалога и вставляем подсказку перед ними
-        size_t insert_pos = prompt_llama.find(params.person + chat_symb);
-        if (insert_pos != std::string::npos && insert_pos > 0) {
-            // Отступаем назад, чтобы вставить перед строкой с примером
-            // (ищем начало строки)
-            while (insert_pos > 0 && prompt_llama[insert_pos - 1] != '\n') {
-                insert_pos--;
+
+        if (!already_has_gender) {
+            if (params.language == "ru") {
+                if (bot_is_female) {
+                    gender_hint = "\n[Ты женщина. Говори в женском роде: сделала, сказала, подумала, пошла.]\n";
+                } else {
+                    gender_hint = "\n[Ты мужчина. Говори в мужском роде: сделал, сказал, подумал, пошёл.]\n";
+                }
+            } else {
+                if (bot_is_female) {
+                    gender_hint = "\n[You are female. Use: she did, she said, she thought.]\n";
+                } else {
+                    gender_hint = "\n[You are male. Use: he did, he said, he thought.]\n";
+                }
             }
-            prompt_llama.insert(insert_pos, gender_hint);
+
+            // Вставляем перед первым примером диалога
+            size_t insert_pos = prompt_llama.find(params.person + chat_symb);
+            if (insert_pos != std::string::npos && insert_pos > 0) {
+                while (insert_pos > 0 && prompt_llama[insert_pos - 1] != '\n') {
+                    insert_pos--;
+                }
+                prompt_llama.insert(insert_pos, gender_hint);
+            }
         }
     }
     // INSTRUCT-РЕЖИМ: промпт из файла уже в ChatML-формате с именами,
@@ -3761,11 +3780,12 @@ if (llama_decode(ctx_llama, batch)) {
     // Останавливаем генерацию, когда модель сгенерировала начало реплики пользователя
     // или перевод строки (новый абзац). Спецтокены типа <|eot_id|> обрабатываются
     // отдельно через special_token_ids (остановка по ID).
-    std::vector<std::string> antiprompts = {
-        "\n",                                    // <-- ДОБАВЛЕНО: стоп по переводу строки
-        "\n" + params.person + chat_symb,       // "\nДруг:" на новой строке
-        "\n" + params.person + " " + chat_symb, // "\nДруг :"
-    };
+    std::vector<std::string> antiprompts;
+    if (!params.allow_newline) {
+        antiprompts.push_back("\n");               // стоп-слово только если новые строки запрещены
+    }
+    antiprompts.push_back("\n" + params.person + chat_symb);       // "\nДруг:"
+    antiprompts.push_back("\n" + params.person + " " + chat_symb); // "\nДруг :"
 
     // Пользовательские стоп-слова из --stop-words (если нужны)
     if (!params.stop_words.empty()) {
@@ -3792,33 +3812,30 @@ if (llama_decode(ctx_llama, batch)) {
         }
     }
 
-     // === ФУНКЦИЯ ДЛЯ ОБНОВЛЕНИЯ АНТИПРОМПТОВ ПРИ СМЕНЕ БОТА ===
+    // === ФУНКЦИЯ ДЛЯ ОБНОВЛЕНИЯ АНТИПРОМПТОВ ПРИ СМЕНЕ БОТА ===
     // Вызывается при команде "call" в режиме --multi-chars.
     // Обновляет имя пользователя И добавляет стоп-слова для старого/нового бота.
     auto update_antiprompts = [&](const std::string& new_person, const std::string& new_bot_name) {
-        // 1. Обновляем антипромпты для имени пользователя (Друг:)
-        if (antiprompts.size() >= 2) {
-            antiprompts[0] = "\n" + new_person + chat_symb;       // "\nНовыйДруг:"
-            antiprompts[1] = "\n" + new_person + " " + chat_symb; // "\nНовыйДруг :"
+        // 1. Обновляем антипромпты для имени пользователя
+        //    Индексы зависят от того, есть ли начальный "\n" в antiprompts.
+        size_t user_offset = (!antiprompts.empty() && antiprompts[0] == "\n") ? 1 : 0;
+
+        if (antiprompts.size() >= user_offset + 2) {
+            antiprompts[user_offset]     = "\n" + new_person + chat_symb;       // "\nНовыйДруг:"
+            antiprompts[user_offset + 1] = "\n" + new_person + " " + chat_symb; // "\nНовыйДруг :"
         }
 
         // 2. Добавляем антипромпты для старого имени бота (чтобы модель не продолжала его речь)
         //    Это предотвращает ситуацию, когда модель говорит и от старого, и от нового бота.
-        static std::vector<std::string> old_bot_antiprompts;
-
-        // Сохраняем старые антипромпты бота (если они есть) в отдельный вектор
-        // Они будут работать как стоп-слова, но не будут мешать новому боту.
         std::string old_bot_pattern1 = "\n" + params.bot_name + chat_symb;
         std::string old_bot_pattern2 = "\n" + params.bot_name + " " + chat_symb;
 
-        // Проверяем, не добавлены ли уже
         bool found1 = false, found2 = false;
         for (const auto& ap : antiprompts) {
             if (ap == old_bot_pattern1) found1 = true;
             if (ap == old_bot_pattern2) found2 = true;
         }
 
-        // Добавляем старые паттерны бота в антипромпты (как стоп-слова)
         if (!found1 && !old_bot_pattern1.empty() && old_bot_pattern1 != "\n" + new_person + chat_symb) {
             antiprompts.push_back(old_bot_pattern1);
         }
@@ -3826,8 +3843,7 @@ if (llama_decode(ctx_llama, batch)) {
             antiprompts.push_back(old_bot_pattern2);
         }
 
-        // 3. Опционально: добавляем стоп-последовательность из JSON-пресета (например <|eot_id|>)
-        //    Она уже есть в special_token_ids, но на всякий случай продублируем в антипромпты
+        // 3. Опционально: добавляем стоп-последовательность из JSON-пресета
         if (!params.instruct_preset_data["stop_sequence"].empty()) {
             std::string stop_seq = params.instruct_preset_data["stop_sequence"];
             bool stop_seq_found = false;
@@ -3839,7 +3855,6 @@ if (llama_decode(ctx_llama, batch)) {
             }
         }
 
-        // Отладочный вывод (если включён verbose)
         if (params.verbose) {
             printf("\n[DEBUG] Antiprompts updated. New bot: '%s'. Total antiprompts: %zu\n",
                    new_bot_name.c_str(), antiprompts.size());
@@ -4984,8 +4999,19 @@ std::string resp = send_curl(url);
     // =================================================================
     bool done = false;
     std::string text_to_speak;
+    std::string full_response_text;   // полный текст ответа для Regenerate
     int new_tokens = 0;
     bool first_token_after_bot = true;  // ← СБРАСЫВАЕМ ФЛАГ ПЕРЕД КАЖДОЙ НОВОЙ ГЕНЕРАЦИЕЙ
+
+    // СБРОС СТАТИЧЕСКИХ ПЕРЕМЕННЫХ перед новой генерацией
+    {
+        static std::string pending_fragment;
+        static int pending_count;
+        static bool first_token_after_bot_static;
+        pending_fragment = "";
+        pending_count = 0;
+        first_token_after_bot_static = true;
+    }
 
     while (true) {
         // =============================================================
@@ -5392,6 +5418,7 @@ char out_token_symbol;
         static std::string pending_fragment = "";
         static int pending_count = 0;
         static const int MAX_PENDING = 8;
+        // (переменные статические, но сбрасываются перед каждым новым диалогом)
 
         // Шаг 3d: Определяем, похож ли токен на фрагмент спецтокена
         bool looks_like_special = false;
@@ -5438,13 +5465,14 @@ char out_token_symbol;
                 pending_count = 0;
             }
         }
-
         // Убираем лишний пробел в начале первого токена после имени бота
-        static bool first_token_after_bot = true;
-        if (first_token_after_bot && !out_token_str.empty() && out_token_str[0] == ' ') {
-            out_token_str.erase(0, 1);  // убираем первый пробел
+        {
+            static bool first_token_after_bot_static = true;
+            if (first_token_after_bot_static && !out_token_str.empty() && out_token_str[0] == ' ') {
+                out_token_str.erase(0, 1);  // убираем первый пробел
+            }
+            first_token_after_bot_static = false;
         }
-        first_token_after_bot = false;
 
         // Выводим только очищенный и безопасный токен
         if (should_print && !out_token_str.empty()) {
@@ -5697,6 +5725,11 @@ if (text_len >= 2 && new_tokens >= 5 && !person_name_is_found &&
 
 try
     {
+        // Накапливаем полный ответ перед очисткой
+        if (!text_to_speak.empty()) {
+            full_response_text += text_to_speak;
+        }
+
         // Захватываем ВСЁ по значению — безопасно с мьютексом
         std::string voice_copy = current_voice;  // <-- КОПИЯ
         safe_thread_emplace(threads, [text_to_speak, voice_copy, params]() {
@@ -6059,15 +6092,20 @@ try
             text_to_speak = ::replace(text_to_speak, "|>", "");
             trim(text_to_speak);
 
-            if (text_to_speak.size())  // Если есть текст для озвучки
+            // Добавляем остаток в полный ответ
+            if (!text_to_speak.empty()) {
+                full_response_text += text_to_speak;
+            }
+
+            // Сохраняем ПОЛНЫЙ текст ответа для Regenerate
+            {
+                std::lock_guard<std::mutex> lock(g_last_tts_mutex);
+                g_last_tts_text = full_response_text;
+            }
+
+            if (!text_to_speak.empty())  // Если есть текст для озвучки
             {
                 std::string text_to_speak_final = text_to_speak; // Создаём локальную копию
-
-                // Сохраняем последний отправленный текст для функционала Regenerate
-                {
-                    std::lock_guard<std::mutex> lock(g_last_tts_mutex);
-                    g_last_tts_text = text_to_speak_final;
-                }
 
                 try {
                     std::string voice_copy = current_voice;
@@ -6145,7 +6183,7 @@ try
            {                                    // Сброс под защитой мьютекса
                 std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
                 g_hotkey_pressed = "";
-            }                                   // Сбрасываем горячую клавишу
+            }         // Сбрасываем горячую клавишу
 
             // ===== ПРИГЛАШЕНИЕ ПОСЛЕ ОТВЕТА БОТА =====
             printf("\n");
