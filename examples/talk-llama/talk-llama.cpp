@@ -251,12 +251,12 @@ struct whisper_params {
     int32_t interrupt_threshold_ms = 250;   // Сколько мс речи нужно для прерывания
 	std::string person      = "Друг";
     std::string bot_name    = "Эмма";
-    std::string xtts_voice  = "Emma";
+    std::string xtts_voice  = "Эмма";
     std::string wake_cmd    = "";      // Команда пробуждения (например "Эмма,")
     std::string heard_ok    = "";
     std::string language    = "ru";
     std::string model_wsp   = "whisper-ggml-medium-q4_0.bin";
-    std::string model_llama = "saiga_yandexgpt_8b_Q4_K_S.gguf";
+    std::string model_llama = "saiga_yandexgpt_8b_Q5_K.gguf";
     std::string speak       = "speak";
 	std::string speak_file  = "to_speak.txt"; // not used
     std::string xtts_control_path = "xtts_play_allowed.txt";
@@ -1706,7 +1706,7 @@ std::string url_to_speech(const std::string& url) {
 // ВСЕ регулярные выражения компилируются ОДИН РАЗ при первом вызове функции.
 // Использует оптимизированные regex и безопасную обработку UTF-8.
 void send_tts_async(std::string text,
-                    std::string speaker_wav = "Emma",
+                    std::string speaker_wav = "Эмма",
                     std::string language = "ru",
                     std::string tts_url = "http://localhost:8020/") {
 
@@ -2710,7 +2710,61 @@ try {
 // ============================================================
 // ЭТАП 8: МИНИМАЛЬНАЯ НОРМАЛИЗАЦИЯ ПУНКТУАЦИИ
 // ============================================================
+try {// ============================================================
+// ЭТАП 7.1: НОРМАЛИЗАЦИЯ МНОГОТОЧИЙ (УЛУЧШЕННАЯ) -> ОДНА ТОЧКА
+// ============================================================
+// Цель: превратить любые многоточия ("...", "…", ". . ." и т.д.)
+// в одну точку, не трогая одиночные точки-разделители предложений.
 try {
+    // Шаг 1: Unicode-многоточие "…" (U+2026) -> обычная точка "."
+    text = std::regex_replace(text, std::regex("\xE2\x80\xA6"), ".");
+
+    // Шаг 2: Последовательности из 2+ точек с любыми пробелами между ними -> одна точка.
+    // Примеры: "...", "..", ". . .", ".  .", " . . . ", "…" (уже точка) и т.п.
+    // НЕ затрагивает одиночную точку в "конец предложения.   Начало".
+    thread_local const std::regex re_dot_seq(R"((\.\s*){2,})");
+    text = std::regex_replace(text, re_dot_seq, ".");
+
+    // Шаг 3: Убрать пробел перед точкой, если он остался (" ." -> ".")
+    thread_local const std::regex re_space_dot(R"(\s+\.)");
+    text = std::regex_replace(text, re_space_dot, ".");
+
+    // Шаг 4: Убрать точку, которая идёт сразу после ! или ?
+    // (например "?!." -> "?!", "!." -> "!")
+    thread_local const std::regex re_punct_dot(R"(([?!])\.)");
+    text = std::regex_replace(text, re_punct_dot, "$1");
+
+    // Шаг 5: Страховка — любые оставшиеся 2+ точек -> одна точка
+    thread_local const std::regex re_any_dots(R"(\.{2,})");
+    text = std::regex_replace(text, re_any_dots, ".");
+
+} catch (const std::regex_error& e) {
+    // Fallback на случай проблем с регулярками (минимальная очистка)
+    text = replace(text, "\xE2\x80\xA6", ".");
+    text = replace(text, ". . .", ".");
+    text = replace(text, ". .", ".");
+    text = replace(text, "...", ".");
+    text = replace(text, "..", ".");
+    text = replace(text, " .", ".");
+    text = replace(text, "?.", "?");
+    text = replace(text, "!.", "!");
+}
+
+// ============================================================
+// ЭТАП 7.2: ФИНАЛЬНАЯ ЧИСТКА ЗНАКОВ ПРЕПИНАНИЯ (дублирующиеся ! и ?)
+// ============================================================
+try {
+    // Схлопываем повторы: !! -> !, ??? -> ?
+    thread_local const std::regex re_bangs(R"(!{2,})");
+    thread_local const std::regex re_qmarks(R"(\?{2,})");
+    text = std::regex_replace(text, re_bangs, "!");
+    text = std::regex_replace(text, re_qmarks, "?");
+
+} catch (const std::regex_error& e) {
+    // Ручной fallback
+    text = replace(text, "!!", "!");
+    text = replace(text, "???", "?");
+}
     // Схлопываем только явные повторы
     thread_local const std::regex re_bangs(R"(!{2,})", std::regex::ECMAScript);
     thread_local const std::regex re_qmarks(R"(\?{2,})", std::regex::ECMAScript);
@@ -3362,97 +3416,13 @@ if (!params.instruct_preset.empty())
         {
             params.instruct_preset = "";
         }
+
     //Нужен начальный пробел ' '
     prompt_llama.insert(0, 1, ' ');
 
-    // Определяем пол бота для правильного склонения в ответах
-    bool bot_is_female = false;
-    std::string bot_lower = params.bot_name;
-    std::transform(bot_lower.begin(), bot_lower.end(), bot_lower.begin(), ::tolower);
-
-    if (bot_lower.length() >= 1) {
-        char last_char = bot_lower.back();
-        // Женские окончания: -а, -я, -ь
-        if (last_char == 'а' || last_char == 'я' || last_char == 'ь') {
-            bot_is_female = true;
-        }
-        // Женское окончание: -ия
-        else if (bot_lower.length() >= 2 && bot_lower.substr(bot_lower.length() - 2) == "ия") {
-            bot_is_female = true;
-        }
-        // Исключения: мужские имена на -а/-я
-        if (bot_is_female) {
-            static const std::unordered_set<std::string> male_exceptions = {
-                "никита", "илья", "фома", "лука", "кузьма", "добрыня"
-            };
-            if (male_exceptions.find(bot_lower) != male_exceptions.end()) {
-                bot_is_female = false;
-            }
-        }
-    }
-
     // ============================================================
-    // Разделение Raw/Instruct для начального промпта
-    // Подсказка о роде вставляется ПЕРЕД примерами диалога,
-    // а НЕ дописывается в конец (где она ломала структуру)
-    // ============================================================
-    if (params.instruct_preset.empty()) {
-        // RAW-РЕЖИМ: заменяем плейсхолдеры {0} и {1} здесь
-        prompt_llama = ::replace(prompt_llama, "{0}", params.person);
-        prompt_llama = ::replace(prompt_llama, "{1}", params.bot_name);
-
-        // Грамматическая подсказка (без запретов) — вставляем ТОЛЬКО если
-        // в промпте ещё нет явного указания рода.
-        std::string gender_hint;
-
-        // Проверяем, не содержит ли промпт уже гендерную инструкцию
-        bool already_has_gender = false;
-        {
-            std::string lower_prompt = prompt_llama;
-            std::transform(lower_prompt.begin(), lower_prompt.end(), lower_prompt.begin(), ::tolower);
-            if (params.language == "ru") {
-                if (lower_prompt.find("женский род") != std::string::npos ||
-                    lower_prompt.find("мужской род") != std::string::npos) {
-                    already_has_gender = true;
-                }
-            } else {
-                if (lower_prompt.find("female gender") != std::string::npos ||
-                    lower_prompt.find("male gender") != std::string::npos) {
-                    already_has_gender = true;
-                }
-            }
-        }
-
-        if (!already_has_gender) {
-            if (params.language == "ru") {
-                if (bot_is_female) {
-                    gender_hint = "\n[Ты женщина. Говори в женском роде: сделала, сказала, подумала, пошла.]\n";
-                } else {
-                    gender_hint = "\n[Ты мужчина. Говори в мужском роде: сделал, сказал, подумал, пошёл.]\n";
-                }
-            } else {
-                if (bot_is_female) {
-                    gender_hint = "\n[You are female. Use: she did, she said, she thought.]\n";
-                } else {
-                    gender_hint = "\n[You are male. Use: he did, he said, he thought.]\n";
-                }
-            }
-
-            // Вставляем перед первым примером диалога
-            size_t insert_pos = prompt_llama.find(params.person + chat_symb);
-            if (insert_pos != std::string::npos && insert_pos > 0) {
-                while (insert_pos > 0 && prompt_llama[insert_pos - 1] != '\n') {
-                    insert_pos--;
-                }
-                prompt_llama.insert(insert_pos, gender_hint);
-            }
-        }
-    }
-    // INSTRUCT-РЕЖИМ: промпт из файла уже в ChatML-формате с именами,
-    // грамматический род не добавляем — модель знает пол из контекста
-    // ============================================================
-
     // ВЫНОСИМ ОБЪЯВЛЕНИЕ ПЕРЕМЕННЫХ НАРУЖУ (будут видны в цикле генерации)
+    // ============================================================
     std::string time_str, year_str, ymd;
 
     // Получаем текущее время и дату
@@ -3488,19 +3458,34 @@ if (!params.instruct_preset.empty())
     }
 
     // ============================================================
-    // ПАТЧ №1 (продолжение): замена {2}{3}{4}{5} здесь, где переменные уже доступны
+    // Замена всех плейсхолдеров — ДО обработки instruct-пресета
     // ============================================================
-    if (params.instruct_preset.empty()) {
-        prompt_llama = ::replace(prompt_llama, "{2}", time_str);
-        prompt_llama = ::replace(prompt_llama, "{3}", year_str);
-        prompt_llama = ::replace(prompt_llama, "{4}", chat_symb);
-        prompt_llama = ::replace(prompt_llama, "{5}", ymd);
+    prompt_llama = ::replace(prompt_llama, "{0}", params.person);
+    prompt_llama = ::replace(prompt_llama, "{1}", params.bot_name);
+    prompt_llama = ::replace(prompt_llama, "{2}", time_str);
+    prompt_llama = ::replace(prompt_llama, "{3}", year_str);
+    prompt_llama = ::replace(prompt_llama, "{4}", chat_symb);
+    prompt_llama = ::replace(prompt_llama, "{5}", ymd);
+
+    // Добавляем информацию о поле пользователя
+    if (params.language == "ru") {
+        if (user_is_female) {
+            prompt_llama += "\n[" + params.person + " — женщина. О себе говорит: сделала, сказала, пошла.]\n";
+        } else {
+            prompt_llama += "\n[" + params.person + " — мужчина. О себе говорит: сделал, сказал, пошёл.]\n";
+        }
+    } else {
+        if (user_is_female) {
+            prompt_llama += "\n[" + params.person + " is female. She says: she did, she said, she went.]\n";
+        } else {
+            prompt_llama += "\n[" + params.person + " is male. He says: he did, he said, he went.]\n";
+        }
     }
-    // В Instruct-режиме дата/время уже вписаны в промпт-файл статично
     // ============================================================
 
 
     // llama_batch batch = llama_batch_init(2048, 0, 1); // <-- ВСЕГДА ИНИЦИАЛИЗИРУЕМ С n_tokens=0!
+
     llama_batch batch = llama_batch_init(params.ctx_size, 0, 1);
 
     fprintf(stdout, "llama_n_ctx %d", llama_n_ctx(ctx_llama));
@@ -3774,7 +3759,7 @@ if (llama_decode(ctx_llama, batch)) {
     std::uniform_int_distribution<size_t> dist;
 
 	int last_command_time = 0;
-	std::string current_voice = params.xtts_voice;
+    std::string current_voice = params.xtts_voice.empty() ? params.bot_name : params.xtts_voice;
 
     // === АНТИПРОМПТЫ (только для смены говорящего) ===
     // Останавливаем генерацию, когда модель сгенерировала начало реплики пользователя
@@ -4669,7 +4654,7 @@ else if (user_command == "reset")
                 text_heard = "";
                 text_heard_trimmed = "";
 
-                send_tts_async("Reset whole context", params.xtts_voice, params.language, params.xtts_url);
+                send_tts_async("Reset whole context", current_voice, params.language, params.xtts_url);
 
                 new_command_allowed = 0;
                 last_command_time = std::time(0);
@@ -4943,13 +4928,13 @@ std::string resp = send_curl(url);
         text_heard_with_instruct.insert(0, 1, ' ');
         } else {
         // Стандартное начало реплики пользователя в контексте модели
-            text_heard.insert(0, params.person + chat_symb + " ");
+            text_heard.insert(0, "\n" + params.person + chat_symb + " ");
         text_heard_with_instruct.insert(0, params.instruct_preset_data["user_message_prefix"] + "\n" + params.person + chat_symb + " ");
         }
 
     // ===== ФОРМАТИРОВАНИЕ ОТВЕТА БОТА =====
-        text_heard += "\n\n" + params.bot_name + chat_symb;
-    text_heard_with_instruct += params.instruct_preset_data["user_message_suffix"] + "\n" + params.instruct_preset_data["bot_message_prefix"] + "\n" + params.bot_name + chat_symb;
+        text_heard += params.bot_name + chat_symb;
+    text_heard_with_instruct += params.instruct_preset_data["user_message_suffix"] + params.instruct_preset_data["bot_message_prefix"] + "\n" + params.bot_name + chat_symb;
 
     // ===== ВЫВОД В КОНСОЛЬ =====
     // Перезаписываем строку ожидания и выводим реплику пользователя
@@ -5381,23 +5366,24 @@ char out_token_symbol;
         }
 
         // ============================================================
-        // 3. УМНАЯ ФИЛЬТРАЦИЯ СПЕЦТОКЕНОВ (без хардкода строк)
+        // 3. УМНАЯ ФИЛЬТРАЦИЯ СПЕЦТОКЕНОВ (полностью переработанная)
         // ============================================================
-        // Проблема: старый код хардкодил "<|", "|>", "<|eot" и пропускал
-        // разбитые BPE-субтокены спецтокенов.
+        // Проблема: BPE-токенизатор разбивает спецтокены типа <|start_header_id|>
+        // на множество мелких токенов: "<", "|", "start", "_", "header", ...
+        // Старая логика накапливала их в pending_fragment, но при превышении
+        // MAX_PENDING (8 токенов) вываливала в консоль как обычный текст.
         //
-        // Решение:
-        // a) Проверяем ID токена по списку special_token_ids (собран из
-        //    JSON-пресета, --stop-words и базовых EOT-маркеров).
-        // b) Если токен совпал — подавляем его и сбрасываем накопительный буфер.
-        // c) Если токен НЕ совпал, но содержит '<' или '|' — накапливаем
-        //    в буфере (ждём полный спецтокен).
-        // d) Обычный токен сначала "выталкивает" буфер, потом выводится сам.
-        // e) Если накопилось > MAX_PENDING подозрительных токенов — выводим
-        //    принудительно (это не спецтокен, а обычный текст).
+        // Новое решение:
+        // 1. Проверяем ID токена по списку special_token_ids (стоп-токены).
+        // 2. Токены с '<' или '|' накапливаем в буфер.
+        // 3. Как только в буфере образовался полный паттерн <|...|> —
+        //    молча хороним ВЕСЬ буфер (это был спецтокен).
+        // 4. Если накопилось > MAX_PENDING и нет полного паттерна —
+        //    это обычный текст с угловыми скобками, выводим как есть.
+        // 5. Обычные токены выводим сразу, предварительно вытолкнув буфер.
         // ============================================================
 
-        // Шаг 3a: Проверяем ID токена по заранее собранному списку
+        // Шаг 3a: Проверяем ID токена по заранее собранному списку стоп-токенов
         bool is_special_id = false;
         for (int si = 0; si < special_token_count; si++) {
             if (id == special_token_ids[si]) {
@@ -5417,8 +5403,7 @@ char out_token_symbol;
         // Шаг 3c: Буфер для накопления подозрительных фрагментов
         static std::string pending_fragment = "";
         static int pending_count = 0;
-        static const int MAX_PENDING = 8;
-        // (переменные статические, но сбрасываются перед каждым новым диалогом)
+        static const int MAX_PENDING = 20;  // Увеличено, т.к. спецтокены могут быть длинными
 
         // Шаг 3d: Определяем, похож ли токен на фрагмент спецтокена
         bool looks_like_special = false;
@@ -5434,7 +5419,7 @@ char out_token_symbol;
         bool should_print = true;
 
         if (is_special_id) {
-            // Токен гарантированно специальный — подавляем и очищаем буфер
+            // Токен гарантированно стоп-токен — подавляем и очищаем буфер
             should_print = false;
             pending_fragment = "";
             pending_count = 0;
@@ -5443,19 +5428,34 @@ char out_token_symbol;
             pending_fragment += out_token_str;
             pending_count++;
 
-            if (pending_count >= MAX_PENDING) {
-                // Слишком много фрагментов — это обычный текст
+            // ===== КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: проверяем, не собрался ли целый спецтокен =====
+            // Если в буфере уже есть и открывающий "<|", и закрывающий "|>",
+            // значит мы накопили полный спецтокен — выбрасываем его молча.
+            bool has_open = (pending_fragment.find("<|") != std::string::npos);
+            bool has_close = (pending_fragment.find("|>") != std::string::npos);
+
+            if (has_open && has_close) {
+                // Это полный спецтокен — тихо хороним
+                pending_fragment = "";
+                pending_count = 0;
+                should_print = false;
+            }
+            // ===== КОНЕЦ КЛЮЧЕВОГО ИСПРАВЛЕНИЯ =====
+            else if (pending_count >= MAX_PENDING) {
+                // Слишком много фрагментов, а полного спецтокена нет —
+                // это обычный текст с угловыми скобками, выводим
                 printf("%s", pending_fragment.c_str());
                 fflush(stdout);
                 text_to_speak += pending_fragment;
                 tokens_in_reply += utf8_length(pending_fragment);
                 pending_fragment = "";
                 pending_count = 0;
+                should_print = true;  // чтобы текущий токен тоже вывелся ниже
             } else {
                 should_print = false;
             }
         } else {
-            // Обычный токен — выводим накопленный буфер, если есть
+            // Обычный токен — сначала выталкиваем накопленный буфер, если есть
             if (!pending_fragment.empty()) {
                 printf("%s", pending_fragment.c_str());
                 fflush(stdout);
@@ -5465,6 +5465,7 @@ char out_token_symbol;
                 pending_count = 0;
             }
         }
+
         // Убираем лишний пробел в начале первого токена после имени бота
         {
             static bool first_token_after_bot_static = true;
@@ -5477,21 +5478,31 @@ char out_token_symbol;
         // Выводим только очищенный и безопасный токен
         if (should_print && !out_token_str.empty()) {
             // Очистка спецтокенов для вывода на экран
+            // Используем регулярку для удаления ЛЮБЫХ паттернов <|...|>
             std::string display_str = out_token_str;
-            display_str = ::replace(display_str, "<|start_header_id|>", "");
-            display_str = ::replace(display_str, "<|end_header_id|>", "");
-            display_str = ::replace(display_str, "<|eot_id|>", "");
-            display_str = ::replace(display_str, "<|im_start|>", "");
-            display_str = ::replace(display_str, "<|im_end|>", "");
-            display_str = ::replace(display_str, "assistant", "");
-            display_str = ::replace(display_str, "system", "");
-            display_str = ::replace(display_str, "user", "");
+            try {
+                // Удаляем всё, что похоже на <|что-угодно|>
+                display_str = std::regex_replace(display_str, std::regex(R"(<\|[^>]*\|>)"), "");
+                // Удаляем одиночные роли (могут остаться после очистки тегов)
+                display_str = std::regex_replace(display_str, std::regex(R"(\b(assistant|system|user|end_header_id|eot_id|start_header_id)\b)"), "");
+            } catch (const std::regex_error&) {
+                // Fallback: ручная очистка, если регулярка не сработала
+                display_str = ::replace(display_str, "<|start_header_id|>", "");
+                display_str = ::replace(display_str, "<|end_header_id|>", "");
+                display_str = ::replace(display_str, "<|eot_id|>", "");
+                display_str = ::replace(display_str, "<|im_start|>", "");
+                display_str = ::replace(display_str, "<|im_end|>", "");
+                display_str = ::replace(display_str, "assistant", "");
+                display_str = ::replace(display_str, "system", "");
+                display_str = ::replace(display_str, "user", "");
+            }
 
             if (!display_str.empty()) {
                 printf("%s", display_str.c_str());
                 fflush(stdout);
             }
-            text_to_speak += out_token_str;  // В TTS идёт исходная строка (очистится позже)
+            // В TTS идёт исходная строка — она очистится в send_tts_async()
+            text_to_speak += out_token_str;
         }
 
         if (should_print) {
@@ -5573,9 +5584,11 @@ char out_token_symbol;
         int text_len = text_to_speak.size();
 
         if (text_len > 0 && text_to_speak[text_len-1] == ',') n_comas++;
+        // Пропускаем разбиение на апострофе, не ломая счётчик split_after
         if (text_len > 0 && new_tokens == split_after && params.split_after && text_to_speak[text_len-1] == '\'')
-
-        split_after++;
+        {
+            // Ничего не делаем — просто не отправляем в TTS на этом токене
+        }
         // Не разбиваем по Mr.
         if (text_to_speak.size() >= 3 && text_to_speak.substr(text_to_speak.size()-3, 3) == "Mr.")
             text_to_speak[text_len-1] = ' ';
@@ -6079,7 +6092,11 @@ try
 // Она теперь выполняется только в главном цикле программы
 // для максимальной скорости генерации токенов
 }
-            // Финальная часть предложения, если осталась
+            // ========== ФИНАЛЬНАЯ ОБРАБОТКА ОСТАВШЕГОСЯ ТЕКСТА (ИСПРАВЛЕНО) ==========
+            // Проблема: раньше остаток text_to_speak отправлялся только если не пуст,
+            // но сохранение в full_response_text и g_last_tts_text происходило
+            // в разных условиях. Теперь логика едина.
+
             // Очистка от спецтокенов перед TTS
             text_to_speak = ::replace(text_to_speak, "<|eot_id|>", "");
             text_to_speak = ::replace(text_to_speak, "<|start_header_id|>", "");
@@ -6092,21 +6109,18 @@ try
             text_to_speak = ::replace(text_to_speak, "|>", "");
             trim(text_to_speak);
 
-            // Добавляем остаток в полный ответ
             if (!text_to_speak.empty()) {
+                // 1. Добавляем остаток в полный ответ
                 full_response_text += text_to_speak;
-            }
 
-            // Сохраняем ПОЛНЫЙ текст ответа для Regenerate
-            {
-                std::lock_guard<std::mutex> lock(g_last_tts_mutex);
-                g_last_tts_text = full_response_text;
-            }
+                // 2. Сохраняем ПОЛНЫЙ текст ответа для команды Regenerate
+                {
+                    std::lock_guard<std::mutex> lock(g_last_tts_mutex);
+                    g_last_tts_text = full_response_text;
+                }
 
-            if (!text_to_speak.empty())  // Если есть текст для озвучки
-            {
-                std::string text_to_speak_final = text_to_speak; // Создаём локальную копию
-
+                // 3. Отправляем остаток в TTS
+                std::string text_to_speak_final = text_to_speak;
                 try {
                     std::string voice_copy = current_voice;
                     std::string lang_copy = params.language;
@@ -6114,14 +6128,21 @@ try
                     safe_thread_emplace(threads, [text_to_speak_final, voice_copy, lang_copy, url_copy]() {
                         send_tts_async(text_to_speak_final, voice_copy, lang_copy, url_copy);
                     });
-
-                    text_to_speak = ""; // Очищаем оригинальную переменную
-                }
-
-                catch (const std::exception& ex) {
+                    text_to_speak = ""; // Очищаем после отправки
+                } catch (const std::exception& ex) {
                     std::cerr << "[Exception]: Failed to send final TTS: " << ex.what() << '\n';
                 }
+            } else {
+                // Если остатка нет (всё уже отправлено частями),
+                // всё равно гарантируем, что full_response_text сохранён для Regenerate
+                if (!full_response_text.empty()) {
+                    std::lock_guard<std::mutex> lock(g_last_tts_mutex);
+                    if (g_last_tts_text.empty()) {
+                        g_last_tts_text = full_response_text;
+                    }
+                }
             }
+            // ========== КОНЕЦ ФИНАЛЬНОЙ ОБРАБОТКИ ==========
             // Безопасная очистка всех предыдущих потоков TTS — ВСЕ предыдущие потоки TTS должны быть завершены.
             // Это гарантирует, что при Regenerate/Reset/Exit не будет joinable-потоков в threads.
             // Используем swap + локальный вектор для безопасного join().
