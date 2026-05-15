@@ -2660,95 +2660,7 @@ try {
     text = replace(text, " .", ".");
 }
 
-// ============================================================
-// ЭТАП 7.1: НОРМАЛИЗАЦИЯ МНОГОТОЧИЙ -> ТОЧКА
-// ============================================================
 try {
-    // ШАГ 0: Unicode-многоточие → обычная точка
-    text = replace(text, "\xE2\x80\xA6", ".");  // "…" (U+2026) → "."
-
-    // ШАГ 1: Точки с пробелами между ними → убираем пробелы между точками
-    // ". . ." → "...", ". ." → "..", " . . . " → "..."
-    thread_local const std::regex re_spaced_dots(R"(\.\s+\.)");  // точка-пробел(ы)-точка
-    int dots_max_iterations = 10;  // ← защита от бесконечного цикла
-    while (dots_max_iterations-- > 0 && std::regex_search(text, re_spaced_dots)) {
-        text = std::regex_replace(text, re_spaced_dots, "..");
-    }
-    if (dots_max_iterations <= 0) {
-        fprintf(stderr, "Warning: Too many iterations while normalizing spaced dots, stopping\n");
-    }
-
-    // ШАГ 2: Убираем пробелы вокруг групп точек
-    // " ... " → "...", "hello ... world" → "hello...world"
-    thread_local const std::regex re_spaces_around_dots(R"(\s*(\.{2,})\s*)");
-    text = std::regex_replace(text, re_spaces_around_dots, "$1");
-
-    // ШАГ 3: Любые 2+ точек подряд → одна точка
-    thread_local const std::regex re_any_dots(R"(\.{2,})");
-    text = std::regex_replace(text, re_any_dots, ".");
-
-    // ШАГ 4: Убираем пробел перед точкой (если остался)
-    thread_local const std::regex re_space_before_dot(R"(\s+\.)");
-    text = std::regex_replace(text, re_space_before_dot, ".");
-
-    // ШАГ 5: Страховка — дублирующиеся точки
-    thread_local const std::regex re_double_dots(R"(\.{2,})");
-    text = std::regex_replace(text, re_double_dots, ".");
-
-} catch (const std::regex_error& e) {
-    // Fallback
-    text = replace(text, "\xE2\x80\xA6", ".");
-    text = replace(text, ". . .", ".");
-    text = replace(text, ". .", ".");
-    text = replace(text, "...", ".");
-    text = replace(text, "…", ".");
-    text = replace(text, "....", ".");
-    text = replace(text, " ...", ".");
-    text = replace(text, "..", ".");
-}
-
-// ============================================================
-// ЭТАП 8: МИНИМАЛЬНАЯ НОРМАЛИЗАЦИЯ ПУНКТУАЦИИ
-// ============================================================
-try {// ============================================================
-// ЭТАП 7.1: НОРМАЛИЗАЦИЯ МНОГОТОЧИЙ (УЛУЧШЕННАЯ) -> ОДНА ТОЧКА
-// ============================================================
-// Цель: превратить любые многоточия ("...", "…", ". . ." и т.д.)
-// в одну точку, не трогая одиночные точки-разделители предложений.
-try {
-    // Шаг 1: Unicode-многоточие "…" (U+2026) -> обычная точка "."
-    text = std::regex_replace(text, std::regex("\xE2\x80\xA6"), ".");
-
-    // Шаг 2: Последовательности из 2+ точек с любыми пробелами между ними -> одна точка.
-    // Примеры: "...", "..", ". . .", ".  .", " . . . ", "…" (уже точка) и т.п.
-    // НЕ затрагивает одиночную точку в "конец предложения.   Начало".
-    thread_local const std::regex re_dot_seq(R"((\.\s*){2,})");
-    text = std::regex_replace(text, re_dot_seq, ".");
-
-    // Шаг 3: Убрать пробел перед точкой, если он остался (" ." -> ".")
-    thread_local const std::regex re_space_dot(R"(\s+\.)");
-    text = std::regex_replace(text, re_space_dot, ".");
-
-    // Шаг 4: Убрать точку, которая идёт сразу после ! или ?
-    // (например "?!." -> "?!", "!." -> "!")
-    thread_local const std::regex re_punct_dot(R"(([?!])\.)");
-    text = std::regex_replace(text, re_punct_dot, "$1");
-
-    // Шаг 5: Страховка — любые оставшиеся 2+ точек -> одна точка
-    thread_local const std::regex re_any_dots(R"(\.{2,})");
-    text = std::regex_replace(text, re_any_dots, ".");
-
-} catch (const std::regex_error& e) {
-    // Fallback на случай проблем с регулярками (минимальная очистка)
-    text = replace(text, "\xE2\x80\xA6", ".");
-    text = replace(text, ". . .", ".");
-    text = replace(text, ". .", ".");
-    text = replace(text, "...", ".");
-    text = replace(text, "..", ".");
-    text = replace(text, " .", ".");
-    text = replace(text, "?.", "?");
-    text = replace(text, "!.", "!");
-}
 
 // ============================================================
 // ЭТАП 7.2: ФИНАЛЬНАЯ ЧИСТКА ЗНАКОВ ПРЕПИНАНИЯ (дублирующиеся ! и ?)
@@ -2764,7 +2676,7 @@ try {
     // Ручной fallback
     text = replace(text, "!!", "!");
     text = replace(text, "???", "?");
-}
+    }
     // Схлопываем только явные повторы
     thread_local const std::regex re_bangs(R"(!{2,})", std::regex::ECMAScript);
     thread_local const std::regex re_qmarks(R"(\?{2,})", std::regex::ECMAScript);
@@ -2785,6 +2697,7 @@ try {
 } catch (const std::regex_error& e) {
     fprintf(stderr, "Regex error (punctuation): %s\n", e.what());
 }
+
 trim(text);
 if (text.empty()) return;
 
@@ -5672,7 +5585,7 @@ if (text_len >= 2 && new_tokens >= 5 && !person_name_is_found &&
     {
         translation_full += text_to_speak;  // Накапливаем текст для перевода
         //fprintf(stdout, " translation_full: (%s)\n", translation_full.c_str());  // Отладочный вывод
-    }
+}
 
     // =================================================================
     // ПОДГОТОВКА ТЕКСТА ДЛЯ TTS: УДАЛЕНИЕ ИМЕНИ БОТА
@@ -5686,17 +5599,17 @@ if (text_len >= 2 && new_tokens >= 5 && !person_name_is_found &&
 
     // Удаляем имя пользователя только если оно в конце текста
     // Дополнительная проверка: antiprompts не пуст и содержит корректный маркер
-    if (!antiprompts.empty() && !antiprompts[0].empty()) {
-        std::string user_name_marker = antiprompts[0];
+        if (!antiprompts.empty() && !antiprompts[0].empty()) {
+            std::string user_name_marker = antiprompts[0];
         // Проверяем, что текст не короче маркера и заканчивается на него
         if (text_to_speak.size() >= user_name_marker.size()) {
             std::string end_of_text = text_to_speak.substr(text_to_speak.size() - user_name_marker.size());
-            if (end_of_text == user_name_marker) {
+                if (end_of_text == user_name_marker) {
                 text_to_speak = text_to_speak.substr(0, text_to_speak.size() - user_name_marker.size());
                 trim(text_to_speak);
+                }
             }
         }
-    }
 
     // Если есть текст для озвучки (первая или средняя часть предложения)
     // Очистка от спецтокенов перед TTS
@@ -5734,27 +5647,27 @@ if (text_len >= 2 && new_tokens >= 5 && !person_name_is_found &&
                 text_to_speak = "";        // Очищаем текст для озвучки
                 continue;  // Переходим к следующей итерации для обработки промпта перевода
             }
-        }
+            }
 
 try
     {
         // Накапливаем полный ответ перед очисткой
         if (!text_to_speak.empty()) {
             full_response_text += text_to_speak;
-        }
+            }
 
         // Захватываем ВСЁ по значению — безопасно с мьютексом
         std::string voice_copy = current_voice;  // <-- КОПИЯ
         safe_thread_emplace(threads, [text_to_speak, voice_copy, params]() {
             send_tts_async(text_to_speak, voice_copy, params.language, params.xtts_url);
-        });
+            });
         // Очищаем локальную переменную
         text_to_speak = "";
 
         // Если задержка перед XTTS включена, делаем паузу
         // Это помогает ускорить инференс xtts
         if (params.sleep_before_xtts)
-            std::this_thread::sleep_for(std::chrono::milliseconds(params.sleep_before_xtts));
+                std::this_thread::sleep_for(std::chrono::milliseconds(params.sleep_before_xtts));
 
 
     }
@@ -5762,35 +5675,35 @@ try
                 catch (const std::exception& ex) {
                     // Выводим сообщение об ошибке создания потока
                     std::cerr << "[Exception]: Failed to push_back mid thread: " << ex.what() << '\n';
-                }
+}
 
                 // Проверяем уровень энергии, если пользователь говорит
                 if (!params.push_to_talk || (params.push_to_talk && hk_copy == "Alt"))
                 {
                     // Получаем аудио данные (неблокирующий вызов)
-                    audio.get(params.interrupt_check_ms, pcmf32_cur);
+        audio.get(params.interrupt_check_ms, pcmf32_cur);
 
-                    int vad_result = ::vad_simple_int(pcmf32_cur, WHISPER_SAMPLE_RATE, params.vad_last_ms,
+        int vad_result = ::vad_simple_int(pcmf32_cur, WHISPER_SAMPLE_RATE, params.vad_last_ms,
                     params.vad_thold, params.freq_thold, params.print_energy,
                     params.vad_start_thold);
 
-                    if (vad_result == 1) {
-                        if (speech_vad_start_ms == 0.0f) {
-                            speech_vad_start_ms = get_current_time_ms() * 1000.0f;
-                        }
+        if (vad_result == 1) {
+            if (speech_vad_start_ms == 0.0f) {
+                speech_vad_start_ms = get_current_time_ms() * 1000.0f;
+            }
 
-                        if ((get_current_time_ms() * 1000) - speech_vad_start_ms > params.interrupt_threshold_ms) {
-                            printf(" [Speech interruption confirmed!]\n");
-                            llama_interrupted.store(1);
-                            g_is_interrupted.store(true);
-                            allow_xtts_file(params.xtts_control_path, 0);
-                            done = true;
-                            break;
-                        }
-                    } else {
-                        speech_vad_start_ms = 0;
-                    }
-                }
+            if ((get_current_time_ms() * 1000) - speech_vad_start_ms > params.interrupt_threshold_ms) {
+                printf(" [Speech interruption confirmed!]\n");
+                llama_interrupted.store(1);
+                g_is_interrupted.store(true);
+                allow_xtts_file(params.xtts_control_path, 0);
+                done = true;
+                break;
+            }
+        } else {
+            speech_vad_start_ms = 0;
+        }
+    }
 
 
                 // Удаление перевода из контекста (откат после перевода)
@@ -5805,19 +5718,19 @@ try
                         if (rollback_num)
                         {
                             // Удаляем токены перевода из контекста
-                            embd_inp.erase(embd_inp.end() - rollback_num, embd_inp.end());
+                embd_inp.erase(embd_inp.end() - rollback_num, embd_inp.end());
                             n_past = embd_inp.size();  // Обновляем позицию в контексте
                             n_session_consumed = n_past;  // Обновляем сессию
                             // Удаляем последовательность из KV-кэша (новый API)
-                            llama_memory_seq_rm(llama_get_memory(ctx_llama), 0, embd_inp.size(), -1);
+                llama_memory_seq_rm(llama_get_memory(ctx_llama), 0, embd_inp.size(), -1);
                             printf("\n"); // Выводим пустую строку для разделения перевода и оригинала
-                        }
+            }
                         continue;  // Переходим к следующей итерации (продолжаем генерацию)
-                    }
+        }
                 }
             }
-        }
     }
+}
 }
 
 // Обработка последнего вывода и антипромптов
