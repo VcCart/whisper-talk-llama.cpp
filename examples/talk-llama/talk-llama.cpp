@@ -74,34 +74,6 @@
 #include <Windows.h>           // Windows API (работа с окнами, клавиатурой)
 #endif
 
-// ============================================================
-// ФУНКЦИИ ДЛЯ ЦВЕТНОГО ВЫВОДА (кроссплатформенные)
-// ============================================================
-#ifdef _WIN32
-static HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-static WORD originalColors = 0;
-
-static void init_console_colors() {
-    CONSOLE_SCREEN_BUFFER_INFO csbi;
-    if (GetConsoleScreenBufferInfo(hConsole, &csbi)) {
-        originalColors = csbi.wAttributes;
-    }
-}
-
-static void set_console_color(WORD color) {
-    SetConsoleTextAttribute(hConsole, color);
-}
-
-static void reset_console_color() {
-    SetConsoleTextAttribute(hConsole, originalColors);
-}
-#else
-// Для Linux/macOS используем ANSI
-#define set_console_color(x)
-#define reset_console_color() printf("\033[0m")
-static inline void init_console_colors() {}
-#endif
-
 // ГЛОБАЛЬНЫЕ МЬЮТЕКСЫ
 std::atomic<bool> g_is_interrupted{false};          // Флаг прерывания для сетевых запросов (curl)
 std::atomic<int>  llama_interrupted{0};             // Флаг прерывания генерации LLaMA (связь с озвучкой)
@@ -990,6 +962,34 @@ void allow_xtts_file(std::string& path, int xtts_play_allowed) {
             writeStream.flush();
         }
     }
+}
+
+// ============================================================
+// ФУНКЦИЯ МГНОВЕННОЙ ОСТАНОВКИ TTS
+// ============================================================
+void stop_tts_immediately() {
+    // 1. СНАЧАЛА принудительная очистка аудио через SDL (мгновенно)
+    SDL_PauseAudio(1);           // Пауза аудиопотока
+    SDL_ClearQueuedAudio(2);     // Очищаем очередь (ID устройства XTTS)
+    SDL_PauseAudio(0);           // Возобновляем (уже с пустым буфером)
+    
+    // 2. Записываем 0 в файл (для предотвращения новых чанков)
+    std::string dummy_path;
+    allow_xtts_file(dummy_path, 0);
+    
+    // 3. HTTP-запрос к серверу для мгновенной остановки стрима
+    CURL* curl = curl_easy_init();
+    if (curl) {
+        std::string url = "http://localhost:8020/stop_stream";
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 50L);  // 50мс таймаут
+        curl_easy_perform(curl);
+        curl_easy_cleanup(curl);
+    }
+    
+    // 4. Маленькая задержка для завершения
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
 }
 
 // Убирает пробельные символы из начала строки
@@ -2847,13 +2847,17 @@ void input_thread_func() {
     bool found_another_line = true;
     while (keyboard_input_running) {
         do {
-            // Читаем строку из консоли
-            found_another_line = console::readline(line, false);
+            // Читаем строку из консоли - true = разрешаем очень длинные строки
+            found_another_line = console::readline(line, true);
             buffer += line;
+            if (!line.empty() && line.back() == '\n') {
+                // Нашли естественный конец строки
+                break;
+            }
         } while (found_another_line);
         trim(buffer); // Убираем лишние пробелы у введённой строки
         if (!buffer.empty()) { // Проверка на пустую строку
-            std::lock_guard<std::mutex> lock(input_mutex); // 🔥 ФИКС: защищаем запись
+            std::lock_guard<std::mutex> lock(input_mutex);
             input_queue.push(buffer);
             buffer = ""; // Очищаем буфер
         }
@@ -3035,10 +3039,6 @@ llama_sampler * smpl_high_temp = nullptr;
             whisper_print_usage(argc, argv, params);
             exit(0);
         }
-
-#ifdef _WIN32
-    init_console_colors();
-#endif
 
 	allow_xtts_file(params.xtts_control_path, 1);  // разрешаем воспроизведение звука XTTS
 
@@ -3791,17 +3791,9 @@ if (llama_decode(ctx_llama, batch)) {
     else
         printf("Start speaking or typing:\n");
 
-    // ===== НАЧАЛЬНОЕ ПРИГЛАШЕНИЕ =====
-    // Формат старта должен совпадать с форматом последующих ходов
-    printf("\n");
-    #ifdef _WIN32
-        set_console_color(FOREGROUND_GREEN | FOREGROUND_INTENSITY);
-    #else
-        printf("\033[32m");
-    #endif
-        printf("%s%s ", params.person.c_str(), chat_symb.c_str());    // ← "Друг: "
-        reset_console_color();
-        fflush(stdout);
+    // ===== НАЧАЛЬНОЕ ПРИГЛАШЕНИЕ - БЕЗ ЛИШНЕГО ПЕРЕВОДА СТРОКИ =====
+    printf("%s%s ", params.person.c_str(), chat_symb.c_str());
+    fflush(stdout);
     // -------------------------------------------------------
 
 	int vad_result_prev = 2; // ended
@@ -3920,31 +3912,33 @@ console::set_display(console::reset);
                 if (vad_result_prev != 1) // реальное начало речи
                 {
                     // Запоминаем время начала речи
-                    speech_start_ms = get_current_time_ms(); // float
+                    speech_start_ms = get_current_time_ms();
 
                     // Обновляем статус VAD
                     vad_result_prev = 1;
 
-                    // НИКАКОЙ ТРАНСКРИПЦИИ ЗДЕСЬ НЕ НУЖНО — только запоминаем время начала.
-                    // Раньше здесь был вызов transcribe() для "прогревки", но он:
-                    // 1. Создавал лишнюю задержку
-                    // 2. Мог сбивать внутреннее состояние Whisper
-                    // 3. Результат нигде не использовался (all_heard_pre не читается)
-                }
+                    // ===== МГНОВЕННАЯ ОСТАНОВКА TTS =====
+                    std::string current_hotkey;
+                    {
+                        std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
+                        current_hotkey = g_hotkey_pressed;
+                    }
+                    if (!params.push_to_talk || (params.push_to_talk && current_hotkey == "Alt"))
+                    {
+                        // НЕМЕДЛЕННАЯ ОСТАНОВКА (файл + HTTP + SDL)
+                        stop_tts_immediately();
 
-                // Пользователь начал говорить — запрещаем воспроизведение через XTTS
-                std::string current_hotkey;
-                {
-                    std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
-                    current_hotkey = g_hotkey_pressed;
-                }
-                if (!params.push_to_talk || (params.push_to_talk && current_hotkey == "Alt"))
-                {
-                    allow_xtts_file(params.xtts_control_path, 0);
-
-                    // Устанавливаем флаги прерывания
-                    llama_interrupted.store(1);
-                    g_is_interrupted.store(true);
+                        // Устанавливаем флаги прерывания
+                        llama_interrupted.store(1);
+                        g_is_interrupted.store(true);
+                        
+                        // Очищаем буфер микрофона
+                        audio.clear();
+                        
+                        if (params.verbose) {
+                            printf("\n[VAD] Речь обнаружена, TTS остановлен\n");
+                        }
+                    }
                 }
             }
 
@@ -4367,6 +4361,10 @@ if (user_command == "regenerate" ||
 				{
 					if (new_command_allowed)
                         {
+                            // МГНОВЕННАЯ ОСТАНОВКА TTS ПЕРЕД РЕГЕНЕРАЦИЕЙ
+                            stop_tts_immediately();
+                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
                             new_command_allowed = 0;
                             last_command_time = std::time(0);
 
@@ -4501,7 +4499,11 @@ else if (user_command == "reset")
 {
     if (new_command_allowed)
     {
+        // МГНОВЕННАЯ ОСТАНОВКА TTS ПЕРЕД СБРОСОМ
+        stop_tts_immediately();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         if (!past_prev_arr.empty())
+
         {
             n_past_prev = past_prev_arr.front();
             past_prev_arr.clear();
@@ -4583,72 +4585,49 @@ else if (user_command == "reset")
     continue;
 }
 
-// ОСТАНОВКА stop
+// ОСТАНОВКА stop - УПРОЩЁННАЯ ВЕРСИЯ БЕЗ ЛИШНИХ ПЕЧАТЕЙ
 if (user_command == "stop")
     {
         std::string lower_text = LowerCase(text_heard_trimmed);
-        // Расширенный список стоп-команд с учетом разных вариантов
-        static const std::vector<std::string> stop_commands = {
-            "стоп", "stop", "остановись", "останови", "хватит", "прекрати",
-            "стоп пожалуйста", "stop please", "хватит пожалуйста", "прекрати пожалуйста"
-        };
-        // Фразы с именем бота (например, "Эмма, стоп")
-        static const std::vector<std::string> stop_with_bot = {
-            params.bot_name + " стоп",
-            params.bot_name + " stop",
-            params.bot_name + " остановись",
-            params.bot_name + " хватит"
-        };
-
-        bool is_stop_command = false;
-        // 1. Проверяем точное совпадение с базовыми командами
-        for (const auto& cmd : stop_commands) {
-            if (lower_text == cmd) {
-                is_stop_command = true;
-                break;
-            }
-        }
-        // 2. Проверяем команды с именем бота
-        if (!is_stop_command) {
-            for (const auto& cmd : stop_with_bot) {
-                if (lower_text.find(cmd) != std::string::npos) {
-                    is_stop_command = true;
-                    break;
-                }
-            }
-        }
-        // 3. Проверяем короткие фразы, которые начинаются со стоп-слова
-        if (!is_stop_command && lower_text.length() < 20) {
-            for (const auto& cmd : stop_commands) {
-                if (cmd.length() < lower_text.length() &&
-                    lower_text.find(cmd) == 0) {
-                    // Начинается со стоп-слова и короткая
-                    is_stop_command = true;
-                    break;
-                }
-            }
-        }
+        
+        // Простая проверка стоп-команд
+        bool is_stop_command = (
+            lower_text == "стоп" || lower_text == "stop" ||
+            lower_text == "хватит" || lower_text == "остановись" ||
+            lower_text.find(params.bot_name + " стоп") != std::string::npos ||
+            lower_text.find(params.bot_name + " stop") != std::string::npos
+        );
+        
         if (!is_stop_command) {
             // Не стоп-команда — продолжаем обычную обработку
             user_command.clear();
             continue;
         }
-        // Реальный STOP-запрос
-        fprintf(stdout, "[user] requested STOP: \"%s\"\n", text_heard_trimmed.c_str());
-        // 1) Безопасно очищаем буферы и ввод
+        
+        // ===== МГНОВЕННАЯ ОСТАНОВКА TTS =====
+        stop_tts_immediately();
+        
+        // Очищаем буферы
         text_heard.clear();
         text_heard_trimmed.clear();
         audio.clear();
         user_typed.clear();
         user_typed_this = false;
-        // 2) Прерываем озвучку XTTS
-        allow_xtts_file(params.xtts_control_path, 0);
-        // 3) Устанавливаем флаг остановки генерации
+        
+        // Сбрасываем флаги генерации
+        llama_interrupted.store(1);
+        g_is_interrupted.store(true);
+        
+        // Устанавливаем флаг горячей клавиши
         {
             std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
             g_hotkey_pressed = "Ctrl+Space";
         }
-        // Продолжаем цикл — модель корректно завершит текущую генерацию
+        
+        if (params.verbose) {
+            fprintf(stdout, "\n[Stop] TTS остановлен\n");
+        }
+        
         continue;
     }
     // Скажи сколько время
@@ -4850,26 +4829,13 @@ std::string resp = send_curl(url);
     text_heard_with_instruct += params.instruct_preset_data["user_message_suffix"] + params.instruct_preset_data["bot_message_prefix"] + "\n" + params.bot_name + chat_symb;
 
     // ===== ВЫВОД В КОНСОЛЬ =====
-    // Перезаписываем строку ожидания и выводим реплику пользователя
-    printf("\r");
-    #ifdef _WIN32
-        set_console_color(FOREGROUND_GREEN | FOREGROUND_INTENSITY);
-    #else
-        printf("\033[32m");
-    #endif
+    // Выводим реплику пользователя
     printf("%s%s ", params.person.c_str(), chat_symb.c_str());
-    reset_console_color();
     printf("%s\n", user_typed_this ? user_typed.c_str() : text_heard_trimmed.c_str());
-
-    // Выводим имя бота (цветной)
-    #ifdef _WIN32
-        set_console_color(FOREGROUND_GREEN | FOREGROUND_INTENSITY);
-    #else
-        printf("\033[32m");
-    #endif
-        printf("%s%s", params.bot_name.c_str(), chat_symb.c_str());
-        reset_console_color();
-        fflush(stdout);
+    
+    // Выводим имя бота (приглашение для его ответа)
+    printf("%s%s ", params.bot_name.c_str(), chat_symb.c_str());
+    fflush(stdout);
 
     // НЕ ТОКЕНИЗИРУЕМ здесь — токенизация будет ниже, после split_after
 
@@ -4932,7 +4898,7 @@ std::string resp = send_curl(url);
         // =============================================================
         {
             std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
-            if (!g_hotkey_pressed.empty()) {
+            if (!g_hotkey_pressed.empty() && g_hotkey_pressed != "Alt") {
                 // Нажата горячая клавиша — прерываем генерацию
                 llama_interrupted.store(1);
                 g_is_interrupted.store(true);
@@ -4944,7 +4910,10 @@ std::string resp = send_curl(url);
                 // Сбрасываем горячую клавишу после обработки
                 g_hotkey_pressed = "";
 
-                printf(" [Hotkey interrupt: generation stopped]\n");
+                // ТОЛЬКО ОДНО КРАТКОЕ СООБЩЕНИЕ, БЕЗ СЛОВА "Hotkey"
+                if (params.verbose) {
+                    printf(" [stopped]\n");
+                }
                 break;
             }
         }
@@ -5517,49 +5486,77 @@ char out_token_symbol;
                 text_to_speak[text_len-1] = ' ';
 
 
-                // Проверяем каждые 2 токена, НО не прерываем первые 50 токенов
-            if (new_tokens % 2 == 0 && new_tokens > 50)  // ← ФИКС 1: даём Эмме начать фразу
-            {
-                audio.get(2000, pcmf32_cur);
-                // Проверяем уровень энергии (VAD - Voice Activity Detection)
-                int vad_result = ::vad_simple_int(pcmf32_cur, WHISPER_SAMPLE_RATE, params.vad_last_ms,
-                                                params.vad_thold, params.freq_thold, params.print_energy,
-                                                params.vad_start_thold);
-
-                /// Если обнаружена речь или нажата горячая клавиша
-                if ((!params.push_to_talk && vad_result == 1) ||
-                    hk_copy == "Ctrl+Space" || hk_copy == "Alt")
+                // Проверяем прерывание КАЖДЫЙ ТОКЕН после первых 10 токенов
+                if (new_tokens > 10)  // ← даём боту начать фразу, но после этого проверяем каждый токен
                 {
-                    // 1. Взводим флаги для остановки сетевых потоков и генерации
-                    llama_interrupted.store(1);
-                    g_is_interrupted.store(true);
-                    // 2. ОЧИЩАЕМ буфер текста, чтобы следующая итерация цикла не отправила "ошметки" фразы в TTS
-                    text_to_speak = "";
-                    // 3. ОСТАНОВКА ЗВУКА (SDL2)
-                    // Очищаем очередь аудио, чтобы недоигранные фрагменты исчезли мгновенно
-                    // В talk-llama вывод обычно идет через устройство с ID 2 или глобальный микшер
-                    SDL_PauseAudio(1);         // Ставим на паузу всё аудио
-                    SDL_ClearQueuedAudio(2);   // Очищаем очередь вывода (ID 2 — стандарт для вывода в этом коде)
-                    SDL_PauseAudio(0);         // Снимаем паузу (устройство готово к новым данным, но очередь пуста)
-                    llama_interrupted_time = get_current_time_ms();
-                    printf(" [Speech/Stop!]\n");
+                    // Берём всего 500 мс аудио для быстрой проверки
+                    audio.get(500, pcmf32_cur);
+                    
+                    // Проверяем уровень энергии (VAD - Voice Activity Detection)
+                    int vad_result = ::vad_simple_int(pcmf32_cur, WHISPER_SAMPLE_RATE, 
+                                                    500,  // ← короткое окно для быстрой реакции
+                                                    params.vad_thold, params.freq_thold, 
+                                                    params.print_energy, params.vad_start_thold);
 
-                    // === НЕ очищаем аудиобуфер при VAD-прерывании ===
-                    // Аудио должно быть доступно для последующего распознавания в главном цикле.
-                    // Очистка произойдёт после успешного распознавания фразы.
-                    // audio.clear();  // ← ЗАКОММЕНТИРОВАНО
+                    /// Если обнаружена речь 
+                    if ((!params.push_to_talk && vad_result == 1)) {
+                        // МГНОВЕННОЕ ПРЕРЫВАНИЕ
+                        llama_interrupted.store(1);
+                        g_is_interrupted.store(true);
+                        
+                        // ОЧИЩАЕМ буфер текста
+                        text_to_speak = "";
+                        
+                        // МГНОВЕННАЯ ОСТАНОВКА ЗВУКА
+                        SDL_PauseAudio(1);
+                        SDL_ClearQueuedAudio(2);
+                        SDL_PauseAudio(0);
+                        
+                        llama_interrupted_time = get_current_time_ms();
+                        
+                        // ТОЛЬКО ОДНО КРАТКОЕ СООБЩЕНИЕ
+                        if (params.verbose) {
+                            printf(" [interrupted]\n");
+                        }
 
-                    // Сигнализируем внешнему сервису
-                    allow_xtts_file(params.xtts_control_path, 0);
-                    done = true;
-                    { // Сброс под защитой мьютекса
-                        std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
-                        g_hotkey_pressed = "";
+                        // Сигнализируем внешнему сервису
+                        allow_xtts_file(params.xtts_control_path, 0);
+                        done = true;
+                        
+                        // Сброс горячей клавиши
+                        {
+                            std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
+                            g_hotkey_pressed = "";
+                        }
+                        break;
                     }
-                    // 5. Выход из цикла генерации
-                    break;
                 }
-            }
+                
+                // Отдельная проверка горячей клавиши (быстрая)
+                {
+                    std::string hk_local;
+                    {
+                        std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
+                        hk_local = g_hotkey_pressed;
+                    }
+                    if (hk_local == "Ctrl+Space" || hk_local == "Alt") {
+                        llama_interrupted.store(1);
+                        g_is_interrupted.store(true);
+                        text_to_speak = "";
+                        SDL_PauseAudio(1);
+                        SDL_ClearQueuedAudio(2);
+                        SDL_PauseAudio(0);
+                        done = true;
+                        {
+                            std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
+                            g_hotkey_pressed = "";
+                        }
+                        if (params.verbose) {
+                            printf(" [keyboard stop]\n");
+                        }
+                        break;
+                    }
+                }
     // Очистка микрофона после генерации 20 токенов
     // Это помогает избежать накопления шума в буфере микрофона
         if (new_tokens == 20 && !llama_interrupted)
@@ -6116,18 +6113,13 @@ char out_token_symbol;
             }         // Сбрасываем горячую клавишу
 
             // ===== ПРИГЛАШЕНИЕ ПОСЛЕ ОТВЕТА БОТА =====
-            // Гарантированно выводим перевод строки, даже если предыдущий вывод не закончился на \n
+            // Один перевод строки перед следующим приглашением пользователя
             printf("\n");
             fflush(stdout);
-            
-            #ifdef _WIN32
-                        set_console_color(FOREGROUND_GREEN | FOREGROUND_INTENSITY);
-            #else
-                        printf("\033[32m");
-            #endif
+
             printf("%s%s ", params.person.c_str(), chat_symb.c_str());
-            reset_console_color();
             fflush(stdout);
+
         }
     }
 }
