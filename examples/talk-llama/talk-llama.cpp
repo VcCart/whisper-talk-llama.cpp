@@ -965,31 +965,22 @@ void allow_xtts_file(std::string& path, int xtts_play_allowed) {
 }
 
 // ============================================================
-// ФУНКЦИЯ МГНОВЕННОЙ ОСТАНОВКИ TTS
+// ФУНКЦИЯ МГНОВЕННОЙ ОСТАНОВКИ TTS (ТОЛЬКО ФАЙЛОВЫЙ КОНТРОЛЬ)
 // ============================================================
 void stop_tts_immediately() {
-    // 1. СНАЧАЛА принудительная очистка аудио через SDL (мгновенно)
-    SDL_PauseAudio(1);           // Пауза аудиопотока
-    SDL_ClearQueuedAudio(2);     // Очищаем очередь (ID устройства XTTS)
-    SDL_PauseAudio(0);           // Возобновляем (уже с пустым буфером)
-    
-    // 2. Записываем 0 в файл (для предотвращения новых чанков)
+    // 1. Записываем 0 в файл (блокировка новых чанков)
     std::string dummy_path;
     allow_xtts_file(dummy_path, 0);
     
-    // 3. HTTP-запрос к серверу для мгновенной остановки стрима
+    // 2. HTTP-запрос к серверу для немедленной остановки стрима
     CURL* curl = curl_easy_init();
     if (curl) {
-        std::string url = "http://localhost:8020/stop_stream";
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_URL, "http://localhost:8020/stop_stream");
         curl_easy_setopt(curl, CURLOPT_POST, 1L);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 50L);  // 50мс таймаут
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 50L);
         curl_easy_perform(curl);
         curl_easy_cleanup(curl);
     }
-    
-    // 4. Маленькая задержка для завершения
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
 }
 
 // Убирает пробельные символы из начала строки
@@ -3148,6 +3139,9 @@ llama_sampler * smpl_high_temp = nullptr;
         "<|endoftext|>",     // Некоторые модели
         "<|im_start|>",      // Начало сообщения (тоже стоп-сигнал)
         "<|end|>",           // Альтернативный маркер
+        "<|eo|>",            // Дополнительный стоп-маркер
+        "<|start_header_id|>", // Начало заголовка
+        "<|end_header_id|>",   // Конец заголовка
     };
 
     for (const char* pattern : special_patterns) {
@@ -3791,8 +3785,9 @@ if (llama_decode(ctx_llama, batch)) {
     else
         printf("Start speaking or typing:\n");
 
-    // ===== НАЧАЛЬНОЕ ПРИГЛАШЕНИЕ - БЕЗ ЛИШНЕГО ПЕРЕВОДА СТРОКИ =====
-    printf("%s%s ", params.person.c_str(), chat_symb.c_str());
+    // ===== НАЧАЛЬНОЕ ПРИГЛАШЕНИЕ =====
+    // Пустая строка уже напечатана выше, выводим префикс пользователя
+    printf("%s%s  ", params.person.c_str(), chat_symb.c_str());
     fflush(stdout);
     // -------------------------------------------------------
 
@@ -3923,17 +3918,17 @@ console::set_display(console::reset);
                         std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
                         current_hotkey = g_hotkey_pressed;
                     }
-                    if (!params.push_to_talk || (params.push_to_talk && current_hotkey == "Alt"))
+                     if (!params.push_to_talk || (params.push_to_talk && current_hotkey == "Alt"))
                     {
-                        // НЕМЕДЛЕННАЯ ОСТАНОВКА (файл + HTTP + SDL)
-                        stop_tts_immediately();
+                        // Только файловый запрет (без очистки микрофона!)
+                        std::string dummy_path;
+                        allow_xtts_file(dummy_path, 0);
 
                         // Устанавливаем флаги прерывания
                         llama_interrupted.store(1);
                         g_is_interrupted.store(true);
                         
-                        // Очищаем буфер микрофона
-                        audio.clear();
+                        // audio.clear() - НЕ ВЫЗЫВАЕМ! Это убивает буфер микрофона
                         
                         if (params.verbose) {
                             printf("\n[VAD] Речь обнаружена, TTS остановлен\n");
@@ -4825,13 +4820,46 @@ std::string resp = send_curl(url);
         }
 
     // ===== ФОРМАТИРОВАНИЕ ОТВЕТА БОТА =====
-        text_heard += params.bot_name + chat_symb;
-    text_heard_with_instruct += params.instruct_preset_data["user_message_suffix"] + params.instruct_preset_data["bot_message_prefix"] + "\n" + params.bot_name + chat_symb;
+    text_heard += params.bot_name + chat_symb;
+    text_heard_with_instruct += params.instruct_preset_data["user_message_suffix"] + 
+                                params.instruct_preset_data["bot_message_prefix"] + 
+                                params.bot_name + chat_symb;  // ← убрали "\n"
 
     // ===== ВЫВОД В КОНСОЛЬ =====
+    // Подготавливаем текст реплики для вывода в консоль
+    // Физический смысл: модель получает контекст с разметкой ролей (\nДруг: ...),
+    // но пользователь в консоли должен видеть только чистый текст без дублирования имени.
+    std::string display_text;
+    if (user_typed_this) {
+        // Пользователь ввёл текст вручную — берём как есть
+        display_text = user_typed;
+    } else {
+        // Распознанный текст — берём очищенную версию
+        display_text = text_heard_trimmed;
+    }
+
+    // УНИВЕРСАЛЬНОЕ удаление префикса имени пользователя
+    // Проверяем все варианты: "Друг:", "Друг :", "Друг  :"
+    // Используем цикл для читаемости и лёгкого расширения
+    {
+        const std::string prefixes[] = {
+            params.person + chat_symb,           // "Друг:"
+            params.person + " " + chat_symb,     // "Друг :"
+            params.person + "  " + chat_symb     // "Друг  :"
+        };
+        for (const auto& prefix : prefixes) {
+            if (display_text.size() >= prefix.size() && 
+                display_text.compare(0, prefix.size(), prefix) == 0) {
+                display_text = display_text.substr(prefix.size());
+                break; // удалили один раз — выходим, чтобы не обрезать лишнее
+            }
+        }
+    }
+    trim(display_text); // финальная обрезка пробелов
+    
     // Выводим реплику пользователя
     printf("%s%s ", params.person.c_str(), chat_symb.c_str());
-    printf("%s\n", user_typed_this ? user_typed.c_str() : text_heard_trimmed.c_str());
+    printf("%s\n", display_text.c_str());
     
     // Выводим имя бота (приглашение для его ответа)
     printf("%s%s ", params.bot_name.c_str(), chat_symb.c_str());
@@ -5376,7 +5404,7 @@ char out_token_symbol;
                 // Удаляем всё, что похоже на <|что-угодно|>
                 display_str = std::regex_replace(display_str, std::regex(R"(<\|[^>]*\|>)"), "");
                 // Удаляем одиночные роли (могут остаться после очистки тегов)
-                display_str = std::regex_replace(display_str, std::regex(R"(\b(assistant|system|user|end_header_id|eot_id|start_header_id)\b)"), "");
+                display_str = std::regex_replace(display_str, std::regex(R"(\b(assistant|system|user|end_header_id|eot_id|start_header_id|eo)\b)"), "");
             } catch (const std::regex_error&) {
                 // Fallback: ручная очистка, если регулярка не сработала
                 display_str = ::replace(display_str, "<|start_header_id|>", "");
@@ -5384,6 +5412,7 @@ char out_token_symbol;
                 display_str = ::replace(display_str, "<|eot_id|>", "");
                 display_str = ::replace(display_str, "<|im_start|>", "");
                 display_str = ::replace(display_str, "<|im_end|>", "");
+                display_str = ::replace(display_str, "<|eo|>", "");
                 display_str = ::replace(display_str, "assistant", "");
                 display_str = ::replace(display_str, "system", "");
                 display_str = ::replace(display_str, "user", "");
@@ -5486,47 +5515,35 @@ char out_token_symbol;
                 text_to_speak[text_len-1] = ' ';
 
 
-                // Проверяем прерывание КАЖДЫЙ ТОКЕН после первых 10 токенов
-                if (new_tokens > 10)  // ← даём боту начать фразу, но после этого проверяем каждый токен
+                // Проверяем прерывание КАЖДЫЕ 2 ТОКЕНА после первых 50 токенов (исходная логика)
+                if (new_tokens % 2 == 0 && new_tokens > 50)
                 {
-                    // Берём всего 500 мс аудио для быстрой проверки
+                    // Берём короткое аудио для проверки
                     audio.get(500, pcmf32_cur);
                     
                     // Проверяем уровень энергии (VAD - Voice Activity Detection)
                     int vad_result = ::vad_simple_int(pcmf32_cur, WHISPER_SAMPLE_RATE, 
-                                                    500,  // ← короткое окно для быстрой реакции
+                                                    500,
                                                     params.vad_thold, params.freq_thold, 
                                                     params.print_energy, params.vad_start_thold);
 
-                    /// Если обнаружена речь 
-                    if ((!params.push_to_talk && vad_result == 1)) {
-                        // МГНОВЕННОЕ ПРЕРЫВАНИЕ
+                    /// Если обнаружена речь
+                    if ((!params.push_to_talk && vad_result == 1))
+                    {
+                        // ===== КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: вызываем stop_tts_immediately() =====
+                        // Это остановит текущий TTS через HTTP + файл
+                        stop_tts_immediately();
+                        
+                        // Флаги прерывания
                         llama_interrupted.store(1);
                         g_is_interrupted.store(true);
                         
-                        // ОЧИЩАЕМ буфер текста
                         text_to_speak = "";
                         
-                        // МГНОВЕННАЯ ОСТАНОВКА ЗВУКА
-                        SDL_PauseAudio(1);
-                        SDL_ClearQueuedAudio(2);
-                        SDL_PauseAudio(0);
-                        
-                        llama_interrupted_time = get_current_time_ms();
-                        
-                        // ТОЛЬКО ОДНО КРАТКОЕ СООБЩЕНИЕ
-                        if (params.verbose) {
-                            printf(" [interrupted]\n");
-                        }
-
-                        // Сигнализируем внешнему сервису
-                        allow_xtts_file(params.xtts_control_path, 0);
                         done = true;
                         
-                        // Сброс горячей клавиши
-                        {
-                            std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
-                            g_hotkey_pressed = "";
+                        if (params.verbose) {
+                            printf(" [interrupted]\n");
                         }
                         break;
                     }
@@ -5846,7 +5863,7 @@ char out_token_symbol;
                             // Проверяем, есть ли текст ДО этого антипромпта
                             if (text_to_speak.empty() || text_to_speak.length() < 2) {
                                 if (params.debug) {
-                                    printf("\n[DEBUG] User name antiprompt but text_to_speak empty - IGNORED\n");
+                                    fprintf(stderr, "[DEBUG] User name antiprompt but text_to_speak empty - IGNORED\n");
                                 }
                                 i_antiprompt++;
                                 continue;
@@ -5863,7 +5880,7 @@ char out_token_symbol;
                             done = true;
                             
                             if (params.debug) {
-                                printf("\n[DEBUG] User name antiprompt '%s' matched - stopping\n", antiprompt.c_str());
+                                fprintf(stderr, "[DEBUG] User name antiprompt '%s' matched - stopping\n", antiprompt.c_str());
                             }
                         }
                         else
@@ -6112,13 +6129,20 @@ char out_token_symbol;
                 g_hotkey_pressed = "";
             }         // Сбрасываем горячую клавишу
 
-            // ===== ПРИГЛАШЕНИЕ ПОСЛЕ ОТВЕТА БОТА =====
-            // Один перевод строки перед следующим приглашением пользователя
+        // ===== ПРИГЛАШЕНИЕ ПОСЛЕ ОТВЕТА БОТА =====
+        // Гарантируем ровно один перенос строки между репликами
+        // Проверяем, не закончился ли ответ уже с \n (чтобы не дублировать)
+        if (!full_response_text.empty()) {
+            char last_ch = full_response_text.back();
+            if (last_ch != '\n' && last_ch != '\r') {
+                printf("\n");
+            }
+        } else {
             printf("\n");
-            fflush(stdout);
-
-            printf("%s%s ", params.person.c_str(), chat_symb.c_str());
-            fflush(stdout);
+        }
+        // Выводим приглашение для следующей реплики пользователя
+        printf("%s%s  ", params.person.c_str(), chat_symb.c_str());
+        fflush(stdout);
 
         }
     }
