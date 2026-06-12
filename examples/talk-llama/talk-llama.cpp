@@ -24,18 +24,22 @@
 //   - Все отладочные выводы (>>>) появляются ТОЛЬКО при --verbose
 //   - В обычном режиме только диалог и ошибки
 //   - VAD использует сглаживание для устойчивости к шумам
+//   - ПРЕРЫВАНИЕ ПО МИКРОФОНУ: проверка каждые 3 токена в цикле генерации
 //
 // =============================================================================
-// 1. ПОДКЛЮЧЕНИЕ БИБЛИОТЕК
-// -----------------------------------------------------------------------------
+
+// ============================================================================
+// 1. ПОДКЛЮЧЕНИЕ БИБЛИОТЕК (ПОЛНОСТЬЮ ИЗ ОРИГИНАЛА, БЕЗ ИЗМЕНЕНИЙ)
+// ============================================================================
+
 // 1.1 Внешние библиотеки ИИ (Whisper и LLaMA)
-// -----------------------------------------------------------------------------
 #include "common-sdl.h"        // Общие функции SDL для работы с аудио
 #include "common.h"            // Общие вспомогательные функции проекта
 #include "common-whisper.h"    // Общие функции для интеграции с Whisper
 #include "whisper.h"           // Основная библиотека Whisper для распознавания речи
 #include "llama.h"             // Основная библиотека LLaMA для генерации текста
-// СИСТЕМНЫЕ БИБЛИОТЕКИ C++
+
+// 1.2 СИСТЕМНЫЕ БИБЛИОТЕКИ C++
 #include <chrono>              // Работа со временем и таймерами
 #include <cstdio>              // Стандартный ввод/вывод C (printf, fprintf)
 #include <cassert>             // Проверки при отладке (удаляются в релизе)
@@ -63,25 +67,44 @@
 #include <ctime>               // Работа с системным временем
 #include <filesystem>
 #include <random>              // Современный генератор случайных чисел
-// ПОЛЬЗОВАТЕЛЬСКИЕ МОДУЛИ
+
+// 1.3 ПОЛЬЗОВАТЕЛЬСКИЕ МОДУЛИ
 #include "console.h"           // Заголовочный файл консольных функций
 #include "console.cpp"         // Реализация консольных функций
-// СЕТЕВЫЕ БИБЛИОТЕКИ
+
+// 1.4 СЕТЕВЫЕ БИБЛИОТЕКИ
 #include <curl/curl.h>         // Библиотека libcurl для HTTP запросов
 #include "json.hpp"            // Библиотека nlohmann/json для работы с JSON
-// ЗАГОЛОВКИ ОС (Windows)
+
+// 1.5 ЗАГОЛОВКИ ОС (Windows)
 #ifdef _WIN32
 #include <Windows.h>           // Windows API (работа с окнами, клавиатурой)
 #endif
 
-// ГЛОБАЛЬНЫЕ МЬЮТЕКСЫ
-std::atomic<bool> g_is_interrupted{false};          // Флаг прерывания для сетевых запросов (curl)
-std::atomic<int>  llama_interrupted{0};             // Флаг прерывания генерации LLaMA (связь с озвучкой)
-std::atomic<bool> g_shutting_down{false};
+// ============================================================================
+// 2. ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ И МЬЮТЕКСЫ (ЕДИНЫЙ ФЛАГ ПРЕРЫВАНИЯ)
+// ============================================================================
 
+// 2.1 Единая система прерываний
+// WHY: Вместо g_is_interrupted, llama_interrupted, g_user_started_speaking,
+//      g_voice_interrupted_active используем один атомарный enum.
+//      Это исключает состояние гонки и дублирование логики прерывания.
+enum class InterruptReason : uint8_t {
+    NONE = 0,           // Нет прерывания, генерация продолжается
+    VAD_SPEECH,         // Обнаружена речь пользователя (в цикле генерации)
+    HOTKEY_STOP,        // Пользователь нажал Ctrl+Space
+    HOTKEY_ALT,         // Push-to-talk: Alt зажат
+    MANUAL_STOP         // Команда "Стоп" из распознанного текста
+};
+
+std::atomic<InterruptReason> g_interrupt_reason{InterruptReason::NONE};
+std::atomic<bool> g_interrupt_processed{false};     // Защита от двойного вызова stop_tts
+std::atomic<bool> g_shutting_down{false};           // Флаг завершения программы
+std::string g_xtts_control_file_path = "";          // Путь к файлу управления TTS
+std::mutex  g_xtts_control_mutex;                   // Мьютекс для доступа к пути
 std::queue<std::string> input_queue;                // Очередь ввода с клавиатуры
-std::mutex              input_mutex;                // Мьютекс для защиты input_queue
 
+std::mutex              input_mutex;                // Мьютекс для защиты input_queue
 std::atomic<bool> keyboard_input_running{true};     // Флаг работы потока ввода с клавиатуры
 
 std::string g_hotkey_pressed = "";                  // Последняя нажатая горячая клавиша
@@ -94,15 +117,22 @@ std::mutex  g_last_tts_mutex;                       // Мьютекс для з�
 std::atomic<bool> g_shortcut_thread_running{true};  // Флаг работы потока горячих клавиш
 std::mutex  g_llama_mutex;                          // Мьютекс для защиты ctx_llama
 
+// Глобальный флаг verbose режима (доступен из любой функции, включая stop_tts_immediately)
+std::atomic<bool> g_verbose_mode{false};
+
+// ========== КОНСТАНТЫ ДЛЯ УПРАВЛЕНИЯ ПОТОКАМИ ==========
+const int THREAD_CLEANUP_INTERVAL = 5;   // Очищать завершённые потоки каждые N ответов
+const int VAD_CHECK_INTERVAL_TOKENS = 3; // Проверять VAD каждые N токенов (было 2, сделал 3 для баланса)
+// ========== КОНЕЦ КОНСТАНТ ==========
+
 // ФУНКЦИЯ ТОКЕНИЗАЦИИ ТЕКСТА
 // Преобразует текст в последовательность токенов модели LLaMA
-
 static std::vector<llama_token> llama_tokenize(struct llama_context * ctx, const std::string & text, bool add_bos) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // Начальный размер с запасом (как в старой версии)
-    int n_tokens = text.length() + add_bos;
+    int n_tokens = static_cast<int>(text.length()) + (add_bos ? 1 : 0);
     std::vector<llama_token> result(n_tokens);
 
     // Токенизация с реальным буфером
@@ -110,14 +140,15 @@ static std::vector<llama_token> llama_tokenize(struct llama_context * ctx, const
 
     if (n_tokens < 0) {
         // Если буфер мал, увеличиваем до нужного размера
-        result.resize(-n_tokens);
+        result.resize(static_cast<size_t>(-n_tokens));
         int check = llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_bos, false);
         if (check != -n_tokens) {
             fprintf(stderr, "Warning: token count mismatch after resize\n");
         }
+        result.resize(static_cast<size_t>(n_tokens));
     } else {
         // Обрезаем до реального размера
-        result.resize(n_tokens);
+        result.resize(static_cast<size_t>(n_tokens));
     }
 
     return result;
@@ -134,11 +165,11 @@ static std::string llama_token_to_piece(const struct llama_context * ctx, llama_
     // Преобразуем токен в текст
     const int n_tokens = llama_token_to_piece(vocab, token, result.data(), result.size(), 0, false);
     if (n_tokens < 0) { // Если буфер мал, увеличиваем его
-        result.resize(-n_tokens);
+        result.resize(static_cast<size_t>(-n_tokens));
         int check = llama_token_to_piece(vocab, token, result.data(), result.size(), 0, false);
         GGML_ASSERT(check == -n_tokens); // Проверяем корректность
     } else {
-        result.resize(n_tokens); // Устанавливаем точный размер
+        result.resize(static_cast<size_t>(n_tokens)); // Устанавливаем точный размер
     }
 
     return std::string(result.data(), result.size());
@@ -195,8 +226,8 @@ struct whisper_params {
     int32_t audio_ctx    = 0;
     int32_t n_gpu_layers = 999;
 
-	float vad_thold        = 0.6f;           //  VAD
-    float vad_start_thold  = 0.000270f;       // Снижен для более быстрого определения начала речи
+    float vad_thold        = 0.6f;           //  VAD
+    float vad_start_thold  = 0.000270f;      // Снижен для более быстрого определения начала речи
     float vad_last_ms      = 1250;           // Уменьшена пауза между фразами для русской речи
     float freq_thold       = 90.0f;
 
@@ -209,7 +240,7 @@ struct whisper_params {
     bool verbose_prompt = false;
     bool verbose        = false;
     bool use_gpu        = true;
-	bool flash_attn     = false;
+    bool flash_attn     = false;
     bool allow_newline  = false;
     bool multi_chars    = false;
     bool xtts_intro     = false;
@@ -219,34 +250,34 @@ struct whisper_params {
     int sleep_before_xtts = 0; // in ms
     int main_gpu = 0;
     // Параметры прерывания генерации
-    int32_t interrupt_check_ms   = 200;    // Как часто проверять микрофон (мс)
-    int32_t interrupt_threshold_ms = 250;   // Сколько мс речи нужно для прерывания
-	std::string person      = "Друг";
+    int32_t interrupt_check_ms   = 50;      // проверка каждые 50 мс вместо 200
+    int32_t interrupt_threshold_ms = 100;  // 100 мс речи достаточно для прерывания
+    std::string person      = "Друг";
     std::string bot_name    = "Эмма";
     std::string xtts_voice  = "Эмма";
-    std::string wake_cmd    = "";      // Команда пробуждения (например "Эмма,")
+    std::string wake_cmd    = "";          // Команда пробуждения (например "Эмма,")
     std::string heard_ok    = "";
     std::string language    = "ru";
     std::string model_wsp   = "whisper-ggml-medium-q4_0.bin";
     std::string model_llama = "saiga_yandexgpt_8b_Q5_K.gguf";
     std::string speak       = "speak";
-	std::string speak_file  = "to_speak.txt"; // not used
+    std::string speak_file  = "to_speak.txt"; // not used
     std::string xtts_control_path = "xtts_play_allowed.txt";
     std::string xtts_url = "http://localhost:8020/";
     std::string google_url = "http://localhost:8003/";
     std::string prompt      = "";
-	std::string instruct_preset = "";
-	std::string split_mode = "none";
+    std::string instruct_preset = "";
+    std::string split_mode = "none";
     std::vector<float> tensor_split;
-	std::map<std::string, std::string> instruct_preset_data = {
-		{"system_prompt_prefix", ""},
-		{"system_prompt_suffix", ""},
-		{"user_message_prefix", ""},
-		{"user_message_suffix", ""},
-		{"bot_message_prefix", ""},
-		{"bot_message_suffix", ""},
-		{"stop_sequence", ""}
-	};
+    std::map<std::string, std::string> instruct_preset_data = {
+        {"system_prompt_prefix", ""},
+        {"system_prompt_suffix", ""},
+        {"user_message_prefix", ""},
+        {"user_message_suffix", ""},
+        {"bot_message_prefix", ""},
+        {"bot_message_suffix", ""},
+        {"stop_sequence", ""}
+    };
     std::string fname_out;
     std::string path_session = "";
     std::string stop_words = "";
@@ -285,38 +316,81 @@ bool whisper_params_parse(int argc, char **argv, whisper_params &params) {
                 }
                 params.n_threads = std::stoi(argv[++i]);
             }
-
             else if (arg == "-vms" || arg == "--voice-ms") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.voice_ms = std::stoi(argv[++i]);
             }
             else if (arg == "-c" || arg == "--capture") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.capture_id = std::stoi(argv[++i]);
             }
             else if (arg == "--interrupt-check-ms") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.interrupt_check_ms = std::stoi(argv[++i]);
             }
             else if (arg == "--interrupt-threshold-ms") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.interrupt_threshold_ms = std::stoi(argv[++i]);
             }
             else if (arg == "-mt" || arg == "--max-tokens") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.max_tokens = std::stoi(argv[++i]);
             }
             else if (arg == "-ac" || arg == "--audio-ctx") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.audio_ctx = std::stoi(argv[++i]);
             }
             else if (arg == "-ngl" || arg == "--n-gpu-layers") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.n_gpu_layers = std::stoi(argv[++i]);
             }
             else if (arg == "-vth" || arg == "--vad-thold") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.vad_thold = std::stof(argv[++i]);
             }
             else if (arg == "-vths" || arg == "--vad-start-thold") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.vad_start_thold = std::stof(argv[++i]);
             }
             else if (arg == "-vlm" || arg == "--vad-last-ms") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.vad_last_ms = std::stoi(argv[++i]);
             }
             else if (arg == "-fth" || arg == "--freq-thold") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.freq_thold = std::stof(argv[++i]);
             }
             else if (arg == "-su" || arg == "--speed-up") {
@@ -347,72 +421,159 @@ bool whisper_params_parse(int argc, char **argv, whisper_params &params) {
                 params.flash_attn = true;
             }
             else if (arg == "-p" || arg == "--person") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.person = argv[++i];
             }
             else if (arg == "-bn" || arg == "--bot-name") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.bot_name = argv[++i];
             }
             else if (arg == "--session") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.path_session = argv[++i];
             }
             else if (arg == "-w" || arg == "--wake-command") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.wake_cmd = argv[++i];
             }
             else if (arg == "-ho" || arg == "--heard-ok") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.heard_ok = argv[++i];
             }
             else if (arg == "-l" || arg == "--language") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.language = argv[++i];
             }
             else if (arg == "-mw" || arg == "--model-whisper") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.model_wsp = argv[++i];
             }
             else if (arg == "-ml" || arg == "--model-llama") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.model_llama = argv[++i];
             }
             else if (arg == "-s" || arg == "--speak") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.speak = argv[++i];
             }
             else if (arg == "-sf" || arg == "--speak-file") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.speak_file = argv[++i];
             }
             else if (arg == "--ctx_size") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.ctx_size = std::stoi(argv[++i]);
             }
             else if (arg == "-b" || arg == "--batch-size") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.batch_size = std::stoi(argv[++i]);
             }
             else if (arg == "-n" || arg == "--n_predict") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.n_predict = std::stoi(argv[++i]);
             }
             else if (arg == "--temp") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.temp = std::stof(argv[++i]);
             }
             else if (arg == "--top_k") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.top_k = std::stoi(argv[++i]);
             }
             else if (arg == "--top_p") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.top_p = std::stof(argv[++i]);
             }
             else if (arg == "--min_p") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.min_p = std::stof(argv[++i]);
             }
             else if (arg == "--repeat_penalty") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.repeat_penalty = std::stof(argv[++i]);
             }
             else if (arg == "--repeat_last_n") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.repeat_last_n = std::stoi(argv[++i]);
             }
             else if (arg == "--n_keep") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.n_keep = std::stoi(argv[++i]);
             }
             else if (arg == "--main-gpu") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.main_gpu = std::stoi(argv[++i]);
             }
             else if (arg == "--split-mode") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.split_mode = argv[++i];
             }
-
             else if (arg == "--tensor-split") {
                 // Безопасная обработка tensor-split аргумента
                 if (i + 1 >= argc) {
@@ -451,17 +612,32 @@ bool whisper_params_parse(int argc, char **argv, whisper_params &params) {
                     std::cerr << "Warning: tensor-split values sum to " << sum << " (expected ~1.0)" << std::endl;
                 }
             }
-
             else if (arg == "--xtts-voice") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.xtts_voice = argv[++i];
             }
             else if (arg == "--xtts-url") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.xtts_url = argv[++i];
             }
             else if (arg == "--google-url") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.google_url = argv[++i];
             }
             else if (arg == "--xtts-control-path") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.xtts_control_path = argv[++i];
             }
             else if (arg == "--allow-newline") {
@@ -474,6 +650,10 @@ bool whisper_params_parse(int argc, char **argv, whisper_params &params) {
                 params.xtts_intro = true;
             }
             else if (arg == "--sleep-before-xtts") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.sleep_before_xtts = std::stoi(argv[++i]);
             }
             else if (arg == "--seqrep") {
@@ -483,20 +663,35 @@ bool whisper_params_parse(int argc, char **argv, whisper_params &params) {
                 params.push_to_talk = true;
             }
             else if (arg == "--split-after") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.split_after = std::stoi(argv[++i]);
             }
             else if (arg == "--min-tokens") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.min_tokens = std::stoi(argv[++i]);
             }
             else if (arg == "--stop-words") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.stop_words = argv[++i];
             }
             else if (arg == "--instruct-preset") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.instruct_preset = argv[++i];
             }
             else if (arg == "--prompt-file") {
-                if (i + 1 >= argc) { // Проверяем, есть ли аргумент после --prompt-file
-                    std::cerr << "Error: --prompt-file requires a filename." << std::endl;
+                if (i + 1 >= argc) { // Проверяем, есть ли аргумент после --prompt-file                    std::cerr << "Error: --prompt-file requires a filename." << std::endl;
                     whisper_print_usage(argc, argv, params);
                     return false;
                 }
@@ -513,6 +708,10 @@ bool whisper_params_parse(int argc, char **argv, whisper_params &params) {
                 }
             }
             else if (arg == "-f" || arg == "--file") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value after " << arg << std::endl;
+                    return false;
+                }
                 params.fname_out = argv[++i];
             }
             else {
@@ -521,12 +720,11 @@ bool whisper_params_parse(int argc, char **argv, whisper_params &params) {
                 return false;
             }
         }
-            catch (const std::exception &e) {
-                std::cerr << "Error parsing argument: " << e.what() << std::endl;
-                // очистка не нужна - вектор сам управляет памятью
-                whisper_print_usage(argc, argv, params);
-                return false;
-            }
+        catch (const std::exception &e) {
+            std::cerr << "Error parsing argument: " << e.what() << std::endl;
+            whisper_print_usage(argc, argv, params);
+            return false;
+        }
     }
     return true;
 }
@@ -546,8 +744,8 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -ac N,    --audio-ctx N    [%-7d] audio context size (0 - all)\n",                params.audio_ctx);
     fprintf(stderr, "  -ngl N,   --n-gpu-layers N [%-7d] number of layers to store in VRAM\n",           params.n_gpu_layers);
     fprintf(stderr, "  -vth N,   --vad-thold N    [%-7.2f] voice avg activity detection threshold\n",    params.vad_thold);
-	fprintf(stderr, "  -vths N,  --vad-start-thold N [%-7.6f] vad min level to stop tts, 0: off, 0.000270: default\n",params.vad_start_thold);
-    fprintf(stderr, "  -vlm N,   --vad-last-ms N  [%-7.2f] vad min silence after speech, ms\n",       	 params.vad_last_ms);
+    fprintf(stderr, "  -vths N,  --vad-start-thold N [%-7.6f] vad min level to stop tts, 0: off, 0.000270: default\n",params.vad_start_thold);
+    fprintf(stderr, "  -vlm N,   --vad-last-ms N  [%-7.2f] vad min silence after speech, ms\n",        params.vad_last_ms);
     fprintf(stderr, "  -fth N,   --freq-thold N   [%-7.2f] high-pass frequency cutoff\n",                params.freq_thold);
     fprintf(stderr, "  -su,      --speed-up       [%-7s] speed up audio by x2 (not working)\n",          params.speed_up ? "true" : "false");
     fprintf(stderr, "  -tr,      --translate      [%-7s] translate from source language to english\n",   params.translate ? "true" : "false");
@@ -557,7 +755,7 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -vp,      --verbose-prompt [%-7s] print prompt at start\n",                       params.verbose_prompt ? "true" : "false");
     fprintf(stderr, "  --verbose                  [%-7s] print speed\n",                                 params.verbose ? "true" : "false");
     fprintf(stderr, "  -ng,      --no-gpu         [%-7s] disable GPU\n",                                 params.use_gpu ? "false" : "true");
-	fprintf(stderr, "  -fa,      --flash-attn     [%-7s] flash attention\n",                             params.flash_attn ? "true" : "false");
+    fprintf(stderr, "  -fa,      --flash-attn     [%-7s] flash attention\n",                             params.flash_attn ? "true" : "false");
     fprintf(stderr, "  -p NAME,  --person NAME    [%-7s] person name (for prompt selection)\n",          params.person.c_str());
     fprintf(stderr, "  -bn NAME, --bot-name NAME  [%-7s] bot name (to display)\n",                       params.bot_name.c_str());
     fprintf(stderr, "  -w TEXT,  --wake-command T [%-7s] wake-up command to listen for\n",               params.wake_cmd.c_str());
@@ -566,16 +764,16 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -mw FILE, --model-whisper  [%-7s] whisper model file\n",                          params.model_wsp.c_str());
     fprintf(stderr, "  -ml FILE, --model-llama    [%-7s] llama model file\n",                            params.model_llama.c_str());
     fprintf(stderr, "  -s FILE,  --speak TEXT     [%-7s] command for TTS\n",                             params.speak.c_str());
-	fprintf(stderr, "  -sf FILE, --speak-file     [%-7s] file to pass to TTS\n",                         params.speak_file.c_str());
+    fprintf(stderr, "  -sf FILE, --speak-file     [%-7s] file to pass to TTS\n",                         params.speak_file.c_str());
     fprintf(stderr, "  --prompt-file FNAME        [%-7s] file with custom prompt to start dialog\n",     "");
-    fprintf(stderr, "  --instruct-preset TEXT     [%-7s] instruct preset to use without .json \n",     	 "");
+    fprintf(stderr, "  --instruct-preset TEXT     [%-7s] instruct preset to use without .json \n",       "");
     fprintf(stderr, "  --session FNAME                   file to cache model state in (may be large!) (default: none)\n");
     fprintf(stderr, "  -f FNAME, --file FNAME     [%-7s] text output file name\n",                       params.fname_out.c_str());
     fprintf(stderr, "   --ctx_size N              [%-7d] Size of the prompt context\n",                  params.ctx_size);
     fprintf(stderr, "  -b N,     --batch-size N   [%-7d] Size of input batch size\n",                    params.batch_size);
     fprintf(stderr, "  -n N,     --n_predict N    [%-7d] Max number of tokens to predict\n",             params.n_predict);
     fprintf(stderr, "  --temp N                   [%-7.2f] Temperature \n",                              params.temp);
-    fprintf(stderr, "  --top_k N                  [%-7d] top_k \n",                                    params.top_k);
+    fprintf(stderr, "  --top_k N                  [%-7d] top_k \n",                                      params.top_k);
     fprintf(stderr, "  --top_p N                  [%-7.2f] top_p \n",                                    params.top_p);
     fprintf(stderr, "  --min_p N                  [%-7.2f] min_p \n",                                    params.min_p);
     fprintf(stderr, "  --repeat_penalty N         [%-7.2f] repeat_penalty \n",                           params.repeat_penalty);
@@ -583,20 +781,20 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  --n_keep N                 [%-7d] keep first n_tokens after context_shift \n",    params.n_keep);
     fprintf(stderr, "  --main-gpu N               [%-7d] main GPU id, starting from 0 \n",               params.main_gpu);
     fprintf(stderr, "  --split-mode NAME          [%-7s] GPU split mode: 'none' or 'layer'\n",           params.split_mode.c_str());
-    fprintf(stderr, "  --tensor-split NAME        [    ] Tensor split, list of floats: 0.5,0.5\n"),
+    fprintf(stderr, "  --tensor-split NAME        [    ] Tensor split, list of floats: 0.5,0.5\n");
     fprintf(stderr, "  --xtts-voice NAME          [%-7s] xtts voice without .wav\n",                     params.xtts_voice.c_str());
     fprintf(stderr, "  --xtts-url TEXT            [%-7s] xtts/silero server URL, with trailing slash\n", params.xtts_url.c_str());
     fprintf(stderr, "  --xtts-control-path FNAME  [%-7s] not used anymore\n",                            params.xtts_control_path.c_str());
-	fprintf(stderr, "  --xtts-intro               [%-7s] xtts instant short random intro like Hmmm.\n",  params.xtts_intro ? "true" : "false");
+    fprintf(stderr, "  --xtts-intro               [%-7s] xtts instant short random intro like Hmmm.\n",  params.xtts_intro ? "true" : "false");
     fprintf(stderr, "  --sleep-before-xtts        [%-7d] sleep llama inference before xtts, ms.\n",      params.sleep_before_xtts);
     fprintf(stderr, "  --google-url TEXT          [%-7s] langchain google-serper server URL, with /\n",  params.google_url.c_str());
     fprintf(stderr, "  --allow-newline            [%-7s] allow new line in llama output\n",              params.allow_newline ? "true" : "false");
     fprintf(stderr, "  --multi-chars              [%-7s] xtts will use same wav name as in llama output\n", params.multi_chars ? "true" : "false");
-    fprintf(stderr, "  --push-to-talk             [%-7s] hold Alt to speak\n",							 params.push_to_talk ? "true" : "false");
+    fprintf(stderr, "  --push-to-talk             [%-7s] hold Alt to speak\n",                           params.push_to_talk ? "true" : "false");
     fprintf(stderr, "  --seqrep                   [%-7s] sequence repetition penalty, search last 20 in 300\n",params.seqrep ? "true" : "false");
     fprintf(stderr, "  --split-after N            [%-7d] split after first n tokens for tts\n",          params.split_after);
     fprintf(stderr, "  --min-tokens N             [%-7d] min new tokens to output\n",                    params.min_tokens);
-	fprintf(stderr, "  --stop-words TEXT          [%-7s] llama stop w: separated by ; \n",               params.stop_words.c_str());
+    fprintf(stderr, "  --stop-words TEXT          [%-7s] llama stop w: separated by ; \n",               params.stop_words.c_str());
     fprintf(stderr, "\n");
 }
 
@@ -606,7 +804,7 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
 float get_current_time_ms() {
     auto now = std::chrono::high_resolution_clock::now();
     auto duration = now.time_since_epoch();
-    return std::chrono::duration_cast<std::chrono::milliseconds>(duration).count() / 1000.0f;
+    return static_cast<float>(std::chrono::duration_cast<std::chrono::milliseconds>(duration).count()) / 1000.0f;
 }
 
 // -----------------------------------------------------------------------------
@@ -627,6 +825,34 @@ static void safe_thread_emplace(std::vector<std::thread>& threads_vec,
         threads_vec.emplace_back(std::move(task));
     } catch (const std::exception& e) {
         std::cerr << "Ошибка создания потока: " << e.what() << std::endl;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// @brief Очистка завершённых потоков TTS
+// @param threads_vec Вектор потоков
+// -----------------------------------------------------------------------------
+static void cleanup_finished_threads(std::vector<std::thread>& threads_vec) {
+    if (threads_vec.empty()) return;
+    
+    std::scoped_lock lock(g_threads_mutex);
+    
+    // Удаляем завершённые потоки
+    for (auto it = threads_vec.begin(); it != threads_vec.end(); ) {
+        if (it->joinable()) {
+            ++it;
+        } else {
+            it = threads_vec.erase(it);
+        }
+    }
+    
+    // Если всё равно слишком много (>50) — обрезаем до 25 самых новых
+    if (threads_vec.size() > 50) {
+        size_t to_erase = threads_vec.size() - 25;
+        threads_vec.erase(threads_vec.begin(), threads_vec.begin() + to_erase);
+        if (g_verbose_mode.load()) {
+            fprintf(stderr, "[Threads] Trimmed to %zu\n", threads_vec.size());
+        }
     }
 }
 
@@ -659,7 +885,9 @@ static std::string transcribe(
     }
 
     if (pcmf32.empty()) {
-        std::cerr << "Ошибка: Входные аудиоданные пусты" << std::endl;
+        if (params.verbose) {
+            std::cerr << "Ошибка: Входные аудиоданные пусты" << std::endl;
+        }
         return "";
     }
 
@@ -686,11 +914,11 @@ static std::string transcribe(
         prompt_tokens_vec.resize(prompt_text.size() + 1);
         int n_tokens = whisper_tokenize(ctx, prompt_text.c_str(),
                                          prompt_tokens_vec.data(),
-                                         prompt_tokens_vec.size());
+                                         static_cast<int>(prompt_tokens_vec.size()));
         if (n_tokens > 0) {
-            prompt_tokens_vec.resize(n_tokens);
+            prompt_tokens_vec.resize(static_cast<size_t>(n_tokens));
             wparams.prompt_tokens = prompt_tokens_vec.data();
-            wparams.prompt_n_tokens = prompt_tokens_vec.size();
+            wparams.prompt_n_tokens = static_cast<int>(prompt_tokens_vec.size());
         } else {
             // Токенизация не удалась — отключаем промпт
             wparams.prompt_tokens = nullptr;
@@ -715,8 +943,8 @@ static std::string transcribe(
 
     // === ОПТИМАЛЬНЫЕ НАСТРОЙКИ ДЛЯ РАСПОЗНАВАНИЯ РЕЧИ ===
     // ИСПРАВЛЕНО: контекст ВКЛЮЧЕН для предотвращения повторов
-    wparams.no_context       = false;  // ← КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: модель помнит что сказала
-    wparams.single_segment   = false;  // ← КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: быстрее и стабильнее
+    wparams.no_context       = false;  // КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: модель помнит что сказала
+    wparams.single_segment   = false;  // КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: быстрее и стабильнее
     wparams.token_timestamps = false;  // Временные метки не нужны, экономим ресурсы
 
     // Подавление мусора и хезитаций
@@ -727,8 +955,8 @@ static std::string transcribe(
     wparams.temperature      = 0.0f;   // Нулевая температура для стабильного результата
     wparams.temperature_inc  = 0.0f;   // Без повышения температуры
     wparams.length_penalty   = 0.0f;   // Без штрафа за длину
-    wparams.entropy_thold    = 2.4f;   // ← ДОБАВЛЕНО: если модель неуверена → молчит
-    wparams.max_len          = 0;      // ← ДОБАВЛЕНО: авто-ограничение длины
+    wparams.entropy_thold    = 2.4f;   // ДОБАВЛЕНО: если модель неуверена → молчит
+    wparams.max_len          = 0;      // ДОБАВЛЕНО: авто-ограничение длины
 
     // Настройка максимального количества токенов
     {
@@ -737,9 +965,11 @@ static std::string transcribe(
         int mt = (params.max_tokens > 0) ? params.max_tokens : 64;
 
         if (mt > model_text_ctx) {
-            std::cerr << "Предупреждение: max_tokens (" << mt
-                      << ") превышает лимит модели (" << model_text_ctx
-                      << "), применяется лимит модели" << std::endl;
+            if (params.verbose) {
+                std::cerr << "Предупреждение: max_tokens (" << mt
+                          << ") превышает лимит модели (" << model_text_ctx
+                          << "), применяется лимит модели" << std::endl;
+            }
             mt = model_text_ctx;
         }
         wparams.max_tokens = mt;
@@ -750,9 +980,11 @@ static std::string transcribe(
     int model_audio_ctx = static_cast<int>(whisper_n_audio_ctx(ctx));
 
     if (wparams.audio_ctx > model_audio_ctx) {
-        std::cerr << "Предупреждение: audio_ctx (" << wparams.audio_ctx
-                  << ") превышает лимит модели (" << model_audio_ctx
-                  << "), применяется лимит модели" << std::endl;
+        if (params.verbose) {
+            std::cerr << "Предупреждение: audio_ctx (" << wparams.audio_ctx
+                      << ") превышает лимит модели (" << model_audio_ctx
+                      << "), применяется лимит модели" << std::endl;
+        }
         wparams.audio_ctx = model_audio_ctx;
     }
 
@@ -761,16 +993,15 @@ static std::string transcribe(
     wparams.n_threads = params.n_threads;
 
     // Выполнение транскрипции
-    if (whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size()) != 0) {
-        std::cerr << "Ошибка: Не удалось выполнить транскрипцию аудио" << std::endl;
+    if (whisper_full(ctx, wparams, pcmf32.data(), static_cast<int>(pcmf32.size())) != 0) {
+        if (params.verbose) {
+            std::cerr << "Ошибка: Не удалось выполнить транскрипцию аудио" << std::endl;
+        }
         // Расчёт времени выполнения даже при ошибке
         const auto t_end = std::chrono::high_resolution_clock::now();
         t_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
         return "";
     }
-
-    // Если распознавание началось, значит юзер говорит — прерываем старый TTS
-    g_is_interrupted.store(true);
 
     // Сбор результатов транскрипции
     int prob_n = 0;
@@ -786,12 +1017,9 @@ static std::string transcribe(
         // Расчёт вероятности для сегмента
         const int n_tokens = whisper_full_n_tokens(ctx, i);
         for (int j = 0; j < n_tokens; ++j) {
-            // Защита от некорректных индексов токенов
-            if (i >= 0 && i < n_segments && j >= 0 && j < n_tokens) {
-                const auto token = whisper_full_get_token_data(ctx, i, j);
-                prob += token.p;
-                ++prob_n;
-            }
+            const auto token = whisper_full_get_token_data(ctx, i, j);
+            prob += token.p;
+            ++prob_n;
         }
     }
 
@@ -800,7 +1028,9 @@ static std::string transcribe(
         prob /= static_cast<float>(prob_n);
     } else {
         prob = 0.0f;
-        std::cerr << "Предупреждение: Нет токенов для вычисления вероятности" << std::endl;
+        if (params.verbose) {
+            std::cerr << "Предупреждение: Нет токенов для вычисления вероятности" << std::endl;
+        }
     }
 
     // Замер времени выполнения
@@ -809,7 +1039,9 @@ static std::string transcribe(
 
     // Защита от отрицательного времени (редкий случай проблем с системными часами)
     if (duration.count() < 0) {
-        std::cerr << "Предупреждение: Обнаружено отрицательное время выполнения" << std::endl;
+        if (params.verbose) {
+            std::cerr << "Предупреждение: Обнаружено отрицательное время выполнения" << std::endl;
+        }
         t_ms = 0;
     } else {
         t_ms = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
@@ -845,9 +1077,13 @@ std::string getTempDir() {
             return temp_path.string();
         }
     } catch (const std::exception &e) {
-        std::cerr << "[getTempDir] filesystem exception: " << e.what() << std::endl;
+        if (g_verbose_mode.load()) {
+            std::cerr << "[getTempDir] filesystem exception: " << e.what() << std::endl;
+        }
     } catch (...) {
-        std::cerr << "[getTempDir] Unknown filesystem exception" << std::endl;
+        if (g_verbose_mode.load()) {
+            std::cerr << "[getTempDir] Unknown filesystem exception" << std::endl;
+        }
     }
 
 #ifdef _WIN32
@@ -856,13 +1092,17 @@ std::string getTempDir() {
     DWORD ret_val = GetTempPath(MAX_PATH, path_buf);
 
     if (ret_val == 0 || ret_val > MAX_PATH) {
-        std::cerr << "[getTempDir] GetTempPath failed, error: " << GetLastError() << std::endl;
+        if (g_verbose_mode.load()) {
+            std::cerr << "[getTempDir] GetTempPath failed, error: " << GetLastError() << std::endl;
+        }
         return "";
     }
 
     // Проверяем, что буфер не пуст
     if (path_buf[0] == 0) {
-        std::cerr << "[getTempDir] GetTempPath returned empty path" << std::endl;
+        if (g_verbose_mode.load()) {
+            std::cerr << "[getTempDir] GetTempPath returned empty path" << std::endl;
+        }
         return "";
     }
 
@@ -876,10 +1116,14 @@ std::string getTempDir() {
             }
             return result;
         } catch (const std::exception &e) {
-            std::cerr << "[getTempDir] UTF-8 conversion failed: " << e.what() << std::endl;
+            if (g_verbose_mode.load()) {
+                std::cerr << "[getTempDir] UTF-8 conversion failed: " << e.what() << std::endl;
+            }
             return "";
         } catch (...) {
-            std::cerr << "[getTempDir] Unknown error during UTF-8 conversion" << std::endl;
+            if (g_verbose_mode.load()) {
+                std::cerr << "[getTempDir] Unknown error during UTF-8 conversion" << std::endl;
+            }
             return "";
         }
     #else
@@ -900,86 +1144,70 @@ std::string getTempDir() {
 #endif
 }
 
-// Записывает в файл значение 0 или 1, чтобы разрешить или запретить воспроизведение XTTS
-// @path: ссылка на строку, куда будет записан полный путь к файлу (возвращается для отладки)
-// @xtts_play_allowed: 0 — воспроизведение запрещено, 1 — разрешено
+// ============================================================================
+// БЫСТРЫЙ ФАЙЛОВЫЙ СЕМАФОР ДЛЯ TTS (C-STYLE I/O)
+// ============================================================================
+// WHY: std::ofstream слишком медленный для real-time прерываний.
+//      Используем fopen/fprintf/fflush для гарантированного мгновенного сброса
+//      байта '0' или '1' на диск, даже если файл занят чтением Python-процессом.
+// ============================================================================
 void allow_xtts_file(std::string& path, int xtts_play_allowed) {
-    // Получаем путь к временной директории с использованием std::filesystem
-    std::string temp_path = getTempDir();
-    if (temp_path.empty()) {
-        std::cerr << "ERROR: allow_xtts_file: Could not get temporary directory." << std::endl;
-        return;
-    }
-    // Формируем путь к файлу корректно — через std::filesystem, чтобы избежать проблем со слешами
-    // Это гарантирует работу как на Windows, так и на Linux/macOS
-    #if __cplusplus >= 201703L
-    std::filesystem::path p(temp_path);
-    path = (p / "xtts_play_allowed.txt").string();
-    #else
-    // Резервный вариант для старых компиляторов
-    if (!temp_path.empty() && temp_path.back() != '/' && temp_path.back() != '\\') {
-        temp_path += '/';
-    }
-    path = temp_path + "xtts_play_allowed.txt";
-    #endif
-
-    const std::string fileName{path};
-    // Открываем файл для чтения
-    std::ifstream readStream(fileName);
-    std::string singleLine;
-    bool fileExists = readStream.is_open();
-
-    if (!fileExists) {
-        // Файл не существует — пробуем создать его
-        std::ofstream writeStream(fileName);
-        if (!writeStream.is_open()) {
-            std::cerr << "ERROR: allow_xtts_file: Failed to create file: " << fileName << std::endl;
+    // Вычисляем полный путь только один раз при первом вызове
+    if (g_xtts_control_file_path.empty()) {
+        std::string temp_path = getTempDir();
+        if (temp_path.empty()) {
+            std::cerr << "[CRITICAL] allow_xtts_file: Could not get temporary directory." << std::endl;
             return;
         }
-        writeStream << xtts_play_allowed;
-        writeStream.flush();
-    } else {
-        // Файл существует — читаем
-        std::getline(readStream, singleLine);
-        readStream.close();
+        #if __cplusplus >= 201703L
+        std::filesystem::path p(temp_path);
+        g_xtts_control_file_path = (p / "xtts_play_allowed.txt").string();
+        #else
+        g_xtts_control_file_path = temp_path;
+        if (g_xtts_control_file_path.back() != '/' && g_xtts_control_file_path.back() != '\\')
+            g_xtts_control_file_path += '/';
+        g_xtts_control_file_path += "xtts_play_allowed.txt";
+        #endif
+    }
 
-        // Преобразуем строку в число
-        int stored_value = 0;
-        try {
-            stored_value = std::stoi(singleLine);
-        } catch (...) {
-            stored_value = -1; // Некорректное значение — перезаписывать
-        }
+    path = g_xtts_control_file_path;
 
-        // Если значение отличается — обновляем файл
-        if (stored_value != xtts_play_allowed) {
-            std::ofstream writeStream(fileName);
-            if (!writeStream.is_open()) {
-                std::cerr << "ERROR: allow_xtts_file: Failed to write to file: " << fileName << std::endl;
-                return;
-            }
-            writeStream << xtts_play_allowed;
-            writeStream.flush();
-        }
+    // Быстрая запись через C-style I/O (без буферизации STL)
+    FILE* fp = fopen(g_xtts_control_file_path.c_str(), "w");
+    if (fp) {
+        fprintf(fp, "%d", xtts_play_allowed);
+        fflush(fp);   // мгновенный сброс на диск
+        fclose(fp);
+    } else if (g_verbose_mode.load()) {
+        std::cerr << "[WARN] allow_xtts_file: Failed to write to " << g_xtts_control_file_path << std::endl;
     }
 }
 
-// ============================================================
-// ФУНКЦИЯ МГНОВЕННОЙ ОСТАНОВКИ TTS (ТОЛЬКО ФАЙЛОВЫЙ КОНТРОЛЬ)
-// ============================================================
-void stop_tts_immediately() {
-    // 1. Записываем 0 в файл (блокировка новых чанков)
-    std::string dummy_path;
-    allow_xtts_file(dummy_path, 0);
-    
-    // 2. HTTP-запрос к серверу для немедленной остановки стрима
-    CURL* curl = curl_easy_init();
-    if (curl) {
-        curl_easy_setopt(curl, CURLOPT_URL, "http://localhost:8020/stop_stream");
-        curl_easy_setopt(curl, CURLOPT_POST, 1L);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 50L);
-        curl_easy_perform(curl);
-        curl_easy_cleanup(curl);
+
+// ============================================================================
+// ФУНКЦИЯ ФОНОВОГО VAD-МОНИТОРА (ДЛЯ ОБНАРУЖЕНИЯ НАЧАЛА РЕЧИ)
+// ============================================================================
+// WHY: Фоновый поток для быстрого обнаружения начала речи пользователя.
+//      При обнаружении речи устанавливает g_interrupt_reason = VAD_SPEECH
+//      и вызывает stop_tts_immediately().
+// ============================================================================
+void vad_monitor_thread_func(const whisper_params& params, audio_async& audio_ref) {
+    std::vector<float> pcmf32_vad;
+    while (!g_shutting_down.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        audio_ref.get(400, pcmf32_vad);
+        if (!pcmf32_vad.empty()) {
+            int vad_result = ::vad_simple_int(pcmf32_vad, WHISPER_SAMPLE_RATE, 400,
+                                            params.vad_thold, params.freq_thold,
+                                            params.print_energy, params.vad_start_thold);
+            if (vad_result == 1) {
+                // Обнаружена речь — устанавливаем единый флаг прерывания
+                std::string dummy;
+                allow_xtts_file(dummy, 0);
+                g_interrupt_reason.store(InterruptReason::VAD_SPEECH);
+                if (params.verbose) printf("\n[VAD-MONITOR] Речь обнаружена!\n");
+            }
+        }
     }
 }
 
@@ -1011,16 +1239,11 @@ inline void trim(std::string &s) {
 // Проверяет, является ли символ пунктуационным знаком
 bool IsPunctuationMark(char c) {
     switch (static_cast<unsigned char>(c)) {
-        case ',':
-            [[fallthrough]];
-        case '.':
-            [[fallthrough]];
-        case '?':
-            return true;
-		case '!':
-            return true;
-        default:
-            return false;
+        case ',': [[fallthrough]];
+        case '.': [[fallthrough]];
+        case '?': return true;
+        case '!': return true;
+        default: return false;
     }
 }
 
@@ -1039,7 +1262,7 @@ std::string StripPunctuationMarks(const std::string& text) {
 std::string LowerCase(const std::string& text) {
     std::string lowerCasedText;
     for (const auto& c : text) {
-        lowerCasedText += std::tolower(c, std::locale());  // с учётом локали
+        lowerCasedText += static_cast<char>(std::tolower(static_cast<unsigned char>(c), std::locale()));
     }
     return lowerCasedText;
 }
@@ -1064,15 +1287,15 @@ std::string ParseCommandAndGetKeyword(std::string textHeardTrimmed, const std::s
     };
 
     // Переменная для хранения результата
-	std::string result_param = "";
+    std::string result_param = "";
 
     // Удаляем ненужные слова из входной строки
     for (const auto& prefix : please_needles) {
-		sanitizedInput = ::replace(sanitizedInput, prefix, "");
-	}
+        sanitizedInput = ::replace(sanitizedInput, prefix, "");
+    }
 
     // Удаляем лишние пробелы в начале и конце строки
-	trim(sanitizedInput);
+    trim(sanitizedInput);
 
 // безопасный поиск позиции аргумента команды
     // Если команда - "google", ищем соответствующие префиксы
@@ -1110,7 +1333,7 @@ std::string ParseCommandAndGetKeyword(std::string textHeardTrimmed, const std::s
         if (found != std::string::npos) {
             size_t base = found + command.size();
             // пропускаем разделители
-            while (base < sanitizedInput.size() && (std::isspace((unsigned char)sanitizedInput[base]) || sanitizedInput[base] == ':' ))
+            while (base < sanitizedInput.size() && (std::isspace(static_cast<unsigned char>(sanitizedInput[base])) || sanitizedInput[base] == ':' ))
                 ++base;
             pos = base;
         } else {
@@ -1118,7 +1341,7 @@ std::string ParseCommandAndGetKeyword(std::string textHeardTrimmed, const std::s
             size_t foundCall = sanitizedInput.find("Call");
             if (foundCall != std::string::npos) {
                 size_t base = foundCall + 4;
-                while (base < sanitizedInput.size() && (std::isspace((unsigned char)sanitizedInput[base]) || sanitizedInput[base] == ':' ))
+                while (base < sanitizedInput.size() && (std::isspace(static_cast<unsigned char>(sanitizedInput[base])) || sanitizedInput[base] == ':' ))
                     ++base;
                 pos = base;
             } else {
@@ -1162,24 +1385,24 @@ if (command == "call")
 
     // Общие замены через regex
     if (sanitizedInput.size() >= 2) {
-        thread_local const std::regex re_male_genitive_ogo_ego(R"((.+)([оe]го)$)", std::regex_constants::icase); // Ивана́ его -> Иван
-        thread_local const std::regex re_male_u(R"((.+)у$)", std::regex_constants::icase);        // Ивану -> Иван
-        thread_local const std::regex re_male_a(R"((.+)а$)", std::regex_constants::icase);        // Ивана -> Иван
-        thread_local const std::regex re_male_om(R"((.+)ом$)", std::regex_constants::icase);      // Иваном -> Иван
-        thread_local const std::regex re_male_em(R"((.+)ем$)", std::regex_constants::icase);      // Андреем -> Андрей
-        thread_local const std::regex re_male_yu(R"((.+)ю$)", std::regex_constants::icase);       // Сергею -> Сергей
-        thread_local const std::regex re_male_yem(R"((.+)еем$)", std::regex_constants::icase);    // Дмитрием -> Дмитрий
+        thread_local const std::regex re_male_genitive_ogo_ego(R"((.+)([оe]го)$)", std::regex_constants::icase);
+        thread_local const std::regex re_male_u(R"((.+)у$)", std::regex_constants::icase);
+        thread_local const std::regex re_male_a(R"((.+)а$)", std::regex_constants::icase);
+        thread_local const std::regex re_male_om(R"((.+)ом$)", std::regex_constants::icase);
+        thread_local const std::regex re_male_em(R"((.+)ем$)", std::regex_constants::icase);
+        thread_local const std::regex re_male_yu(R"((.+)ю$)", std::regex_constants::icase);
+        thread_local const std::regex re_male_yem(R"((.+)еем$)", std::regex_constants::icase);
 
-        thread_local const std::regex re_female_e(R"((.+)е$)", std::regex_constants::icase);      // Маше -> Маша
-        thread_local const std::regex re_female_oj(R"((.+)ой$)", std::regex_constants::icase);    // Ольгой -> Ольга
-        thread_local const std::regex re_female_y(R"((.+)ы$)", std::regex_constants::icase);      // Эммы -> Эмма
-        thread_local const std::regex re_female_i(R"((.+)и$)", std::regex_constants::icase);      // Маши -> Маша
-        thread_local const std::regex re_female_ej(R"((.+)ей$)", std::regex_constants::icase);    // Наташей -> Наташа
-        thread_local const std::regex re_female_yu(R"((.+)ю$)", std::regex_constants::icase);     // Алёну -> Алёна
+        thread_local const std::regex re_female_e(R"((.+)е$)", std::regex_constants::icase);
+        thread_local const std::regex re_female_oj(R"((.+)ой$)", std::regex_constants::icase);
+        thread_local const std::regex re_female_y(R"((.+)ы$)", std::regex_constants::icase);
+        thread_local const std::regex re_female_i(R"((.+)и$)", std::regex_constants::icase);
+        thread_local const std::regex re_female_ej(R"((.+)ей$)", std::regex_constants::icase);
+        thread_local const std::regex re_female_yu(R"((.+)ю$)", std::regex_constants::icase);
 
         // Новое: имена на -ь (Любовь)
-        thread_local const std::regex re_female_instr_lyubov(R"((.+)ью$)", std::regex_constants::icase);  // Любовью -> Любовь
-        thread_local const std::regex re_female_dat_lyubov(R"((.+)и$)", std::regex_constants::icase);     // Любови -> Любовь
+        thread_local const std::regex re_female_instr_lyubov(R"((.+)ью$)", std::regex_constants::icase);
+        thread_local const std::regex re_female_dat_lyubov(R"((.+)и$)", std::regex_constants::icase);
 
         sanitizedInput = std::regex_replace(sanitizedInput, re_male_genitive_ogo_ego, "$1");
         sanitizedInput = std::regex_replace(sanitizedInput, re_male_om, "$1");
@@ -1210,14 +1433,10 @@ return result_param;
 
 // Callback-функция для записи данных, полученных через CURL, в строку / Используется, например, для сохранения ответа от HTTP-запроса
 static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
-    // Проверка атомарного флага прерывания
-    if (g_is_interrupted.load()) {
-        // Возвращаем число байт, отличное от реального (size*nmemb),
-        // это штатный способ сказать cURL: "Остановись с ошибкой WRITE_ERROR"
-        return 0;
-    }
     size_t realsize = size * nmemb;
-    ((std::string*)userp)->append((char*)contents, realsize);
+    if (userp) {
+        ((std::string*)userp)->append(static_cast<char*>(contents), realsize);
+    }
     return realsize;
 }
 
@@ -1320,26 +1539,26 @@ std::string send_curl_json(const std::string &url, const std::map<std::string, s
     };
     std::unique_ptr<curl_slist, SlistDeleter> headers_guard(nullptr);
 
-// Локальная лямбда для экранирования специальных символов в JSON
-auto escape_json = [](const std::string& s) -> std::string {
-    std::string result;
-    result.reserve(s.size() * 2);
-    for (unsigned char c : s) {
-        switch (c) {
-            case '"':  result += "\\\""; break;
-            case '\\': result += "\\\\"; break;
-            case '\b': result += "\\b";  break;
-            case '\f': result += "\\f";  break;
-            case '\n': result += "\\n";  break;
-            case '\r': result += "\\r";  break;
-            case '\t': result += "\\t";  break;
-            default:
-                result += static_cast<char>(c);
+    // Локальная лямбда для экранирования специальных символов в JSON
+    auto escape_json = [](const std::string& s) -> std::string {
+        std::string result;
+        result.reserve(s.size() * 2);
+        for (unsigned char c : s) {
+            switch (c) {
+                case '"':  result += "\\\""; break;
+                case '\\': result += "\\\\"; break;
+                case '\b': result += "\\b";  break;
+                case '\f': result += "\\f";  break;
+                case '\n': result += "\\n";  break;
+                case '\r': result += "\\r";  break;
+                case '\t': result += "\\t";  break;
+                default:
+                    result += static_cast<char>(c);
+            }
         }
-    }
-    return result;
-};
-	// Настройка запроса
+        return result;
+    };
+    // Настройка запроса
     try {
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_VERBOSE, 0L);
@@ -1359,7 +1578,9 @@ auto escape_json = [](const std::string& s) -> std::string {
                 oss << "\"" << escaped_key << "\":\"" << escaped_value << "\"";
             } else {
                 // Если ключ пустой после экранирования, пропускаем параметр
-                fprintf(stderr, "Warning: skipping empty JSON key\n");
+                if (g_verbose_mode.load()) {
+                    fprintf(stderr, "Warning: skipping empty JSON key\n");
+                }
                 continue;
             }
 
@@ -1370,43 +1591,32 @@ auto escape_json = [](const std::string& s) -> std::string {
 
         // Проверка, что JSON не пустой
         if (jsonData.size() <= 2) {
-            fprintf(stderr, "Warning: generated empty JSON, using fallback\n");
+            if (g_verbose_mode.load()) {
+                fprintf(stderr, "Warning: generated empty JSON, using fallback\n");
+            }
             jsonData = "{}";
         }
 
-        fprintf(stdout, "send_curl_json: %s\n", jsonData.c_str());
-
-		// Устанавливаем заголовки
+        // Устанавливаем заголовки
         curl_slist *headers = curl_slist_append(nullptr, "Content-Type: application/json");
         headers_guard.reset(headers);
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
-		// Устанавливаем тело запроса
+        // Устанавливаем тело запроса
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, jsonData.c_str());
 
-		// Устанавливаем callback для получения данных
+        // Устанавливаем callback для получения данных
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
 
         // Выполняем запрос без лишнего шума в консоли
         CURLcode res = curl_easy_perform(curl);
-
-        // Выводим только реальные ошибки, игнорируем прерывание пользователем
-        /*
-        if (res != CURLE_OK && !(res == CURLE_WRITE_ERROR && g_is_interrupted.load())) {
-            extern whisper_params params;
-            if (params.verbose) {
-                fprintf(stderr, " [TTS Error: %s]", curl_easy_strerror(res));
-            }
-        }
-        */
+        (void)res;  // Подавляем предупреждение о неиспользуемой переменной
 
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
         return "";
     }
-
-    // RAII автоматически освободит curl и headers при выходе из функции
 
     return readBuffer;
 }
@@ -1534,7 +1744,7 @@ std::string utf8_substr(const std::string& str, unsigned int start, unsigned int
  *  - Многобайтовые UTF-8 символы (русские, эмодзи и т.п.) копируются как есть (чтобы не порвать кодировку).
  *  - Если букве соответствует последовательность (например 'x' -> "кс"), возвращается несколько UTF-8 символов.
  */
-std::string translit_en_ru(IN const std::string &str) {
+std::string translit_en_ru(const std::string &str) {
     // Таблица соответствий ASCII -> UTF-8 (кириллица).
     static const std::unordered_map<char, std::string> tbl = {
         // нижний регистр
@@ -1732,7 +1942,9 @@ try {
     processed += text.substr(last_pos);
     text = processed;
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (time protection): %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (time protection): %s\n", e.what());
+    }
 }
 
 // Защита дат: 31.12.2025
@@ -1755,7 +1967,9 @@ try {
     processed += text.substr(last_pos);
     text = processed;
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (date dots protection): %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (date dots protection): %s\n", e.what());
+    }
 }
 
 // Защита дат: 2025-12-31 (ISO формат)
@@ -1778,7 +1992,9 @@ try {
     processed += text.substr(last_pos);
     text = processed;
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (date iso protection): %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (date iso protection): %s\n", e.what());
+    }
 }
 
 // Защита дат: 12/31/2025 (американский формат)
@@ -1801,7 +2017,9 @@ try {
     processed += text.substr(last_pos);
     text = processed;
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (date slash protection): %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (date slash protection): %s\n", e.what());
+    }
 }
 
 // Защита десятичных дробей: 3.14, 0.5, 0,5 (русский формат)
@@ -1823,7 +2041,9 @@ try {
     processed += text.substr(last_pos);
     text = processed;
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (decimal protection): %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (decimal protection): %s\n", e.what());
+    }
 }
 
 // Защита процентов: 50%, 12.5%, 12,5%
@@ -1845,7 +2065,9 @@ try {
     processed += text.substr(last_pos);
     text = processed;
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (percent protection): %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (percent protection): %s\n", e.what());
+    }
 }
 
 // ============================================================
@@ -1877,7 +2099,9 @@ try {
     processed += text.substr(last_pos);
     text = processed;
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (currency protection): %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (currency protection): %s\n", e.what());
+    }
 }
 
 // ============================================================
@@ -1914,7 +2138,9 @@ try {
     processed += text.substr(last_pos);
     text = processed;
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (fraction protection): %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (fraction protection): %s\n", e.what());
+    }
 }
 
 // Защита телефонов: +7 (123) 456-78-90
@@ -1936,7 +2162,9 @@ try {
     processed += text.substr(last_pos);
     text = processed;
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (phone protection): %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (phone protection): %s\n", e.what());
+    }
 }
 
 // Защита URL
@@ -1958,7 +2186,9 @@ try {
     processed += text.substr(last_pos);
     text = processed;
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (URL protection): %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (URL protection): %s\n", e.what());
+    }
 }
 
 // Защита email
@@ -1981,7 +2211,9 @@ try {
     processed += text.substr(last_pos);
     text = processed;
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (email protection): %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (email protection): %s\n", e.what());
+    }
 }
 
 // ============================================================
@@ -2050,7 +2282,7 @@ try {
             char prev_char = dot.before.back();
             char next_char = dot.after[0];
 
-            if (isdigit(prev_char) && isdigit(next_char)) {
+            if (std::isdigit(static_cast<unsigned char>(prev_char)) && std::isdigit(static_cast<unsigned char>(next_char))) {
                 protect = true;
             }
         }
@@ -2059,14 +2291,14 @@ try {
         if (!protect && !dot.before.empty() && !dot.after.empty()) {
             char prev_char = dot.before.back();
 
-            if (isalpha(prev_char)) {
+            if (std::isalpha(static_cast<unsigned char>(prev_char))) {
                 // Проверяем следующий непробельный символ
                 size_t after_pos = 0;
-                while (after_pos < dot.after.length() && isspace(dot.after[after_pos])) {
+                while (after_pos < dot.after.length() && std::isspace(static_cast<unsigned char>(dot.after[after_pos]))) {
                     after_pos++;
                 }
 
-                if (after_pos < dot.after.length() && isalpha(dot.after[after_pos])) {
+                if (after_pos < dot.after.length() && std::isalpha(static_cast<unsigned char>(dot.after[after_pos]))) {
                     protect = true;
                 }
             }
@@ -2079,7 +2311,7 @@ try {
             if (next_dot != std::string::npos && next_dot - dot.pos <= 4) {
                 bool valid = true;
                 for (size_t j = dot.pos + 1; j < next_dot; ++j) {
-                    if (!isalpha(text[j]) && !isspace(text[j])) {
+                    if (!std::isalpha(static_cast<unsigned char>(text[j])) && !std::isspace(static_cast<unsigned char>(text[j]))) {
                         valid = false;
                         break;
                     }
@@ -2093,7 +2325,7 @@ try {
             // Пропускаем пробелы и закрывающие скобки/кавычки
             size_t after_pos = 0;
             while (after_pos < dot.after.length() &&
-                   (isspace(dot.after[after_pos]) ||
+                   (std::isspace(static_cast<unsigned char>(dot.after[after_pos])) ||
                     dot.after[after_pos] == ')' ||
                     dot.after[after_pos] == ']' ||
                     dot.after[after_pos] == '}' ||
@@ -2105,7 +2337,7 @@ try {
             if (after_pos < dot.after.length()) {
                 char next_char = dot.after[after_pos];
                 // Если после точки строчная буква, цифра или знак препинания — это не конец
-                if (islower(next_char) || isdigit(next_char) ||
+                if (std::islower(static_cast<unsigned char>(next_char)) || std::isdigit(static_cast<unsigned char>(next_char)) ||
                     next_char == '.' || next_char == ',' ||
                     next_char == ';' || next_char == ':' ||
                     next_char == '?' || next_char == '!') {
@@ -2144,7 +2376,9 @@ try {
     text = new_text;
 
 } catch (const std::exception& e) {
-    fprintf(stderr, "Error in dot protection: %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Error in dot protection: %s\n", e.what());
+    }
 }
 
 // ============================================================
@@ -2156,7 +2390,9 @@ try {
     thread_local const std::regex re_newline(R"(\r\n|\r|\n)", std::regex::ECMAScript);
     text = std::regex_replace(text, re_newline, " ");
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (newline): %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (newline): %s\n", e.what());
+    }
     text = replace(text, "\r\n", " ");
     text = replace(text, "\r", " ");
     text = replace(text, "\n", " ");
@@ -2169,7 +2405,9 @@ try {
     thread_local const std::regex re_html_tag(R"(<[^>]*>)", std::regex::ECMAScript);
     text = std::regex_replace(text, re_html_tag, " ");
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (HTML): %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (HTML): %s\n", e.what());
+    }
     text = replace(text, "<", " ");
     text = replace(text, ">", " ");
 }
@@ -2307,6 +2545,9 @@ try {
     trim(text);
 
 } catch (const std::regex_error& e) {
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (emotion normalization): %s\n", e.what());
+    }
     // Fallback: минимальная очистка
     text = replace(text, "*", " ");
     text = replace(text, "(", " ");
@@ -2349,7 +2590,9 @@ try {
     text = std::regex_replace(text, re_multi_tildes, " ");
 
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (Markdown): %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (Markdown): %s\n", e.what());
+    }
     text = replace(text, "```", " ");
     text = replace(text, "`", " ");
     text = replace(text, "__", " ");
@@ -2368,15 +2611,17 @@ try {
     );
     text = std::regex_replace(text, re_list_markers, "");
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (list markers): %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (list markers): %s\n", e.what());
+    }
     // Fallback
     if (text.size() > 2) {
         if (text[0] == '-' || text[0] == '*' || text[0] == '+' || text[0] == '#') {
             if (text[1] == ' ') text = text.substr(2);
         }
-        else if (isdigit(text[0])) {
+        else if (std::isdigit(static_cast<unsigned char>(text[0]))) {
             size_t i = 1;
-            while (i < text.size() && isdigit(text[i])) i++;
+            while (i < text.size() && std::isdigit(static_cast<unsigned char>(text[i]))) i++;
             if (i < text.size() && (text[i] == '.' || text[i] == ')')) {
                 if (i + 1 < text.size() && text[i + 1] == ' ') {
                     text = text.substr(i + 2);
@@ -2501,7 +2746,9 @@ try {
     trim(text);
 
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (quotes): %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (quotes): %s\n", e.what());
+    }
     // Fallback: минимальная очистка
     text = replace(text, "«", "");
     text = replace(text, "»", "");
@@ -2565,7 +2812,9 @@ try {
     text = result2;
 
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (links): %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (links): %s\n", e.what());
+    }
     // Fallback: просто удаляем Markdown-синтаксис
     text = replace(text, "[", " ");
     text = replace(text, "]", " ");
@@ -2580,7 +2829,9 @@ try {
     thread_local const std::regex re_img_md(R"(!\[([^\]]*)\]\([^)]+\))", std::regex::ECMAScript);
     text = std::regex_replace(text, re_img_md, "$1, ");
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (images): %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (images): %s\n", e.what());
+    }
 }
 
 // ============================================================
@@ -2589,9 +2840,9 @@ try {
 try {
     thread_local const std::regex re_curly(R"(\{[^{}]*\})", std::regex::ECMAScript);
     bool changed = true;
-    int max_iterations = 100;  // ← ДОБАВЛЕНО: защита от бесконечного цикла
+    int max_iterations_local = 100;  // защита от бесконечного цикла
     int iteration = 0;
-    while (changed && iteration < max_iterations) {
+    while (changed && iteration < max_iterations_local) {
         changed = false;
         iteration++;
         std::string t1 = std::regex_replace(text, re_curly, " ");
@@ -2600,11 +2851,13 @@ try {
             changed = true;
         }
     }
-    if (iteration >= max_iterations) {
+    if (iteration >= max_iterations_local && g_verbose_mode.load()) {
         fprintf(stderr, "Warning: Too many iterations while removing curly braces, stopping\n");
     }
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (curly): %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (curly): %s\n", e.what());
+    }
     text = replace(text, "{", " ");
     text = replace(text, "}", " ");
 }
@@ -2618,7 +2871,9 @@ try {
     thread_local const std::regex re_noise(R"([#\|\\])", std::regex::ECMAScript);
     text = std::regex_replace(text, re_noise, " ");
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (noise): %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (noise): %s\n", e.what());
+    }
     text = replace(text, "#", " ");
     text = replace(text, "|", " ");
     text = replace(text, "\\", " ");
@@ -2686,7 +2941,9 @@ try {
     }
 
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (punctuation): %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (punctuation): %s\n", e.what());
+    }
 }
 
 trim(text);
@@ -2699,7 +2956,9 @@ try {
     thread_local const std::regex re_spaces(R"(\s+)", std::regex::ECMAScript);
     text = std::regex_replace(text, re_spaces, " ");
 } catch (const std::regex_error& e) {
-    fprintf(stderr, "Regex error (spaces): %s\n", e.what());
+    if (g_verbose_mode.load()) {
+        fprintf(stderr, "Regex error (spaces): %s\n", e.what());
+    }
     std::string temp; bool last_was_space = false;
     for (char c : text) {
         if (std::isspace(static_cast<unsigned char>(c))) {
@@ -2778,7 +3037,7 @@ if (text.empty()) return;
                 default:
                     if (c >= 32 && c != 127) result += static_cast<char>(c);
                     else {
-                        char buf[8]; std::snprintf(buf, sizeof(buf), "\\u%04x", (unsigned int)c);
+                        char buf[8]; std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned int>(c));
                         result += buf;
                     }
             }
@@ -2816,18 +3075,12 @@ if (text.empty()) return;
         // Ничего не выводим
         (void)res;  // чтобы компилятор не ругался
 
-        /* if (res != CURLE_OK && !(res == CURLE_WRITE_ERROR && g_is_interrupted.load())) {
-            static bool tts_error_printed = false;
-            if (!tts_error_printed) {
-                fprintf(stderr, " [TTS warning: %s]", curl_easy_strerror(res));
-                tts_error_printed = true;
-            }
-         }*/
-
         curl_slist_free_all(headers);                                          // Освобождаем память, занятую списком заголовков
         curl_easy_cleanup(http_handle);                                        // Освобождаем cURL handle (закрываем соединение)
     } else {
-        fprintf(stderr, "Failed to initialize cURL handle\n");                 // Не удалось создать handle (критическая ошибка)
+        if (g_verbose_mode.load()) {
+            fprintf(stderr, "Failed to initialize cURL handle\n");
+        }
     }
 }
 
@@ -2867,15 +3120,15 @@ bool IsConsoleWindowFocused() {
     }
     return (console_window == foreground_window);
 }
-	// Стоп: Ctrl+Space
-	// Перегенерировать: Ctrl+Right
-	// Удалить: Ctrl+Delete
-	// Сбросить: Ctrl+R
-	// Функция обработки горячих клавиш, изменяет глобальную переменную g_hotkey_pressed
-	// Логика отслеживания нажатий Ctrl+..., Alt и т.д.
+    // Стоп: Ctrl+Space
+    // Перегенерировать: Ctrl+Right
+    // Удалить: Ctrl+Delete
+    // Сбросить: Ctrl+R
+    // Функция обработки горячих клавиш, изменяет глобальную переменную g_hotkey_pressed
+    // Логика отслеживания нажатий Ctrl+..., Alt и т.д.
 
 void keyboard_shortcut_func() {
-	// Логика отслеживания нажатий Ctrl+..., Alt и т.д.
+    // Логика отслеживания нажатий Ctrl+..., Alt и т.д.
     // Подробности ниже...
     bool b_ctr_space_processed = false;
     bool b_ctr_right_processed = false;
@@ -2923,9 +3176,9 @@ void keyboard_shortcut_func() {
             if (b_ctr_space && !b_ctr_space_prev) {
                 if (!b_ctr_space_processed) {
                     fflush(stdout);
-					printf("\b"); // remove printed symbols
-					fflush(stdout);
-					{
+                    printf("\b"); // remove printed symbols
+                    fflush(stdout);
+                    {
                         std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
                         g_hotkey_pressed = "Ctrl+Space";
                     }
@@ -2938,11 +3191,11 @@ void keyboard_shortcut_func() {
 
             if (b_ctr_right && !b_ctr_right_prev) {
                 if (!b_ctr_right_processed) {
-					fflush(stdout);
-					printf("\b"); // remove printed symbols
-					fflush(stdout);
+                    fflush(stdout);
+                    printf("\b"); // remove printed symbols
+                    fflush(stdout);
                     std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
-					g_hotkey_pressed = "Ctrl+Right";
+                    g_hotkey_pressed = "Ctrl+Right";
                     b_ctr_right_processed = true;
                 }
             }
@@ -2952,11 +3205,11 @@ void keyboard_shortcut_func() {
 
             if (b_ctr_delete && !b_ctr_delete_prev) {
                 if (!b_ctr_delete_processed) {
-					fflush(stdout);
-					printf("\b"); // remove printed symbols
-					fflush(stdout);
-                    	std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
-					g_hotkey_pressed = "Ctrl+Delete";
+                    fflush(stdout);
+                    printf("\b"); // remove printed symbols
+                    fflush(stdout);
+                        std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
+                    g_hotkey_pressed = "Ctrl+Delete";
                     b_ctr_delete_processed = true;
                 }
             }
@@ -2966,11 +3219,11 @@ void keyboard_shortcut_func() {
 
             if (b_ctr_r && !b_ctr_r_prev) {
                 if (!b_ctr_r_processed) {
-					fflush(stdout);
-					printf("\b\b"); // remove printed ^R
-					fflush(stdout);
+                    fflush(stdout);
+                    printf("\b\b"); // remove printed ^R
+                    fflush(stdout);
                     std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
-					g_hotkey_pressed = "Ctrl+R";
+                    g_hotkey_pressed = "Ctrl+R";
                     b_ctr_r_processed = true;
                 }
             }
@@ -2982,9 +3235,9 @@ void keyboard_shortcut_func() {
             b_ctr_right_prev = b_ctr_right;
             b_ctr_delete_prev = b_ctr_delete;
             b_ctr_r_prev = b_ctr_r;
-		}
+        }
 
-		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     // добавлен выход из функции при завершении цикла
     // поток завершается автоматически при выходе из функции
@@ -3018,7 +3271,7 @@ int input_tokens_count = 0;
 llama_sampler * smpl = nullptr;
 llama_sampler * smpl_high_temp = nullptr;
 
-	// HWND cur_window_handle больше не нужен — получаем хендл консоли внутри IsConsoleWindowFocused()
+    // HWND cur_window_handle больше не нужен — получаем хендл консоли внутри IsConsoleWindowFocused()
 
     if (whisper_params_parse(argc, argv, params) == false) {
             return 1;
@@ -3031,7 +3284,7 @@ llama_sampler * smpl_high_temp = nullptr;
             exit(0);
         }
 
-	allow_xtts_file(params.xtts_control_path, 1);  // разрешаем воспроизведение звука XTTS
+    allow_xtts_file(params.xtts_control_path, 1);  // разрешаем воспроизведение звука XTTS
 
     // Инициализация Whisper
     struct whisper_context_params cparams = whisper_context_default_params();
@@ -3055,9 +3308,9 @@ llama_sampler * smpl_high_temp = nullptr;
         lmparams.n_gpu_layers = params.n_gpu_layers;
     }
 
-	lmparams.main_gpu = params.main_gpu;
-	if (params.split_mode == "layer") lmparams.split_mode = LLAMA_SPLIT_MODE_LAYER;
-	else lmparams.split_mode = LLAMA_SPLIT_MODE_NONE;
+    lmparams.main_gpu = params.main_gpu;
+    if (params.split_mode == "layer") lmparams.split_mode = LLAMA_SPLIT_MODE_LAYER;
+    else lmparams.split_mode = LLAMA_SPLIT_MODE_NONE;
 
     lmparams.tensor_split = params.tensor_split.empty() ? nullptr : params.tensor_split.data();
 
@@ -3072,17 +3325,18 @@ llama_sampler * smpl_high_temp = nullptr;
     const llama_vocab * vocab_llama = llama_model_get_vocab(model_llama);
 
 
-	bool add_bos_token = llama_vocab_get_add_bos(vocab_llama);
-	const int n_keep   = params.n_keep + add_bos_token;
+    bool add_bos_token = llama_vocab_get_add_bos(vocab_llama);
+    const int n_keep   = params.n_keep + (add_bos_token ? 1 : 0);
 
     llama_context_params lcparams = llama_context_default_params();
 
     // настройте их по своему вкусу
     lcparams.n_ctx      = params.ctx_size; // 2048 по умолчанию
-    fprintf(stdout, "n_ctx %d", lcparams.n_ctx); // Выводим фактический размер контекста
+    if (params.verbose) {
+        fprintf(stdout, "n_ctx %d", lcparams.n_ctx); // Выводим фактический размер контекста
+    }
 
     lcparams.n_threads  = params.n_threads;
-    //lcparams.n_batch    = params.batch_size; // Значение 512 было задано по умолчанию
 
     // === НОВЫЙ КОД (вместо lcparams.flash_attn = params.flash_attn) ===
     // В llama.cpp >= 1.80 поле flash_attn убрали — теперь используется flash_attn_type.
@@ -3390,23 +3644,22 @@ if (!params.instruct_preset.empty())
     }
     // ============================================================
 
-
-    // llama_batch batch = llama_batch_init(2048, 0, 1); // <-- ВСЕГДА ИНИЦИАЛИЗИРУЕМ С n_tokens=0!
-
     llama_batch batch = llama_batch_init(params.ctx_size, 0, 1);
 
-    fprintf(stdout, "llama_n_ctx %d", llama_n_ctx(ctx_llama));
+    if (params.verbose) {
+        fprintf(stdout, "llama_n_ctx %d", llama_n_ctx(ctx_llama));
+    }
 
     // Инициализация сэмплера
-	const float top_k          = params.top_k;
-	const float top_p          = params.top_p;
-	const float min_p          = params.min_p;
-	float temp                 = params.temp;
-	const float repeat_penalty = params.repeat_penalty;
+    const float top_k          = static_cast<float>(params.top_k);
+    const float top_p          = params.top_p;
+    const float min_p          = params.min_p;
+    float temp                 = params.temp;
+    const float repeat_penalty = params.repeat_penalty;
     const int seed = 0;
     auto sparams = llama_sampler_chain_default_params();
-    smpl = llama_sampler_chain_init(sparams);           // ← без llama_sampler*
-    smpl_high_temp = llama_sampler_chain_init(sparams); // ← без llama_sampler*
+    smpl = llama_sampler_chain_init(sparams);
+    smpl_high_temp = llama_sampler_chain_init(sparams);
 
     if (temp > 0.0f) {
         llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k));
@@ -3415,10 +3668,10 @@ if (!params.instruct_preset.empty())
         llama_sampler_chain_add(smpl, llama_sampler_init_temp (temp));
         llama_sampler_chain_add(smpl, llama_sampler_init_dist (seed));
 
-		llama_sampler_chain_add(smpl_high_temp, llama_sampler_init_top_k(top_k));
+        llama_sampler_chain_add(smpl_high_temp, llama_sampler_init_top_k(top_k));
         llama_sampler_chain_add(smpl_high_temp, llama_sampler_init_top_p(top_p, 1));
         llama_sampler_chain_add(smpl_high_temp, llama_sampler_init_min_p(min_p, 1));
-        llama_sampler_chain_add(smpl_high_temp, llama_sampler_init_temp (2.00));
+        llama_sampler_chain_add(smpl_high_temp, llama_sampler_init_temp (2.00f));
         llama_sampler_chain_add(smpl_high_temp, llama_sampler_init_dist (seed));
     } else {
         llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
@@ -3477,11 +3730,11 @@ if (!params.instruct_preset.empty()) {
     // Безопасное ограничение длины контекста модели ---
     // Цель: предотвратить переполнение контекста (ctx_size) и зацикливание на длинных диалогах
     // Если количество токенов приближается к лимиту контекста модели
-    if ((int)embd_inp.size() > params.ctx_size - 512) {
+    if (static_cast<int>(embd_inp.size()) > params.ctx_size - 512) {
         // Количество токенов, которые нужно сохранить в начале (system prompt, ChatML заголовки)
-        int keep = std::min(params.n_keep, (int)embd_inp.size());
+        int keep = std::min(params.n_keep, static_cast<int>(embd_inp.size()));
         // Обрезаем середину контекста, сохраняя начало и хвост
-        if ((int)embd_inp.size() > keep + 256) {
+        if (static_cast<int>(embd_inp.size()) > keep + 256) {
             embd_inp.erase(embd_inp.begin() + keep, embd_inp.end() - 256);
         }
 
@@ -3494,7 +3747,7 @@ if (!params.instruct_preset.empty()) {
     static std::vector<llama_token> recent_tokens;
 
     if (params.repeat_last_n > 0) {
-        if ((int)embd_inp.size() > params.repeat_last_n) {
+        if (static_cast<int>(embd_inp.size()) > params.repeat_last_n) {
             recent_tokens.assign(embd_inp.end() - params.repeat_last_n, embd_inp.end());
         } else {
             recent_tokens = embd_inp;
@@ -3527,7 +3780,7 @@ if (!params.instruct_preset.empty()) {
         // assign автоматически выделяет нужный объем памяти и копирует данные
         embd_inp.assign(session_tokens.begin(), session_tokens.end());
         // Сообщаем о успешной загрузке сессии и выводим количество токенов
-            fprintf(stderr, "%s: loaded a session with prompt size of %d tokens\n", __func__, (int) session_tokens.size());
+            fprintf(stderr, "%s: loaded a session with prompt size of %zu tokens\n", __func__, session_tokens.size());
         } else {
         // Если файл сессии не найден — сообщаем, что будет создан новый
             fprintf(stderr, "%s: session file does not exist, will create\n", __func__);
@@ -3535,7 +3788,9 @@ if (!params.instruct_preset.empty()) {
     }
 
 /// Оценка начального промпта
-printf("\n");
+if (params.verbose) {
+    printf("\n");
+}
 printf("%s : initializing - please wait ...\n", __func__);
 float llama_start_time = get_current_time_ms();
 int n_past = 0;
@@ -3552,14 +3807,14 @@ batch = llama_batch_init(2048, 0, 1); // ←  Инициализируем с з
         return 1;
     }
     // ===========================
-    batch.n_tokens = embd_inp.size();
+    batch.n_tokens = static_cast<int>(embd_inp.size());
 
     for (int i = 0; i < batch.n_tokens; i++) {
         batch.token[i]     = embd_inp[i];
         batch.pos[i]       = i;
         batch.n_seq_id[i]  = 1;
         batch.seq_id[i][0] = 0;
-        batch.logits[i]    = i == batch.n_tokens - 1;
+        batch.logits[i]    = (i == batch.n_tokens - 1) ? 1 : 0;
     }
 }
 
@@ -3568,19 +3823,18 @@ if (llama_decode(ctx_llama, batch)) {
     return 1;
 }
 
-	float llama_end_time = get_current_time_ms();
-	float llama_time_total = 0;
-	float llama_time_input = 0;
-	float llama_time_output = 0;
+    float llama_end_time = get_current_time_ms();
+    float llama_time_total = 0;
+    float llama_time_input = 0;
+    float llama_time_output = 0;
 
-	llama_time_total = llama_end_time - llama_start_time;
+    llama_time_total = llama_end_time - llama_start_time;
 
     printf(" \nLlama start prompt: %zu/%d tokens in %.3f s at %.0f t/s\n",
-
         embd_inp.size(),
-       (int)params.ctx_size, // Предполагаем, что params.ctx_size это int32_t или совместимый тип
-       (double)llama_time_total, // Явное приведение float к double для устранения предупреждения
-       (double)(embd_inp.size() / llama_time_total)); // Результат деления size_t/float -> double
+        params.ctx_size,
+        static_cast<double>(llama_time_total),
+        static_cast<double>(embd_inp.size() / llama_time_total));
 
     if (params.verbose_prompt) {
         fprintf(stdout, "\n");
@@ -3608,7 +3862,7 @@ if (llama_decode(ctx_llama, batch)) {
         }
     }
 
-	// HACK - так как сохранение сессии занимает время, мы не будем его повторно сохранять,
+    // HACK - так как сохранение сессии занимает время, мы не будем его повторно сохранять,
     // если уже загружена сессия с 75% совпадением
     bool need_to_save_session = !path_session.empty() && n_matching_session_tokens < (embd_inp.size() * 3 / 4);
     printf("%s : done! start speaking in the microphone\n", __func__);
@@ -3631,33 +3885,38 @@ if (llama_decode(ctx_llama, batch)) {
     // Переменные для текстового вывода
     const int voice_id = 2;
 
-    // ПЕРЕД генерацией сбрасываем ОБА флага прерывания
-    g_is_interrupted.store(false);   // Чтобы cURL снова начал качать аудио
-    llama_interrupted.store(0);      // Чтобы Llama снова начала генерировать токены
+    // Сброс единого флага прерывания перед началом диалога
+    g_interrupt_reason.store(InterruptReason::NONE);
+    g_interrupt_processed.store(false);
+    
     const int n_ctx = llama_n_ctx(ctx_llama);
 
-    n_past = embd_inp.size();
+    n_past = static_cast<int>(embd_inp.size());
     int n_prev = 64; // TODO arg
     std::vector<int> past_prev_arr{};
     int n_past_prev = 0; // количество токенов, которое было перед последним ответом
-    int n_session_consumed = !path_session.empty() && session_tokens.size() > 0 ? session_tokens.size() : 0;
+    
+    // ========== ДОБАВИТЬ: константа для максимального размера ==========
+    const size_t MAX_PAST_PREV_SIZE = 100;  // Храним только последние 100 состояний
+    // ========== КОНЕЦ ДОБАВЛЕНИЯ ==========
+    int n_session_consumed = !path_session.empty() && session_tokens.size() > 0 ? static_cast<int>(session_tokens.size()) : 0;
     std::vector<llama_token> embd;
-	std::string text_heard_prev;
-	std::string text_heard_trimmed;
-	int new_command_allowed = 1;
-	std::string google_resp;
-	std::vector<std::string> tts_intros;
-	std::string rand_intro_text = "";
-	std::string last_output_buffer = "";
-	std::string last_output_needle = "";
-	if (params.language == "ru")
-	{
-		tts_intros = {"Хм", "Ну", "Нуу", "О", "А", "А?", "Угу", "Ох", "Ха", "Ах", "Блин", "Короче", "В общем", "Ой", "Слышь", "Ну вообще-то", "Ну а вообще", "Кароче", "Вот", "Знаешь", "Как бы", "Прикинь", "Послушай", "Типа", "Это", "Так вот", "Погоди", params.person};
-	}
-	else
-	{
-		tts_intros = {"Hm", "Hmm", "Well", "Well well", "Huh", "Ugh", "Uh", "Um", "Mmm", "Oh", "Ooh", "Haha", "Ha ha", "Ahh", "Whoa", "Really", "I mean", "By the way", "Anyway", "So", "Actually", "Uh-huh", "Seriously", "Whatever", "Ahh", "Like", "But", "You know", "Wait", "Ahem", "Damn", params.person};
-	}
+    std::string text_heard_prev;
+    std::string text_heard_trimmed;
+    int new_command_allowed = 1;
+    std::string google_resp;
+    std::vector<std::string> tts_intros;
+    std::string rand_intro_text = "";
+    std::string last_output_buffer = "";
+    std::string last_output_needle = "";
+    if (params.language == "ru")
+    {
+        tts_intros = {"Хм", "Ну", "Нуу", "О", "А", "А?", "Угу", "Ох", "Ха", "Ах", "Блин", "Короче", "В общем", "Ой", "Слышь", "Ну вообще-то", "Ну а вообще", "Кароче", "Вот", "Знаешь", "Как бы", "Прикинь", "Послушай", "Типа", "Это", "Так вот", "Погоди", params.person};
+    }
+    else
+    {
+        tts_intros = {"Hm", "Hmm", "Well", "Well well", "Huh", "Ugh", "Uh", "Um", "Mmm", "Oh", "Ooh", "Haha", "Ha ha", "Ahh", "Whoa", "Really", "I mean", "By the way", "Anyway", "So", "Actually", "Uh-huh", "Seriously", "Whatever", "Ahh", "Like", "But", "You know", "Wait", "Ahem", "Damn", params.person};
+    }
 
     // Современный генератор случайных чисел (потокобезопасный через thread_local)
     // Объявляем здесь, чтобы использовать во всём основном цикле
@@ -3665,7 +3924,8 @@ if (llama_decode(ctx_llama, batch)) {
     std::mt19937 gen(rd());
     std::uniform_int_distribution<size_t> dist;
 
-	int last_command_time = 0;
+    int last_command_time = 0;
+    // ИСПРАВЛЕНО: current_voice теперь инициализируется корректно
     std::string current_voice = params.xtts_voice.empty() ? params.bot_name : params.xtts_voice;
 
     // === АНТИПРОМПТЫ (только для смены говорящего) ===
@@ -3754,27 +4014,31 @@ if (llama_decode(ctx_llama, batch)) {
     };
 
     // Отладка: выводим ВСЕ стоп-слова для полного контроля
-    printf("Llama stop words (%zu total): ", antiprompts.size());
-    for (size_t i = 0; i < antiprompts.size(); i++) {
-        // Экранируем ВСЕ спецсимволы для читаемости
-        std::string display = antiprompts[i];
-        // Заменяем \n, \r, \t на читаемые аналоги
-        display = ::replace(display, "\r", "\\r");
-        display = ::replace(display, "\n", "\\n");
-        display = ::replace(display, "\t", "\\t");
-        printf("%s'%s'", i > 0 ? ", " : "", display.c_str());
+    if (params.verbose) {
+        printf("Llama stop words (%zu total): ", antiprompts.size());
+        for (size_t i = 0; i < antiprompts.size(); i++) {
+            // Экранируем ВСЕ спецсимволы для читаемости
+            std::string display = antiprompts[i];
+            // Заменяем \n, \r, \t на читаемые аналоги
+            display = ::replace(display, "\r", "\\r");
+            display = ::replace(display, "\n", "\\n");
+            display = ::replace(display, "\t", "\\t");
+            printf("%s'%s'", i > 0 ? ", " : "", display.c_str());
+        }
+
+        // Дополнительно показываем пользовательские стоп-слова отдельно
+        if (!params.stop_words.empty()) {
+            printf(" [+ from --stop-words: %s]", params.stop_words.c_str());
+        }
+        printf("\n");
     }
 
-    // Дополнительно показываем пользовательские стоп-слова отдельно
-    if (!params.stop_words.empty()) {
-        printf(" [+ from --stop-words: %s]", params.stop_words.c_str());
-    }
-
-    printf("\n");
-
-	std::thread input_thread(input_thread_func);
-	std::thread shortcut_thread([]() {
+    std::thread input_thread(input_thread_func);
+    std::thread shortcut_thread([]() {
         keyboard_shortcut_func();
+    });
+    std::thread vad_monitor_thread([&params, &audio]() {
+        vad_monitor_thread_func(params, audio);
     });
 
     // ===== ИНФОРМАЦИЯ О ГОРЯЧИХ КЛАВИШАХ =====
@@ -3791,17 +4055,17 @@ if (llama_decode(ctx_llama, batch)) {
     fflush(stdout);
     // -------------------------------------------------------
 
-	int vad_result_prev = 2; // ended
-	float speech_start_ms = 0;
-	float speech_end_ms = 0;
-	float speech_len = 0;
-	int len_in_samples = 0;
-	int64_t speech_start_sample = 0; // сохраняем номер сэмпла, когда началась речь
-	float llama_interrupted_time = 0.0;
-	llama_start_time = 0.0;
-	float llama_start_generation_time = 0.0; // после оперативной обработки
-	llama_end_time = 0.0;
-	llama_time_total = 0.0;
+    int vad_result_prev = 2; // ended
+    float speech_start_ms = 0;
+    float speech_end_ms = 0;
+    float speech_len = 0;
+    int len_in_samples = 0;
+    int64_t speech_start_sample = 0; // сохраняем номер сэмпла, когда началась речь
+    float llama_interrupted_time = 0.0;
+    llama_start_time = 0.0;
+    float llama_start_generation_time = 0.0; // после оперативной обработки
+    llama_end_time = 0.0;
+    llama_time_total = 0.0;
     std::string user_typed = "";
     bool user_typed_this = false;
 
@@ -3818,9 +4082,9 @@ if (llama_decode(ctx_llama, batch)) {
         }
         // ===== КОНЕЦ ПРОВЕРКИ СОБЫТИЙ =====
 
-        // СБРОС СОСТОЯНИЯ ПРЕРЫВАНИЯ
-        g_is_interrupted.store(false);
-        llama_interrupted.store(0);
+        // СБРОС СОСТОЯНИЯ ПРЕРЫВАНИЯ (теперь через единый флаг)
+        g_interrupt_reason.store(InterruptReason::NONE);
+        g_interrupt_processed.store(false);
 
         // задержка. попробуйте опустить?
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -3832,9 +4096,6 @@ if (llama_decode(ctx_llama, batch)) {
 // keyboard input
 user_typed_this = false;
 console::set_display(console::reset);
-
-        // === ФИКС: Накопление ввода вместо мгновенной отправки ===
-        user_typed_this = false;  // ← СБРОС ФЛАГА В НАЧАЛЕ КАЖДОЙ ИТЕРАЦИИ
 {
     std::lock_guard<std::mutex> lock(input_mutex);
     if (!input_queue.empty())
@@ -3891,7 +4152,7 @@ console::set_display(console::reset);
             // Вызываем VAD (Voice Activity Detection) для определения наличия речи в аудиосигнале
             // vad_simple_int возвращает:
             // 0 — тишина, 1 — начало речи, 2 — конец речи
-            int vad_result = ::vad_simple_int(pcmf32_cur, WHISPER_SAMPLE_RATE, params.vad_last_ms,
+            int vad_result = ::vad_simple_int(pcmf32_cur, WHISPER_SAMPLE_RATE, static_cast<int>(params.vad_last_ms),
                                             params.vad_thold, params.freq_thold, params.print_energy,
                                             params.vad_start_thold);
 
@@ -3918,15 +4179,14 @@ console::set_display(console::reset);
                         std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
                         current_hotkey = g_hotkey_pressed;
                     }
-                     if (!params.push_to_talk || (params.push_to_talk && current_hotkey == "Alt"))
+                    if (!params.push_to_talk || (params.push_to_talk && current_hotkey == "Alt"))
                     {
-                        // Только файловый запрет (без очистки микрофона!)
-                        std::string dummy_path;
-                        allow_xtts_file(dummy_path, 0);
+                        // МГНОВЕННАЯ ОСТАНОВКА TTS (только файловый семафор)
+                        std::string dummy;
+                        allow_xtts_file(dummy, 0);               // прямая запись 0 в файл
 
-                        // Устанавливаем флаги прерывания
-                        llama_interrupted.store(1);
-                        g_is_interrupted.store(true);
+                        // Устанавливаем единый флаг прерывания ДЛЯ ЦИКЛА ГЕНЕРАЦИИ
+                        g_interrupt_reason.store(InterruptReason::VAD_SPEECH);
                         
                         // audio.clear() - НЕ ВЫЗЫВАЕМ! Это убивает буфер микрофона
                         
@@ -3938,20 +4198,20 @@ console::set_display(console::reset);
             }
 
             // Если VAD обнаружил конец речи (vad_result >= 2) и предыдущее состояние было началом речи, или была нажата горячая клавиша, или пользователь ввёл текст вручную
-            if (vad_result >= 2 && vad_result_prev == 1 || force_speak || user_typed.size())  // speech ended or user typed
+            if ((vad_result >= 2 && vad_result_prev == 1) || force_speak || user_typed.size())  // speech ended or user typed
             {
                 // Запоминаем время окончания речи
                 speech_end_ms = get_current_time_ms(); // float в секундах.мс
                 // Вычисляем длительность речи
                 speech_len = speech_end_ms - speech_start_ms;
                 // Фильтруем слишком короткие или слишком длинные речевые сегменты
-                if (speech_len < 0.10) speech_len = 0;
-                else if (speech_len > 10.0) speech_len = 0;
+                if (speech_len < 0.10f) speech_len = 0;
+                else if (speech_len > 10.0f) speech_len = 0;
 
                 vad_result_prev = 2;
 
                 // Пропускаем обработку, если длина речи нулевая и нет введённого пользователем текста
-                if (!speech_len && !user_typed.size()) {
+                if ((speech_len == 0) && user_typed.empty()) {
                     speech_start_ms = 0;
                     audio.clear();  // ← ДОБАВИТЬ
                     continue;
@@ -3969,7 +4229,6 @@ console::set_display(console::reset);
 
                 // Сбрасываем время начала речи для следующего раза
                 speech_start_ms = 0;
-
 
                 std::string all_heard;
                 // Если пользователь ввёл текст вручную — используем его
@@ -4095,7 +4354,9 @@ console::set_display(console::reset);
                     text_heard = std::regex_replace(text_heard, re, "");
                 } catch (const std::regex_error& e) {
                     // Логируем, но не падаем — если регулярка сломалась
-                    fprintf(stderr, "Regex error while removing [brackets]: %s\n", e.what());
+                    if (params.verbose) {
+                        fprintf(stderr, "Regex error while removing [brackets]: %s\n", e.what());
+                    }
                     // Оставляем text_heard как есть
                 }
 
@@ -4237,14 +4498,17 @@ console::set_display(console::reset);
 
                 std::string user_command; // здесь будет храниться распознанная команда пользователя
 
-                // Если VAD начала речи включён (порог > 0), разрешаем воспроизведение XTTS
-                if (params.vad_start_thold > 0.0f)
-                {
+            // Если VAD начала речи включён (порог > 0), разрешаем воспроизведение XTTS
+            if (params.vad_start_thold > 0.0f)
+            {
+                // Проверяем, не активно ли прерывание
+                if (g_interrupt_reason.load() == InterruptReason::NONE) {
                     allow_xtts_file(params.xtts_control_path, 1);
                 }
+            }
 
                 // ВВОДНОЕ предложение TTS rand для мгновенного ответа
-                if (params.xtts_intro && text_heard_trimmed.size())
+                if (params.xtts_intro && !text_heard_trimmed.empty())
                 {
                     dist = std::uniform_int_distribution<size_t>(0, tts_intros.size() - 1);
                     rand_intro_text = tts_intros[dist(gen)];
@@ -4333,80 +4597,78 @@ console::set_display(console::reset);
                         text_heard_trimmed.find("то ты об этом думаешь") == std::string::npos) ||
                         (text_heard_trimmed.find("то ты об этом думаешь") != std::string::npos &&
                         text_heard != "Что ты об этом думаешь?"))
+                {
+                    user_command = "call";
+                }
 
-{
-    user_command = "call";
-}
+                // Проверяем, можно ли выполнять новую команду (с задержкой, чтобы избежать дублирования)
+                if (!user_command.empty() && !new_command_allowed && std::time(0)-last_command_time >= 2)
+                {
+                    new_command_allowed = 1; // даём разрешение на выполнение новой команды
+                }
 
-// Проверяем, можно ли выполнять новую команду (с задержкой, чтобы избежать дублирования)
-	if (user_command.size() && !new_command_allowed && std::time(0)-last_command_time >= 2)
-	{
-    new_command_allowed = 1; // даём разрешение на выполнение новой команды
-}
+                // Если команда — "regenerate" — перегенерируем последний ответ модели
+                if (user_command == "regenerate" ||
+                    text_heard_trimmed == "Please regenerate" ||
+                    text_heard_trimmed == "Regenerate please" ||
+                    text_heard_trimmed == "Regenerate, please" ||
+                    text_heard_trimmed == "Try again please" ||
+                    text_heard_trimmed == "Try again, please" ||
+                    text_heard_trimmed == "Please try again" ||
+                    text_heard_trimmed == "Try again")
+                {
+                    if (new_command_allowed)
+                    {
+                        // МГНОВЕННАЯ ОСТАНОВКА TTS ПЕРЕД РЕГЕНЕРАЦИЕЙ
+                        std::string dummy;
+                        allow_xtts_file(dummy, 0);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-// Если команда — "regenerate" — перегенерируем последний ответ модели
-if (user_command == "regenerate" ||
-    text_heard_trimmed == "Please regenerate" ||
-    text_heard_trimmed == "Regenerate please" ||
-    text_heard_trimmed == "Regenerate, please" ||
-    text_heard_trimmed == "Try again please" ||
-    text_heard_trimmed == "Try again, please" ||
-    text_heard_trimmed == "Please try again" ||
-    text_heard_trimmed == "Try again")
-				{
-					if (new_command_allowed)
+                        new_command_allowed = 0;
+                        last_command_time = static_cast<int>(std::time(0));
+
+                        if (!past_prev_arr.empty())
                         {
-                            // МГНОВЕННАЯ ОСТАНОВКА TTS ПЕРЕД РЕГЕНЕРАЦИЕЙ
-                            stop_tts_immediately();
-                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                            // Возвращаем контекст к предыдущему состоянию
+                            n_past_prev = past_prev_arr.back();
+                            past_prev_arr.pop_back();
 
-                            new_command_allowed = 0;
-                            last_command_time = std::time(0);
+                            int rollback_num = static_cast<int>(embd_inp.size() - n_past_prev);
 
-                            if (!past_prev_arr.empty())
+                            if (rollback_num > 0 && rollback_num <= static_cast<int>(embd_inp.size()))
                             {
-                                // Возвращаем контекст к предыдущему состоянию
-                                n_past_prev = past_prev_arr.back();
-                                past_prev_arr.pop_back();
+                                // Удаляем последние токены из контекста
+                                embd_inp.erase(embd_inp.end() - rollback_num, embd_inp.end());
+                                printf(" [regenerating %d tokens. Context: %zu]\n", rollback_num, embd_inp.size());
 
-                                int rollback_num = (int)(embd_inp.size() - n_past_prev);
+                                n_past = static_cast<int>(embd_inp.size());
+                                n_session_consumed = n_past;
 
-                                if (rollback_num > 0 && rollback_num <= (int)embd_inp.size())
+                                // Удаляем последовательность из KV-кэша
+                                llama_memory_seq_rm(llama_get_memory(ctx_llama), 0, static_cast<int>(embd_inp.size()), -1);
+
+                                // Восстанавливаем предыдущий запрос
+                                text_heard = text_heard_prev;
+                                text_heard_trimmed = "";
+
+                                // НОВЫЙ КОД: берём последний текст из g_last_tts_text (без массива)
+                                std::string text_to_respeak_safe;
                                 {
-                                    // Удаляем последние токены из контекста
-                                    embd_inp.erase(embd_inp.end() - rollback_num, embd_inp.end());
-                                    printf(" [regenerating %d tokens. Context: %zu]\n", rollback_num, embd_inp.size());
+                                    std::lock_guard<std::mutex> lock(g_last_tts_mutex);
+                                    text_to_respeak_safe = g_last_tts_text;
+                                }
 
-                                    n_past = embd_inp.size();
-                                    n_session_consumed = n_past;
-
-                                    // Удаляем последовательность из KV-кэша
-                                    llama_memory_seq_rm(llama_get_memory(ctx_llama), 0, embd_inp.size(), -1);
-
-                                    // Восстанавливаем предыдущий запрос
-                                    text_heard = text_heard_prev;
-                                    text_heard_trimmed = "";
-
-                                    // НОВЫЙ КОД: берём последний текст из g_last_tts_text (без массива)
-                                    std::string text_to_respeak_safe;
-                                    {
-                                        std::lock_guard<std::mutex> lock(g_last_tts_mutex);
-                                        text_to_respeak_safe = g_last_tts_text;
-                                    }
-
-                                    // Отправляем в TTS, если есть что озвучивать (безопасно, с мьютексом)
-                                    if (!text_to_respeak_safe.empty()) {
-                                        std::string voice_copy = current_voice;  // <-- КОПИЯ
-                                        safe_thread_emplace(threads, [text_to_respeak_safe, voice_copy, params]() {
-                                            send_tts_async(text_to_respeak_safe, voice_copy, params.language, params.xtts_url);
-                                        });
-                                    }
-
-
+                                // Отправляем в TTS, если есть что озвучивать (безопасно, с мьютексом)
+                                if (!text_to_respeak_safe.empty()) {
+                                    std::string voice_copy = current_voice;  // <-- КОПИЯ
+                                    safe_thread_emplace(threads, [text_to_respeak_safe, voice_copy, params]() {
+                                        send_tts_async(text_to_respeak_safe, voice_copy, params.language, params.xtts_url);
+                                    });
                                 }
                             }
                         }
-				}
+                    }
+                }
 
             // УДАЛЕНИЕ СООБЩЕНИЙ
             else if (user_command == "delete" ||
@@ -4414,56 +4676,56 @@ if (user_command == "regenerate" ||
             text_heard_trimmed == "Please delete the last message" ||
             text_heard_trimmed == "Delete please" ||
             text_heard_trimmed == "Delete, please")
+            {
+                // Проверяем, можно ли выполнять команду (с учётом таймаута)
+                if (new_command_allowed)
+                {
+                    if (!past_prev_arr.empty())
                     {
+                        // Удаление двух сообщений
+                        if (text_heard_trimmed == "delete two messages" ||
+                            text_heard_trimmed == "Удали 2 сообщения" ||
+                            text_heard_trimmed == "Удали два сообщения" ||
+                            text_heard_trimmed == "Please donate to the messages")
+                        {
+                            n_past_prev = past_prev_arr.back();
+                            past_prev_arr.pop_back();
+                        }
+                        // Удаление трёх сообщений
+                        else if (text_heard_trimmed == "delete three messages" ||
+                                 text_heard_trimmed == "Удали 3 сообщения" ||
+                                 text_heard_trimmed == "Удали три сообщения")
+                        {
+                            n_past_prev = past_prev_arr.back();
+                            past_prev_arr.pop_back();
+                            n_past_prev = past_prev_arr.back();
+                            past_prev_arr.pop_back();
+                        }
 
-            // Проверяем, можно ли выполнять команду (с учётом таймаута)
-            if (new_command_allowed)
-					{
+                        // Удаление одного сообщения
+                        n_past_prev = past_prev_arr.back();
+                        past_prev_arr.pop_back();
 
-if (!past_prev_arr.empty())
-{
-            // Удаление двух сообщений
-            if (text_heard_trimmed == "delete two messages" ||
-                text_heard_trimmed == "Удали 2 сообщения" ||
-                text_heard_trimmed == "Удали два сообщения" ||
-                text_heard_trimmed == "Please donate to the messages")
-							{
-								n_past_prev = past_prev_arr.back();
-								past_prev_arr.pop_back();
-							}
-            // Удаление трёх сообщений
-            else if (text_heard_trimmed == "delete three messages" ||
-                     text_heard_trimmed == "Удали 3 сообщения" ||
-                     text_heard_trimmed == "Удали три сообщения")
-							{
-								n_past_prev = past_prev_arr.back();
-								past_prev_arr.pop_back();
-								n_past_prev = past_prev_arr.back();
-								past_prev_arr.pop_back();
-							}
+                        int rollback_num = static_cast<int>(embd_inp.size() - n_past_prev);
 
-                            // Удаление одного сообщения
-							n_past_prev = past_prev_arr.back();
-							past_prev_arr.pop_back();
-
-							int rollback_num = embd_inp.size()-n_past_prev;
-
-							if (rollback_num)
-							{
+                        if (rollback_num)
+                        {
                             // Удаляем токены из контекста
-								embd_inp.erase(embd_inp.end() - rollback_num, embd_inp.end());
-								printf(" deleting %I32d tokens. Tokens in ctx: %zu\n", rollback_num, embd_inp.size());
-								n_past = embd_inp.size();
-								n_session_consumed = n_past;
-                                // Удаляем последовательность 0 из KV-кэша (новый API)
-                                // Диапазон [embd_inp.size(), end)
-                                llama_memory_seq_rm(llama_get_memory(ctx_llama), 0, embd_inp.size(), -1);
+                            embd_inp.erase(embd_inp.end() - rollback_num, embd_inp.end());
+                            if (params.verbose) {
+                                printf(" deleting %d tokens. Tokens in ctx: %zu\n", rollback_num, embd_inp.size());
+                            }
+                            n_past = static_cast<int>(embd_inp.size());
+                            n_session_consumed = n_past;
+                            // Удаляем последовательность 0 из KV-кэша (новый API)
+                            // Диапазон [embd_inp.size(), end)
+                            llama_memory_seq_rm(llama_get_memory(ctx_llama), 0, static_cast<int>(embd_inp.size()), -1);
 
                             // Сбрасываем переменные
-								text_heard = "";
-								text_heard_trimmed = "";
-								last_command_time = std::time(0);
-								new_command_allowed = 0;
+                            text_heard = "";
+                            text_heard_trimmed = "";
+                            last_command_time = static_cast<int>(std::time(0));
+                            new_command_allowed = 0;
 
                             // Асинхронное воспроизведение "Deleted" через TTS (безопасно, с мьютексом)
                             std::string text_for_deleted_tts = "Deleted";
@@ -4477,1594 +4739,1646 @@ if (!past_prev_arr.empty())
 
                             // При удалении не нужно переозвучивать предыдущий текст,
                             // поэтому убираем всю логику с text_to_respeak_safe и дублирующий вызов
-							}
-						}
-						else
-                            {
-                            // Если удалять нечего — сообщаем об этом
-                                printf("Nothing to delete more\n");
-                                send_tts_async("Nothing to delete more", "ux", params.language);
-                            }
-					}
-    audio.clear(); // Очищаем аудио-буфер
-	}
+                        }
+                    }
+                    else
+                    {
+                        // Если удалять нечего — сообщаем об этом
+                        printf("Nothing to delete more\n");
+                        send_tts_async("Nothing to delete more", "ux", params.language);
+                    }
+                }
+                audio.clear(); // Очищаем аудио-буфер
+            }
 
-// СБРОС КОНТЕКСТА
-else if (user_command == "reset")
-{
-    if (new_command_allowed)
-    {
-        // МГНОВЕННАЯ ОСТАНОВКА TTS ПЕРЕД СБРОСОМ
-        stop_tts_immediately();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        if (!past_prev_arr.empty())
-
-        {
-            n_past_prev = past_prev_arr.front();
-            past_prev_arr.clear();
-            int rollback_num = embd_inp.size() - n_past_prev;
-            if (rollback_num)
+            // СБРОС КОНТЕКСТА
+            else if (user_command == "reset")
             {
-                printf(" [Resetting context of %zd tokens.]\n", embd_inp.size());
+                if (new_command_allowed)
+                {
+                    // МГНОВЕННАЯ ОСТАНОВКА TTS ПЕРЕД СБРОСОМ
+                    std::string dummy;
+                    allow_xtts_file(dummy, 0);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    if (!past_prev_arr.empty())
+                    {
+                        n_past_prev = past_prev_arr.front();
+                        past_prev_arr.clear();
+                        int rollback_num = static_cast<int>(embd_inp.size() - n_past_prev);
+                        if (rollback_num)
+                        {
+                            printf(" [Resetting context of %zd tokens.]\n", embd_inp.size());
 
+                            {
+                                std::lock_guard<std::mutex> lock(g_llama_mutex);
+
+                                llama_batch_free(batch);
+
+                                if (ctx_llama) {
+                                    llama_free(ctx_llama);
+                                    ctx_llama = nullptr;
+                                }
+
+                                ctx_llama = llama_init_from_model(model_llama, lcparams);
+
+                                if (!ctx_llama) {
+                                    fprintf(stderr, "%s : ERROR: Failed to reinitialize llama context on reset\n", __func__);
+                                    return 1;
+                                }
+
+                                batch = llama_batch_init(2048, 0, 1);
+                                embd_inp = ::llama_tokenize(ctx_llama, prompt_llama, true);
+
+                                if (embd_inp.empty()) {
+                                    fprintf(stderr, "%s : ERROR: Failed to tokenize prompt after reset\n", __func__);
+                                    return 1;
+                                }
+
+                                // ===== ИСПРАВЛЕНИЕ: ПРОВЕРКА РАЗМЕРА =====
+                                if (embd_inp.size() > 2048) {
+                                    fprintf(stderr, "%s : FATAL ERROR: Prompt size (%zu tokens) exceeds batch limit (2048)\n",
+                                            __func__, embd_inp.size());
+                                    fprintf(stderr, "Please reduce prompt size or increase batch limit in code.\n");
+                                    return 1;
+                                }
+                                // =======================================
+
+                                batch.n_tokens = static_cast<int>(embd_inp.size());
+
+                                for (int i = 0; i < batch.n_tokens; i++) {
+                                    batch.token[i] = embd_inp[i];
+                                    batch.pos[i] = i;
+                                    batch.n_seq_id[i] = 1;
+                                    batch.seq_id[i][0] = 0;
+                                    batch.logits[i] = (i == batch.n_tokens - 1) ? 1 : 0;
+                                }
+
+                                if (llama_decode(ctx_llama, batch)) {
+                                    fprintf(stderr, "%s : failed to decode after reset\n", __func__);
+                                    return 1;
+                                }
+                            }
+
+                            n_past = static_cast<int>(embd_inp.size());
+                            n_session_consumed = static_cast<int>(embd_inp.size());
+                            printf(" [Context is now %zu/%d tokens. n_past: %d]\n", embd_inp.size(), params.ctx_size, n_past);
+
+                            text_heard = "";
+                            text_heard_trimmed = "";
+
+                            send_tts_async("Reset whole context", current_voice, params.language, params.xtts_url);
+
+                            new_command_allowed = 0;
+                            last_command_time = static_cast<int>(std::time(0));
+                        }
+                    }
+                    else
+                    {
+                        printf(" [Nothing to reset more]\n");
+                        send_tts_async("Nothing to reset more", params.xtts_voice, params.language, params.xtts_url);
+                    }
+                }
+                audio.clear();
+                continue;
+            }
+
+            // ОСТАНОВКА stop (ИСПРАВЛЕНО: используем единый флаг)
+            if (user_command == "stop")
+            {
+                std::string lower_text = LowerCase(text_heard_trimmed);
+                
+                // Простая проверка стоп-команд
+                bool is_stop_command = (
+                    lower_text == "стоп" || lower_text == "stop" ||
+                    lower_text == "хватит" || lower_text == "остановись" ||
+                    lower_text.find(params.bot_name + " стоп") != std::string::npos ||
+                    lower_text.find(params.bot_name + " stop") != std::string::npos
+                );
+                
+                if (!is_stop_command) {
+                    // Не стоп-команда — продолжаем обычную обработку
+                    user_command.clear();
+                    // НЕ continue, а идём дальше
+                } else {
+                    // ===== МГНОВЕННАЯ ОСТАНОВКА TTS =====
+                    std::string dummy;
+                    allow_xtts_file(dummy, 0);
+                    
+                    // Очищаем буферы
+                    text_heard.clear();
+                    text_heard_trimmed.clear();
+                    audio.clear();
+                    user_typed.clear();
+                    user_typed_this = false;
+                    
+                    // Устанавливаем единый флаг прерывания
+                    g_interrupt_reason.store(InterruptReason::MANUAL_STOP);
+                    
+                    // Устанавливаем флаг горячей клавиши
+                    {
+                        std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
+                        g_hotkey_pressed = "Ctrl+Space";
+                    }
+                    
+                    if (params.verbose) {
+                        fprintf(stdout, "\n[Stop] TTS остановлен\n");
+                    }
+                    
+                    // ===== КЛЮЧЕВОЕ: выходим из обработки, чтобы не начинать новую генерацию =====
+                    // Очищаем text_heard, чтобы ниже не началась генерация
+                    text_heard = "";
+                    text_heard_trimmed = "";
+                    
+                    // Пропускаем всю остальную обработку и возвращаемся в главный цикл
+                    continue;
+                }
+            }
+            // Скажи сколько время
+            else if (text_heard_trimmed.find("время") != std::string::npos ||
+                    text_heard_trimmed.find("который час") != std::string::npos ||
+                    text_heard_trimmed.find("what time") != std::string::npos ||
+                    text_heard_trimmed.find("сколько времени") != std::string::npos ||
+                    text_heard_trimmed.find("сколько время") != std::string::npos)
+            {
+                user_command = "time";
+            }
+
+            // Обработчик команды "google"
+            else if (user_command == "google")
+            {
+                // Простая лямбда для отправки текста в TTS (без массивов и мьютексов)
+                auto speak_direct = [&](const std::string& msg) {
+                    if (msg.empty()) return;
+                    std::string msg_copy = msg;
+                    std::string voice_copy = current_voice;  // <-- ДОБАВИТЬ КОПИЮ
+                    try {
+                        safe_thread_emplace(threads, [msg_copy, voice_copy, params]() {
+                            send_tts_async(msg_copy, voice_copy, params.language, params.xtts_url);
+                        });
+                    } catch (const std::exception& e) {
+                        if (params.verbose) {
+                            fprintf(stderr, "[google] TTS thread spawn failed: %s\n", e.what());
+                        }
+                    }
+                };
+
+                // Достаём ключевые слова
+                std::string q = ParseCommandAndGetKeyword(text_heard_trimmed, user_command);
+
+                if (q.empty()) {
+                    fprintf(stdout, "[google] can't get keyword from: %s\n", text_heard_trimmed.c_str());
+                    speak_direct("Извините, не удалось понять, что именно вы хотите найти.");
+                    user_typed.clear();
+                    user_typed_this = false;
+                } else {
+                    // Аудио-квитанция — отправляем в TTS безопасно, с мьютексом
+                    std::string google_search_msg = "Ищу информацию по запросу: " + q;
+                    std::string voice_copy = current_voice;  // <-- КОПИЯ
+                    std::string lang_copy  = params.language;   // <-- КОПИЯ ДЛЯ ПОТОКОБЕЗОПАСНОСТИ
+                    std::string url_copy   = params.xtts_url;   // <-- КОПИЯ ДЛЯ ПОТОКОБЕЗОПАСНОСТИ
+                    safe_thread_emplace(threads, [google_search_msg, voice_copy, lang_copy, url_copy]() {
+                        send_tts_async(google_search_msg, voice_copy, lang_copy, url_copy);
+                    });
+
+                    // Запрос к поисковому серверу
+                    const std::string url = params.google_url + "google?q=" + UrlEncode(q);
+                    std::string resp = send_curl(url);
+                    if (resp.empty()) {
+                        fprintf(stdout, "[google] empty response for (%s) — check backend\n", q.c_str());
+
+                        // ГОЛОСОВОЕ СООБЩЕНИЕ ОБ ОШИБКЕ (безопасно, с мьютексом)
+                        std::string error_msg = "Извините, не удалось найти информацию по запросу: " + q;
+                        std::string voice_copy_err = current_voice;  // <-- КОПИЯ
+                        safe_thread_emplace(threads, [error_msg, voice_copy_err, params]() {
+                            send_tts_async(error_msg, voice_copy_err, params.language, params.xtts_url);
+                        });
+                    } else {
+                        if (params.verbose) {
+                            fprintf(stdout, "[google] resp (%s): %s\n", q.c_str(), resp.c_str());
+                        }
+                        // Подрезаем ответ «по границе предложения»
+                        auto truncate_smart = [](std::string s, size_t hard = 600, size_t prefer = 420) {
+                            if (s.size() <= hard) return s;
+                            size_t cut = s.find_last_of(".!?");
+                            if (cut != std::string::npos && cut >= std::min(prefer, hard)) {
+                                s.erase(cut + 1);
+                            } else {
+                                s.erase(std::min(hard, s.size()));
+                                s += "...";
+                            }
+                            return s;
+                        };
+                        resp = truncate_smart(resp);
+                        // Формируем реплику пользователя для LLaMA
+                        std::string llm_prompt = params.person + ": " + params.bot_name +
+                            ", пожалуйста, кратко изложи основное из текста, найденного по запросу \"" + q + "\": " + resp;
+                        text_heard = llm_prompt;
+                        user_typed_this = true;
+                    }
+                }
+                // Чистим одноразовые буферы, НО НЕ ДЕЛАЕМ continue;
+                audio.clear();
+                user_typed.clear();
+                // user_typed_this оставляем как есть: true — если мы подменили text_heard промптом; false — если нет
+                // Конец обработчика "google" ПОГУГЛИ
+            }
+            // Скажи время
+            else if (user_command == "time") {
+                // Цель: ответить только текущее время в цифровом формате, без даты
+                // 1. Получаем текущее системное время
+                std::time_t t_now = std::time(nullptr);
+                std::tm tm_local_now {};
+                #ifdef _WIN32
+                    localtime_s(&tm_local_now, &t_now); // Windows версия
+                #else
+                    localtime_r(&t_now, &tm_local_now); // POSIX версия
+                #endif
+                int hour = tm_local_now.tm_hour;  // 0-23
+                int minute = tm_local_now.tm_min; // 0-59
+                // Форматируем время как HH:MM
+                char time_buffer[64];
+                std::snprintf(time_buffer, sizeof(time_buffer), "Сейчас %02d:%02d", hour, minute);
+
+                // Формируем промпт для LLM
+                std::string llm_prompt = params.person + ": Который час?\n" + params.bot_name + ": " + std::string(time_buffer);
+                // Подменяем вход
+                text_heard = llm_prompt;
+                user_typed_this = true;
+                // Очищаем аудио и состояние
+                audio.clear();
+                user_typed.clear();
+                text_heard_trimmed = "";
+                // reply_part не сбрасываем
+                // Продолжаем основной цикл обработки
+            }
+
+            // CALL
+            // В функции обработки команды "call" обновляем логику выбора бота
+            else if (user_command == "call") {
+                // Проверяем, включена ли функция множества ботов
+                if (params.multi_chars) {
+                    std::string q = ParseCommandAndGetKeyword(text_heard, user_command);
+                    if (!q.empty()) {
+                        fprintf(stdout, "Переключаюсь на бота: %s", q.c_str());
+                        std::string old_bot_name = params.bot_name;  // сохраняем для отладки (опционально)
+                        params.bot_name = q;                         // меняем имя бота
+
+                        // ОБНОВЛЯЕМ АНТИПРОМПТЫ С НОВЫМ ИМЕНЕМ ПОЛЬЗОВАТЕЛЯ
+                        update_antiprompts(params.person, params.bot_name);
+
+                        if (params.verbose) {
+                            fprintf(stdout, " [antiprompts updated for bot: %s]\n", params.bot_name.c_str());
+                        }
+                    } else {
+                        fprintf(stdout, "Error: can't find bot name in text_heard_trimmed: %s", text_heard_trimmed.c_str());
+                    }
+                } else {
+                    // Если multi_chars отключен, игнорируем команду call
+                    // fprintf(stdout, "Команда 'call' игнорируется: режим multi_chars отключен.");
+                }
+            }
+
+            int translation_is_going = 0;
+            int n_embd_inp_before_trans = 0;
+            int tokens_in_reply = 0;
+            std::string current_voice_tmp = "";
+            reply_part = 0;
+
+            // ### ЦИКЛ ГЕНЕРАЦИИ ТЕКСТА (LLaMA) ###
+            // Объяви это ПЕРЕД циклом while(true) генерации LLaMA
+            float speech_vad_start_ms = 0.0f;
+            float llama_start_generation_time = 0.0f;  // <-- ДОБАВИТЬ ИНИЦИАЛИЗАЦИЮ
+            llama_start_time = get_current_time_ms();
+
+            // ОПТИМИЗАЦИЯ: Убрана первичная токенизация. Проверяем только пустоту строки.
+            if (text_heard.empty() || force_speak) {
+                audio.clear();
+                {   // Сброс под защитой мьютекса
+                    std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
+                    g_hotkey_pressed = "";
+                }
+                force_speak = false; // Сбрасываем флаг ПЕРЕД continue, чтобы он не залип
+                continue;
+            }
+            trim(text_heard);
+            text_heard_prev = text_heard;
+            n_past_prev = static_cast<int>(embd_inp.size());
+            
+            past_prev_arr.push_back(static_cast<int>(embd_inp.size()));
+            
+            // Простое ограничение: храним не больше 100 состояний
+            if (past_prev_arr.size() > 100) {
+                past_prev_arr.erase(past_prev_arr.begin());
+            }
+
+
+            std::string translation_full = "";
+            std::string bot_name_current = params.bot_name;
+            std::string bot_name_current_ru = params.bot_name;
+            std::string text_heard_with_instruct = text_heard;
+
+            if (params.translate) bot_name_current_ru = translit_en_ru(params.bot_name);
+            int n_comas = 0;
+
+            // ===== ФОРМАТИРОВАНИЕ РЕПЛИКИ ПОЛЬЗОВАТЕЛЯ ДЛЯ LLAMA =====
+            // Алгоритмический смысл: модели YandexGPT/Llama-3 требуют явных разделителей ролей в контексте.
+            // Мы формируем их ТОЛЬКО для embd_inp. В stdout эта разметка попадать не должна.
+            if (last_output_has_username && !user_typed_this) {
+                // Предыдущий ответ модели уже содержал имя пользователя — добавляем только пробел для склейки
+                text_heard.insert(0, 1, ' ');
+                text_heard_with_instruct.insert(0, 1, ' ');
+            } else {
+                // Стандартное начало реплики пользователя в контексте модели
+                text_heard.insert(0, "\n" + params.person + chat_symb + " ");
+                text_heard_with_instruct.insert(0, params.instruct_preset_data["user_message_prefix"] + "\n" + params.person + chat_symb + " ");
+            }
+
+            // ===== ФОРМАТИРОВАНИЕ ОТВЕТА БОТА =====
+            text_heard += params.bot_name + chat_symb;
+            text_heard_with_instruct += params.instruct_preset_data["user_message_suffix"] + 
+                                        params.instruct_preset_data["bot_message_prefix"] + 
+                                        params.bot_name + chat_symb;  // ← убрали "\n"
+
+            // ===== ВЫВОД В КОНСОЛЬ: ЧИСТЫЙ ДИАЛОГ =====
+            std::string display_text;
+            if (user_typed_this) {
+                display_text = user_typed;
+            } else {
+                display_text = text_heard_trimmed;
+            }
+
+            // Удаляем все варианты префикса имени пользователя из начала строки
+            std::string clean_prefix = params.person + chat_symb;       // "Друг:"
+            std::string clean_prefix_space = params.person + " " + chat_symb; // "Друг :"
+            while (display_text.find(clean_prefix) == 0) {
+                display_text.erase(0, clean_prefix.length());
+            }
+            while (display_text.find(clean_prefix_space) == 0) {
+                display_text.erase(0, clean_prefix_space.length());
+            }
+            trim(display_text);
+            if (!display_text.empty() && display_text[0] == ':') {
+                display_text.erase(0, 1);
+                trim(display_text);
+            }
+
+            // Визуальное разделение диалогов (пустая строка между парами)
+            static bool first_dialog_pair = true;
+            if (!first_dialog_pair) {
+                printf("\n");
+            }
+            first_dialog_pair = false;
+
+            // Очистка текущей строки консоли от артефактов VAD/Whisper
+            printf("\r\033[K");
+
+            // Вывод реплики пользователя
+            if (!display_text.empty()) {
+                printf("%s%s %s\n", params.person.c_str(), chat_symb.c_str(), display_text.c_str());
+            } else {
+                // Если текст пустой (тишина/шум), показываем маркер слушания
+                printf("%s%s [слушаю...]\n", params.person.c_str(), chat_symb.c_str());
+            }
+            fflush(stdout);
+
+            // Приглашение для бота (ровно один пробел после двоеточия)
+            printf("%s%s ", params.bot_name.c_str(), chat_symb.c_str());
+            fflush(stdout);
+
+            // ЕДИНСТВЕННАЯ ТОКЕНИЗАЦИЯ: сразу в embd
+            embd = ::llama_tokenize(ctx_llama, text_heard_with_instruct, false);
+            input_tokens_count = static_cast<int>(embd.size());
+
+            // Append the new input tokens to the session_tokens vector
+            if (!path_session.empty()) {
+                // Используем embd (активные токены), а не удаленный вектор tokens
+                session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
+            }
+
+            float temp_next = params.temp;
+            int n_discard = 0;
+            int n_left = 0;
+
+            // =================================================================
+            // ЦИКЛ ГЕНЕРАЦИИ ТЕКСТА (LLaMA)
+            // =================================================================
+            // В этом цикле модель генерирует токен за токеном до тех пор,
+            // пока не встретит стоп-последовательность или не достигнет лимита
+            // =================================================================
+            bool done = false;
+            std::string text_to_speak;
+            std::string full_response_text;   // полный текст ответа для Regenerate
+            int new_tokens = 0;
+            bool first_token_after_bot = true;  // ← СБРАСЫВАЕМ ФЛАГ ПЕРЕД КАЖДОЙ НОВОЙ ГЕНЕРАЦИЕЙ
+
+            // =================================================================
+            // ОБЪЯВЛЕНИЕ СТАТИЧЕСКОГО БУФЕРА ДЛЯ УМНОГО СПЛИТА TTS
+            // =================================================================
+            static std::string tts_smart_buffer;
+
+            // =================================================================
+            // ПЕРЕМЕННЫЕ ДЛЯ VAD ПРОВЕРКИ В ЦИКЛЕ ГЕНЕРАЦИИ
+            // =================================================================
+            int vad_check_counter = 0;
+            int vad_loop_counter = 0;           // <-- НОВАЯ ПЕРЕМЕННАЯ (НЕ static!)
+            std::vector<float> pcmf32_vad;
+
+            // СБРОС ПЕРЕМЕННЫХ перед новой генерацией
+            {
+                std::string pending_fragment;
+                int pending_count = 0;
+                bool first_token_after_bot_static = true;
+
+                // Очищаем буфер TTS перед каждым новым ответом
+                tts_smart_buffer.clear();
+            }
+            while (true) {
+                // =============================================================
+                // ПРОВЕРКА ПРЕРЫВАНИЯ ПО ЕДИНОМУ ФЛАГУ
+                // =============================================================
+                InterruptReason reason = g_interrupt_reason.load();
+                if (reason != InterruptReason::NONE) {
+                    std::string dummy;
+                    allow_xtts_file(dummy, 0);
+                    done = true;
+                    text_to_speak = "";
+                    tts_smart_buffer.clear();
+                    audio.clear();
+                    if (params.verbose) {
+                        printf(" [interrupted by %d]\n", static_cast<int>(reason));
+                    }
+                    break;
+                }
+                    
+                // =============================================================
+                // ПРОВЕРКА ПРЕРЫВАНИЯ ПО ГОРЯЧЕЙ КЛАВИШЕ
+                // =============================================================
+                // Каждую итерацию цикла проверяем, не нажал ли пользователь
+                // Ctrl+Space или Alt для прерывания генерации.
+                // Это позволяет мгновенно остановить генерацию, не дожидаясь
+                // окончания текущего токена или следующей итерации главного цикла.
+                // =============================================================
+                {
+                    std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
+                    if (!g_hotkey_pressed.empty() && g_hotkey_pressed != "Alt") {
+                        // МГНОВЕННАЯ ОСТАНОВКА TTS
+                        std::string dummy;
+                        allow_xtts_file(dummy, 0);
+                        
+                        // Нажата горячая клавиша — прерываем генерацию
+                        g_interrupt_reason.store(InterruptReason::HOTKEY_STOP);
+                        done = true;
+
+                        // Очищаем текст для озвучки, чтобы не отправлять в TTS
+                        text_to_speak = "";
+                        tts_smart_buffer.clear();
+
+                        // Сбрасываем горячую клавишу после обработки
+                        g_hotkey_pressed = "";
+
+                        // ТОЛЬКО ОДНО КРАТКОЕ СООБЩЕНИЕ, БЕЗ СЛОВА "Hotkey"
+                        if (params.verbose) {
+                            printf(" [stopped by hotkey]\n");
+                        }
+                        break;
+                    }
+                }
+
+                // =============================================================
+                // ПРОВЕРКА МИКРОФОНА В ЦИКЛЕ ГЕНЕРАЦИИ (КЛЮЧЕВОЕ УЛУЧШЕНИЕ!)
+                // =============================================================
+                // Проверяем каждые VAD_CHECK_INTERVAL_TOKENS токенов.
+                // Это позволяет мгновенно прерывать генерацию, как только
+                // пользователь начинает говорить.
+                // =============================================================
+                // ВАЖНО: vad_loop_counter объявлен НЕ static перед циклом while(true)
+                // и сбрасывается при каждом новом ответе бота
+                vad_loop_counter++;
+                if (vad_loop_counter >= VAD_CHECK_INTERVAL_TOKENS && new_tokens > 0) {
+                    vad_loop_counter = 0;
+                    std::vector<float> pcmf32_vad_check;
+                    audio.get(400, pcmf32_vad_check);
+                    if (!pcmf32_vad_check.empty()) {
+                        int vad_check = ::vad_simple_int(pcmf32_vad_check, WHISPER_SAMPLE_RATE,
+                                                        400, params.vad_thold, params.freq_thold,
+                                                        params.print_energy, params.vad_start_thold);
+                        if (vad_check == 1) {
+                            // Обнаружена речь — МГНОВЕННАЯ ОСТАНОВКА
+                            std::string dummy;
+                            allow_xtts_file(dummy, 0);
+                            tts_smart_buffer.clear();
+                            text_to_speak.clear();
+                            g_interrupt_reason.store(InterruptReason::VAD_SPEECH);
+                            done = true;
+                            if (params.verbose) {
+                                printf("\n[VAD-LOOP] INTERRUPTED at token %d\n", new_tokens);
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                // predict
+                if (new_tokens > params.n_predict) break;      // превышен лимит токенов ответа
+                new_tokens++;                                   // увеличиваем счётчик сгенерированных токенов
+                if (embd.size() > 0) {                          // есть токены на декодирование
+                    if (n_past + static_cast<int>(embd.size()) > n_ctx) {   // контекст переполнен → нужен сдвиг
+
+                        // ============================================================================
+                        // РОТАЦИЯ КОНТЕКСТА (CONTEXT SHIFT) — ИСПРАВЛЕННАЯ ВЕРСИЯ
+                        // ============================================================================
+                        if (n_past + static_cast<int>(embd.size()) > n_ctx) {
+                            // ------------------------------------------------------------------------
+                            // ШАГ 1: Получаем вокабуляр для работы с BOS-токеном
+                            // ------------------------------------------------------------------------
+                            const llama_vocab * vocab_llama_local = llama_model_get_vocab(model_llama);
+
+                            // ------------------------------------------------------------------------
+                            // ШАГ 2: Вычисляем, сколько токенов можно удалить
+                            // ------------------------------------------------------------------------
+                            const int n_left_local = std::max(0, n_past - n_keep);
+
+                            // n_discard = сколько токенов удаляем (1/4 от n_left, но минимум 1)
+                            int n_discard_local = 0;
+                            if (n_left_local > 0) {
+                                n_discard_local = std::max(1, n_left_local / 4);
+                                n_discard_local = std::min(n_discard_local, n_left_local);
+                            }
+
+                            // ------------------------------------------------------------------------
+                            // ШАГ 3: Флаг успешного сдвига
+                            // ------------------------------------------------------------------------
+                            bool context_updated = false;
+
+                            // ------------------------------------------------------------------------
+                            // ШАГ 4: Основная логика сдвига (если есть что удалять)
+                            // ------------------------------------------------------------------------
+                            if (n_discard_local > 0 && n_keep + n_discard_local <= n_past) {
+                                if (n_keep >= 0 && n_keep + n_discard_local <= static_cast<int>(embd_inp.size())) {
+
+                                    // 4.1 Удаляем диапазон токенов из KV-кэша модели
+                                    llama_memory_seq_rm(llama_get_memory(ctx_llama), 0, n_keep, n_keep + n_discard_local);
+
+                                    // 4.2 Сдвигаем оставшиеся токены влево
+                                    if (n_keep + n_discard_local < n_past) {
+                                        llama_memory_seq_add(llama_get_memory(ctx_llama), 0, n_keep + n_discard_local, n_past, -n_discard_local);
+                                    }
+
+                                    // 4.3 Удаляем те же токены из локального буфера embd_inp
+                                    embd_inp.erase(embd_inp.begin() + n_keep, embd_inp.begin() + n_keep + n_discard_local);
+
+                                    // ========== ИСПРАВЛЕНИЕ: ПОЛНАЯ СИНХРОНИЗАЦИЯ СЕССИИ ==========
+                                    // 4.4 Синхронизируем session_tokens с embd_inp (по содержимому, не только по размеру)
+                                    if (!path_session.empty()) {
+                                        // Вариант А: Если session_tokens длиннее embd_inp — обрезаем
+                                        if (session_tokens.size() > embd_inp.size()) {
+                                            session_tokens.resize(embd_inp.size());
+                                            if (params.verbose) {
+                                                printf("[Session] Trimmed to %zu tokens\n", session_tokens.size());
+                                            }
+                                        }
+                                        
+                                        // Вариант Б: Проверяем содержимое первых n_keep токенов (они должны совпадать)
+                                        bool need_full_resync = false;
+                                        int check_limit = std::min(n_keep, static_cast<int>(std::min(embd_inp.size(), session_tokens.size())));
+                                        for (int i_check = 0; i_check < check_limit; i_check++) {
+                                            if (embd_inp[i_check] != session_tokens[i_check]) {
+                                                need_full_resync = true;
+                                                break;
+                                            }
+                                        }
+                                        
+                                        // Если рассинхрон — пересоздаём сессию заново
+                                        if (need_full_resync) {
+                                            session_tokens = embd_inp;
+                                            if (params.verbose) {
+                                                printf("[Session] Full resync: %zu tokens\n", session_tokens.size());
+                                            }
+                                        } 
+                                        // Иначе просто обрезаем до размера embd_inp (если ещё не обрезали)
+                                        else if (session_tokens.size() > embd_inp.size()) {
+                                            session_tokens.resize(embd_inp.size());
+                                        }
+                                        
+                                        // Сохраняем сессию после сдвига (критично для долгой работы)
+                                        if (!path_session.empty()) {
+                                            if (llama_state_save_file(ctx_llama, path_session.c_str(), 
+                                                                       session_tokens.data(), session_tokens.size())) {
+                                                if (params.verbose) {
+                                                    printf("[Session] Saved after shift (%zu tokens)\n", session_tokens.size());
+                                                }
+                                            } else {
+                                                if (params.verbose) {
+                                                    fprintf(stderr, "[Session] ERROR: Failed to save after shift\n");
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // ========== КОНЕЦ ИСПРАВЛЕНИЯ ==========
+
+                                    context_updated = true;
+
+                                    // Короткое сообщение в консоль
+                                    if (params.verbose) {
+                                        printf("\n[Сдвиг: удал. %d ток, ост: %zu]\n", n_discard_local, embd_inp.size());
+                                    }
+                                }
+                            }
+
+                            // ------------------------------------------------------------------------
+                            // ШАГ 5: Fallback
+                            // ------------------------------------------------------------------------
+                            if (!context_updated) {
+                                size_t new_size = std::min(static_cast<size_t>(std::max(0, n_keep)), embd_inp.size());
+                                if (new_size < embd_inp.size()) {
+                                    embd_inp.resize(new_size);
+
+                                    if (!path_session.empty() && !session_tokens.empty()) {
+                                        session_tokens.resize(std::min(static_cast<size_t>(std::max(0, n_keep)), session_tokens.size()));
+                                    }
+
+                                    if (params.verbose) {
+                                        printf("\n[Сдвиг: сброс до %zu ток.]\n", embd_inp.size());
+                                    }
+                                }
+                            }
+
+                            // ------------------------------------------------------------------------
+                            // ШАГ 6: Обновляем счётчики
+                            // ------------------------------------------------------------------------
+                            n_past = static_cast<int>(embd_inp.size());
+                            n_session_consumed = n_past;
+
+                            // ------------------------------------------------------------------------
+                            // ШАГ 7: Проверяем и восстанавливаем BOS-токен
+                            // ------------------------------------------------------------------------
+                            if (vocab_llama_local) {
+                                const llama_token bos_token = llama_token_bos(vocab_llama_local);
+                                if (!embd_inp.empty() && embd_inp[0] != bos_token) {
+                                    embd_inp.insert(embd_inp.begin(), bos_token);
+
+                                    if (!session_tokens.empty()) {
+                                        session_tokens.insert(session_tokens.begin(), bos_token);
+                                    }
+
+                                    n_past = static_cast<int>(embd_inp.size());
+                                    n_session_consumed = n_past;
+                                    if (params.verbose) {
+                                        printf("[BOS]");
+                                    }
+                                }
+                            } else {
+                                if (params.verbose) {
+                                    fprintf(stderr, "WARNING: vocab_llama is null, cannot check BOS token\n");
+                                }
+                            }
+
+                            // ------------------------------------------------------------------------
+                            // ШАГ 8: Отключаем сессию после сдвига
+                            // ------------------------------------------------------------------------
+                            path_session = "";
+
+                            // ========== 🔧 ==========
+                            // После сдвига контекста ОЧИЩАЕМ embd, потому что токены в нём имеют старые pos
+                            // Это безопасно: при следующей итерации цикла embd пуст, модель запросит новый токен
+                            // ========================
+
+                            embd.clear();
+                            text_to_speak = "";  // Также очищаем буфер озвучки, чтобы не отправить мусор
+                            past_prev_arr.clear();
+                            continue;  // Переходим к следующей итерации, минуя декодирование старых токенов
+                        }
+                    }
+                }
+                // Попытка повторного использования совпадающего префикса из загруженной сессии
+                if (n_session_consumed < static_cast<int>(session_tokens.size())) {
+                    size_t i = 0;
+                    // Добавляем безопасные границы
+                    int max_check = std::min(static_cast<int>(embd.size()), static_cast<int>(session_tokens.size()) - n_session_consumed);
+
+                    for ( ; i < static_cast<size_t>(max_check); i++) {
+                        // Дополнительная проверка индекса
+                        if (n_session_consumed >= static_cast<int>(session_tokens.size())) {
+                            break;
+                        }
+
+                        if (embd[i] != session_tokens[n_session_consumed]) {
+                            session_tokens.resize(n_session_consumed);
+                            break;
+                        }
+
+                        //Вместо n_past++ — добавляем токен в embd_inp, чтобы сохранить инвариант
+                        embd_inp.push_back(embd[i]);
+                        n_session_consumed++;
+
+                        if (n_session_consumed >= static_cast<int>(session_tokens.size())) {
+                            i++;
+                            break;
+                        }
+                    }
+                    if (i > 0) {
+                        embd.erase(embd.begin(), embd.begin() + static_cast<std::ptrdiff_t>(i));
+                    }
+                    //Обновляем n_past один раз — после всех изменений embd_inp
+                    n_past = static_cast<int>(embd_inp.size());
+                }
+
+                // Если есть новые токены и используется сессия, добавляем их в сессию
+                if (embd.size() > 0 && !path_session.empty()) {
+                    session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
+                    n_session_consumed = static_cast<int>(session_tokens.size());  // Обновляем счётчик потреблённых токенов
+                }
+                // безопасная подготовка batch с обнулением logits
+                {
+                    if (embd.empty()) {
+                        embd.clear();
+                        continue;
+                    }
+                    if (embd.size() > 2048) {
+                        fprintf(stderr, "ERROR: Input sequence too long (%zu tokens). Max batch size is 2048.\n", embd.size());
+                        embd.clear();
+                        continue;
+                    }
+
+                    batch.n_tokens = static_cast<int>(embd.size());
+
+                    // Обнуляем logits только для реально используемых токенов
+                    for (int i = 0; i < batch.n_tokens; ++i) {
+                        batch.logits[i] = 0;
+                    }
+
+                    for (int i = 0; i < batch.n_tokens; ++i) {
+                        batch.token[i] = embd[i];
+                        batch.pos[i] = n_past + i;
+                        batch.n_seq_id[i] = 1;
+                        batch.seq_id[i][0] = 0;
+                        batch.logits[i] = (i == batch.n_tokens - 1) ? 1 : 0;
+                    }
+                }
+
+                // Выполняем декодирование (потокобезопасно с защитой от reset)
                 {
                     std::lock_guard<std::mutex> lock(g_llama_mutex);
 
-                    llama_batch_free(batch);
-
-                    if (ctx_llama) {
-                        llama_free(ctx_llama);
-                        ctx_llama = nullptr;
-                    }
-
-                    ctx_llama = llama_init_from_model(model_llama, lcparams);
-
+                    // Проверяем, что контекст не был сброшен во время генерации
                     if (!ctx_llama) {
-                        fprintf(stderr, "%s : ERROR: Failed to reinitialize llama context on reset\n", __func__);
-                        return 1;
-                    }
-
-                    batch = llama_batch_init(2048, 0, 1);
-                    embd_inp = ::llama_tokenize(ctx_llama, prompt_llama, true);
-
-                    if (embd_inp.empty()) {
-                        fprintf(stderr, "%s : ERROR: Failed to tokenize prompt after reset\n", __func__);
-                        return 1;
-                    }
-
-                    // ===== ИСПРАВЛЕНИЕ: ПРОВЕРКА РАЗМЕРА =====
-                    if (embd_inp.size() > 2048) {
-                        fprintf(stderr, "%s : FATAL ERROR: Prompt size (%zu tokens) exceeds batch limit (2048)\n",
-                                __func__, embd_inp.size());
-                        fprintf(stderr, "Please reduce prompt size or increase batch limit in code.\n");
-                        return 1;
-                    }
-                    // =======================================
-
-                    batch.n_tokens = embd_inp.size();
-
-                    for (int i = 0; i < batch.n_tokens; i++) {
-                        batch.token[i] = embd_inp[i];
-                        batch.pos[i] = i;
-                        batch.n_seq_id[i] = 1;
-                        batch.seq_id[i][0] = 0;
-                        batch.logits[i] = i == batch.n_tokens - 1;
+                        fprintf(stderr, "\n[Context was reset during generation - aborting]\n");
+                        done = true;
+                        break;
                     }
 
                     if (llama_decode(ctx_llama, batch)) {
-                        fprintf(stderr, "%s : failed to decode after reset\n", __func__);
-                        return 1;
+                        fprintf(stderr, "%s : failed to decode\n", __func__);
+                        fprintf(stderr, "\n LLaMA decoding failed. Restarting...\n");
+                        // Очищаем контекст и пробуем заново, без ожидания ввода
+                        if (ctx_llama) {
+                            llama_memory_seq_rm(llama_get_memory(ctx_llama), 0, n_past, -1);
+                        }
+                        embd.clear();
+                        n_past = static_cast<int>(embd_inp.size());
+                        n_session_consumed = n_past;
+                        continue;
                     }
                 }
-
-                n_past = embd_inp.size();
-                n_session_consumed = embd_inp.size();
-                printf(" [Context is now %zu/%d tokens. n_past: %d]\n", embd_inp.size(), params.ctx_size, n_past);
-
-                text_heard = "";
-                text_heard_trimmed = "";
-
-                send_tts_async("Reset whole context", current_voice, params.language, params.xtts_url);
-
-                new_command_allowed = 0;
-                last_command_time = std::time(0);
-            }
-        }
-        else
-        {
-            printf(" [Nothing to reset more]\n");
-            send_tts_async("Nothing to reset more", params.xtts_voice, params.language, params.xtts_url);
-        }
-    }
-    audio.clear();
-    continue;
-}
-
-// ОСТАНОВКА stop - УПРОЩЁННАЯ ВЕРСИЯ БЕЗ ЛИШНИХ ПЕЧАТЕЙ
-if (user_command == "stop")
-    {
-        std::string lower_text = LowerCase(text_heard_trimmed);
-        
-        // Простая проверка стоп-команд
-        bool is_stop_command = (
-            lower_text == "стоп" || lower_text == "stop" ||
-            lower_text == "хватит" || lower_text == "остановись" ||
-            lower_text.find(params.bot_name + " стоп") != std::string::npos ||
-            lower_text.find(params.bot_name + " stop") != std::string::npos
-        );
-        
-        if (!is_stop_command) {
-            // Не стоп-команда — продолжаем обычную обработку
-            user_command.clear();
-            continue;
-        }
-        
-        // ===== МГНОВЕННАЯ ОСТАНОВКА TTS =====
-        stop_tts_immediately();
-        
-        // Очищаем буферы
-        text_heard.clear();
-        text_heard_trimmed.clear();
-        audio.clear();
-        user_typed.clear();
-        user_typed_this = false;
-        
-        // Сбрасываем флаги генерации
-        llama_interrupted.store(1);
-        g_is_interrupted.store(true);
-        
-        // Устанавливаем флаг горячей клавиши
-        {
-            std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
-            g_hotkey_pressed = "Ctrl+Space";
-        }
-        
-        if (params.verbose) {
-            fprintf(stdout, "\n[Stop] TTS остановлен\n");
-        }
-        
-        continue;
-    }
-    // Скажи сколько время
-    else if (text_heard_trimmed.find("время") != std::string::npos ||
-            text_heard_trimmed.find("который час") != std::string::npos ||
-            text_heard_trimmed.find("what time") != std::string::npos ||
-            text_heard_trimmed.find("сколько времени") != std::string::npos ||
-            text_heard_trimmed.find("сколько время") != std::string::npos)
-    {
-        user_command = "time";
-    }
-
-        // Обработчик команды "google"
-    else if (user_command == "google")
-    {
-        // Простая лямбда для отправки текста в TTS (без массивов и мьютексов)
-        auto speak_direct = [&](const std::string& msg) {
-            if (msg.empty()) return;
-            std::string msg_copy = msg;
-            std::string voice_copy = current_voice;  // <-- ДОБАВИТЬ КОПИЮ
-            try {
-                safe_thread_emplace(threads, [msg_copy, voice_copy, params]() {
-                    send_tts_async(msg_copy, voice_copy, params.language, params.xtts_url);
-                });
-            } catch (const std::exception& e) {
-                fprintf(stderr, "[google] TTS thread spawn failed: %s\n", e.what());
-            }
-        };
-
-        // Достаём ключевые слова
-        std::string q = ParseCommandAndGetKeyword(text_heard_trimmed, user_command);
-
-        if (q.empty()) {
-            fprintf(stdout, "[google] can't get keyword from: %s\n", text_heard_trimmed.c_str());
-            speak_direct("Извините, не удалось понять, что именно вы хотите найти.");
-            user_typed.clear();
-            user_typed_this = false;
-        } else {
-            // Аудио-квитанция — отправляем в TTS безопасно, с мьютексом
-            std::string google_search_msg = "Ищу информацию по запросу: " + q;
-            std::string voice_copy = current_voice;  // <-- КОПИЯ
-            std::string lang_copy  = params.language;   // <-- КОПИЯ ДЛЯ ПОТОКОБЕЗОПАСНОСТИ
-            std::string url_copy   = params.xtts_url;   // <-- КОПИЯ ДЛЯ ПОТОКОБЕЗОПАСНОСТИ
-            safe_thread_emplace(threads, [google_search_msg, voice_copy, lang_copy, url_copy]() {
-                send_tts_async(google_search_msg, voice_copy, lang_copy, url_copy);
-            });
-
-            // (запрос к серверу, проверка resp.empty(), формирование промпта для LLaMA)
-
-// Запрос к поисковому серверу
-const std::string url = params.google_url + "google?q=" + UrlEncode(q);
-std::string resp = send_curl(url);
-    if (resp.empty()) {
-        fprintf(stdout, "[google] empty response for (%s) — check backend\n", q.c_str());
-
-        // ГОЛОСОВОЕ СООБЩЕНИЕ ОБ ОШИБКЕ (безопасно, с мьютексом)
-        std::string error_msg = "Извините, не удалось найти информацию по запросу: " + q;
-        std::string voice_copy = current_voice;  // <-- КОПИЯ
-        safe_thread_emplace(threads, [error_msg, voice_copy, params]() {
-            send_tts_async(error_msg, voice_copy, params.language, params.xtts_url);
-        });
-
-        // Не прерываем цикл — просто не будем формировать спец-промпт
-    } else {
-    fprintf(stdout, "[google] resp (%s): %s\n", q.c_str(), resp.c_str());
-    // Подрезаем ответ «по границе предложения»
-    auto truncate_smart = [](std::string s, size_t hard = 600, size_t prefer = 420) {
-        if (s.size() <= hard) return s;
-        size_t cut = s.find_last_of(".!?");
-        if (cut != std::string::npos && cut >= std::min(prefer, hard)) {
-            s.erase(cut + 1);
-        } else {
-            s.erase(std::min(hard, s.size()));
-            s += "...";
-        }
-        return s;
-    };
-    resp = truncate_smart(resp);
-
-    // Формируем реплику пользователя для LLaMA
-    std::string llm_prompt =
-        params.person + ": " + params.bot_name +
-        ", пожалуйста, кратко изложи основное из текста, найденного по запросу \"" + q + "\": " + resp;
-    text_heard = llm_prompt;
-    user_typed_this = true;
-    }
-}
-    // Чистим одноразовые буферы, НО НЕ ДЕЛАЕМ continue;
-    audio.clear();
-    user_typed.clear();
-    // user_typed_this оставляем как есть: true — если мы подменили text_heard промптом; false — если нет
-    // Конец обработчика "google" ПОГУГЛИ
-}
-    // Скажи время
-    else if (user_command == "time") {
-        // Цель: ответить только текущее время в цифровом формате, без даты
-        // 1. Получаем текущее системное время
-        std::time_t t_now = std::time(nullptr);
-        std::tm tm_local_now {};
-        #ifdef _WIN32
-            localtime_s(&tm_local_now, &t_now); // Windows версия
-        #else
-            localtime_r(&t_now, &tm_local_now); // POSIX версия
-        #endif
-        int hour = tm_local_now.tm_hour;  // 0-23
-        int minute = tm_local_now.tm_min; // 0-59
-        // Форматируем время как HH:MM
-        char time_buffer[64];
-        std::snprintf(time_buffer, sizeof(time_buffer), "Сейчас %02d:%02d", hour, minute);
-
-        // Формируем промпт для LLM
-        std::string llm_prompt = params.person + ": Который час?\n" + params.bot_name + ": " + std::string(time_buffer);
-        // Подменяем вход
-        text_heard = llm_prompt;
-        user_typed_this = true;
-        // Очищаем аудио и состояние
-        audio.clear();
-        user_typed.clear();
-        text_heard_trimmed = "";
-        // reply_part не сбрасываем
-        // Продолжаем основной цикл обработки
-    }
-
-    // CALL
-    // В функции обработки команды "call" обновляем логику выбора бота
-    else if (user_command == "call") {
-        // Проверяем, включена ли функция множества ботов
-        if (params.multi_chars) {
-            std::string q = ParseCommandAndGetKeyword(text_heard, user_command);
-            if (!q.empty()) {
-                fprintf(stdout, "Переключаюсь на бота: %s", q.c_str());
-                std::string old_bot_name = params.bot_name;  // сохраняем для отладки (опционально)
-                params.bot_name = q;                         // меняем имя бота
-
-                // ОБНОВЛЯЕМ АНТИПРОМПТЫ С НОВЫМ ИМЕНЕМ ПОЛЬЗОВАТЕЛЯ
-                update_antiprompts(params.person, params.bot_name);
-
-                if (params.verbose) {
-                    fprintf(stdout, " [antiprompts updated for bot: %s]\n", params.bot_name.c_str());
-                }
-            } else {
-                fprintf(stdout, "Error: can't find bot name in text_heard_trimmed: %s", text_heard_trimmed.c_str());
-            }
-        } else {
-            // Если multi_chars отключен, игнорируем команду call
-            // fprintf(stdout, "Команда 'call' игнорируется: режим multi_chars отключен.");
-        }
-    }
-
-        int translation_is_going = 0;
-        int n_embd_inp_before_trans = 0;
-        int tokens_in_reply = 0;
-        std::string current_voice_tmp = "";
-        reply_part = 0;
-
-// ### ЦИКЛ ГЕНЕРАЦИИ ТЕКСТА (LLaMA) ###
-    // Объяви это ПЕРЕД циклом while(true) генерации LLaMA
-    float speech_vad_start_ms = 0.0f;
-    float llama_start_generation_time = 0.0f;  // <-- ДОБАВИТЬ ИНИЦИАЛИЗАЦИЮ
-    llama_start_time = get_current_time_ms();
-
-    // ОПТИМИЗАЦИЯ: Убрана первичная токенизация. Проверяем только пустоту строки.
-    if (text_heard.empty() || force_speak) {
-            audio.clear();
-            {   // Сброс под защитой мьютекса
-                std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
-                g_hotkey_pressed = "";
-            }
-            force_speak = false; // Сбрасываем флаг ПЕРЕД continue, чтобы он не залип
-            continue;
-        }
-    trim(text_heard);
-    text_heard_prev = text_heard;
-    n_past_prev = embd_inp.size();
-    past_prev_arr.push_back(embd_inp.size());
-    std::string translation_full = "";
-    std::string bot_name_current = params.bot_name;
-    std::string bot_name_current_ru = params.bot_name;
-    std::string text_heard_with_instruct = text_heard;
-
-    if (params.translate) bot_name_current_ru = translit_en_ru(params.bot_name);
-    int n_comas = 0;
-
-    // ===== ФОРМАТИРОВАНИЕ РЕПЛИКИ ПОЛЬЗОВАТЕЛЯ ДЛЯ LLAMA =====
-    // Алгоритмический смысл: модели YandexGPT/Llama-3 требуют явных разделителей ролей в контексте.
-    // Мы формируем их ТОЛЬКО для embd_inp. В stdout эта разметка попадать не должна.
-        if (last_output_has_username && !user_typed_this) {
-        // Предыдущий ответ модели уже содержал имя пользователя — добавляем только пробел для склейки
-            text_heard.insert(0, 1, ' ');
-        text_heard_with_instruct.insert(0, 1, ' ');
-        } else {
-        // Стандартное начало реплики пользователя в контексте модели
-            text_heard.insert(0, "\n" + params.person + chat_symb + " ");
-        text_heard_with_instruct.insert(0, params.instruct_preset_data["user_message_prefix"] + "\n" + params.person + chat_symb + " ");
-        }
-
-    // ===== ФОРМАТИРОВАНИЕ ОТВЕТА БОТА =====
-    text_heard += params.bot_name + chat_symb;
-    text_heard_with_instruct += params.instruct_preset_data["user_message_suffix"] + 
-                                params.instruct_preset_data["bot_message_prefix"] + 
-                                params.bot_name + chat_symb;  // ← убрали "\n"
-
-    // ===== ВЫВОД В КОНСОЛЬ =====
-    // Подготавливаем текст реплики для вывода в консоль
-    // Физический смысл: модель получает контекст с разметкой ролей (\nДруг: ...),
-    // но пользователь в консоли должен видеть только чистый текст без дублирования имени.
-    std::string display_text;
-    if (user_typed_this) {
-        // Пользователь ввёл текст вручную — берём как есть
-        display_text = user_typed;
-    } else {
-        // Распознанный текст — берём очищенную версию
-        display_text = text_heard_trimmed;
-    }
-
-    // УНИВЕРСАЛЬНОЕ удаление префикса имени пользователя
-    // Проверяем все варианты: "Друг:", "Друг :", "Друг  :"
-    // Используем цикл для читаемости и лёгкого расширения
-    {
-        const std::string prefixes[] = {
-            params.person + chat_symb,           // "Друг:"
-            params.person + " " + chat_symb,     // "Друг :"
-            params.person + "  " + chat_symb     // "Друг  :"
-        };
-        for (const auto& prefix : prefixes) {
-            if (display_text.size() >= prefix.size() && 
-                display_text.compare(0, prefix.size(), prefix) == 0) {
-                display_text = display_text.substr(prefix.size());
-                break; // удалили один раз — выходим, чтобы не обрезать лишнее
-            }
-        }
-    }
-    trim(display_text); // финальная обрезка пробелов
-    
-    // Выводим реплику пользователя
-    printf("%s%s ", params.person.c_str(), chat_symb.c_str());
-    printf("%s\n", display_text.c_str());
-    
-    // Выводим имя бота (приглашение для его ответа)
-    printf("%s%s ", params.bot_name.c_str(), chat_symb.c_str());
-    fflush(stdout);
-
-    // НЕ ТОКЕНИЗИРУЕМ здесь — токенизация будет ниже, после split_after
-
-    int split_after = params.split_after;
-
-    // ЕДИНСТВЕННАЯ ТОКЕНИЗАЦИЯ: сразу в embd
-    embd = ::llama_tokenize(ctx_llama, text_heard_with_instruct, false);
-    input_tokens_count = embd.size();
-
-    // Append the new input tokens to the session_tokens vector
-    if (!path_session.empty()) {
-        // Используем embd (актуальные токены), а не удаленный вектор tokens
-        session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
-    }
-
-    float temp_next = params.temp;
-    int n_discard = 0;
-    int n_left = 0;
-
-    // =================================================================
-    // ЦИКЛ ГЕНЕРАЦИИ ТЕКСТА (LLaMA)
-    // =================================================================
-    // В этом цикле модель генерирует токен за токеном до тех пор,
-    // пока не встретит стоп-последовательность или не достигнет лимита
-    // =================================================================
-    bool done = false;
-    std::string text_to_speak;
-    std::string full_response_text;   // полный текст ответа для Regenerate
-    int new_tokens = 0;
-    bool first_token_after_bot = true;  // ← СБРАСЫВАЕМ ФЛАГ ПЕРЕД КАЖДОЙ НОВОЙ ГЕНЕРАЦИЕЙ
-
-    // =================================================================
-    // ОБЪЯВЛЕНИЕ СТАТИЧЕСКОГО БУФЕРА ДЛЯ УМНОГО СПЛИТА TTS
-    // =================================================================
-    // Живет между итерациями цикла while(true), сохраняя недоотправленные фрагменты
-    // ВНИМАНИЕ: используем ЕДИНЫЙ буфер tts_smart_buffer для всего цикла генерации
-    static std::string tts_smart_buffer;
-
-    // СБРОС СТАТИЧЕСКИХ ПЕРЕМЕННЫХ перед новой генерацией
-    {
-        static std::string pending_fragment;
-        static int pending_count;
-        static bool first_token_after_bot_static;
-        pending_fragment = "";
-        pending_count = 0;
-        first_token_after_bot_static = true;
-
-        // Очищаем буфер TTS перед каждым новым ответом
-        tts_smart_buffer.clear();
-    }
-
-    while (true) {
-        // =============================================================
-        // ПРОВЕРКА ПРЕРЫВАНИЯ ПО ГОРЯЧЕЙ КЛАВИШЕ
-        // =============================================================
-        // Каждую итерацию цикла проверяем, не нажал ли пользователь
-        // Ctrl+Space или Alt для прерывания генерации.
-        // Это позволяет мгновенно остановить генерацию, не дожидаясь
-        // окончания текущего токена или следующей итерации главного цикла.
-        // =============================================================
-        {
-            std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
-            if (!g_hotkey_pressed.empty() && g_hotkey_pressed != "Alt") {
-                // Нажата горячая клавиша — прерываем генерацию
-                llama_interrupted.store(1);
-                g_is_interrupted.store(true);
-                done = true;
-
-                // Очищаем текст для озвучки, чтобы не отправлять в TTS
-                text_to_speak = "";
-
-                // Сбрасываем горячую клавишу после обработки
-                g_hotkey_pressed = "";
-
-                // ТОЛЬКО ОДНО КРАТКОЕ СООБЩЕНИЕ, БЕЗ СЛОВА "Hotkey"
-                if (params.verbose) {
-                    printf(" [stopped]\n");
-                }
-                break;
-            }
-        }
-
-
-// ============================================================
-// БЛОК УПРАВЛЕНИЯ ГЕНЕРАЦИЕЙ ТОКЕНОВ
-// ============================================================
-
-// predict
-if (new_tokens > params.n_predict) break;      // превышен лимит токенов ответа
-new_tokens++;                                   // увеличиваем счётчик сгенерированных токенов
-if (embd.size() > 0) {                          // есть токены на декодирование
-    if (n_past + (int) embd.size() > n_ctx) {   // контекст переполнен → нужен сдвиг
-
-// ============================================================================
-// РОТАЦИЯ КОНТЕКСТА (CONTEXT SHIFT) — ИСПРАВЛЕННАЯ ВЕРСИЯ
-// ============================================================================
-if (n_past + (int)embd.size() > n_ctx) {
-    // ------------------------------------------------------------------------
-    // ШАГ 1: Получаем вокабуляр для работы с BOS-токеном
-    // ------------------------------------------------------------------------
-    const llama_vocab * vocab_llama = llama_model_get_vocab(model_llama);
-
-    // ------------------------------------------------------------------------
-    // ШАГ 2: Вычисляем, сколько токенов можно удалить
-    // ------------------------------------------------------------------------
-    const int n_left = std::max(0, n_past - n_keep);
-
-    // n_discard = сколько токенов удаляем (1/4 от n_left, но минимум 1)
-    int n_discard = 0;
-    if (n_left > 0) {
-        n_discard = std::max(1, n_left / 4);
-        n_discard = std::min(n_discard, n_left);
-    }
-
-    // ------------------------------------------------------------------------
-    // ШАГ 3: Флаг успешного сдвига
-    // ------------------------------------------------------------------------
-    bool context_updated = false;
-
-    // ------------------------------------------------------------------------
-    // ШАГ 4: Основная логика сдвига (если есть что удалять)
-    // ------------------------------------------------------------------------
-    if (n_discard > 0 && n_keep + n_discard <= n_past) {
-        if (n_keep >= 0 && n_keep + n_discard <= (int)embd_inp.size()) {
-
-            // 4.1 Удаляем диапазон токенов из KV-кэша модели
-            llama_memory_seq_rm(llama_get_memory(ctx_llama), 0, n_keep, n_keep + n_discard);
-
-            // 4.2 Сдвигаем оставшиеся токены влево
-            if (n_keep + n_discard < n_past) {
-                llama_memory_seq_add(llama_get_memory(ctx_llama), 0, n_keep + n_discard, n_past, -n_discard);
-            }
-
-            // 4.3 Удаляем те же токены из локального буфера embd_inp
-            embd_inp.erase(embd_inp.begin() + n_keep, embd_inp.begin() + n_keep + n_discard);
-
-            // 4.4 Если используется сессия, синхронизируем её
-            if (!path_session.empty() && !session_tokens.empty()) {
-                size_t start = std::min((size_t)n_keep, session_tokens.size());
-                size_t end = std::min((size_t)(n_keep + n_discard), session_tokens.size());
-                if (start < end) {
-                    session_tokens.erase(session_tokens.begin() + start, session_tokens.begin() + end);
-                }
-
-                // Ограничение размера сессии (защита от утечки памяти)
-                if (session_tokens.size() > (size_t)(n_ctx * 2)) {
-                    fprintf(stderr, "[warn] Session tokens overflow (%zu), trimming\n", session_tokens.size());
-                    session_tokens.resize(n_ctx);
-                }
-            }
-
-            context_updated = true;
-
-            // Короткое сообщение в консоль
-            printf("\n[Сдвиг: удал. %d ток, ост: %zu]\n", n_discard, embd_inp.size());
-        }
-    }
-
-    // ------------------------------------------------------------------------
-    // ШАГ 5: Fallback
-    // ------------------------------------------------------------------------
-    if (!context_updated) {
-        size_t new_size = std::min((size_t)std::max(0, n_keep), embd_inp.size());
-        if (new_size < embd_inp.size()) {
-            embd_inp.resize(new_size);
-
-            if (!path_session.empty() && !session_tokens.empty()) {
-                session_tokens.resize(std::min((size_t)std::max(0, n_keep), session_tokens.size()));
-            }
-
-            printf("\n[Сдвиг: сброс до %zu ток.]\n", embd_inp.size());
-        }
-    }
-
-    // ------------------------------------------------------------------------
-    // ШАГ 6: Обновляем счётчики
-    // ------------------------------------------------------------------------
-    n_past = (int)embd_inp.size();
-    n_session_consumed = n_past;
-
-    // ------------------------------------------------------------------------
-    // ШАГ 7: Проверяем и восстанавливаем BOS-токен
-    // ------------------------------------------------------------------------
-    if (vocab_llama) {
-        const llama_token bos_token = llama_token_bos(vocab_llama);
-        if (!embd_inp.empty() && embd_inp[0] != bos_token) {
-            embd_inp.insert(embd_inp.begin(), bos_token);
-
-            if (!session_tokens.empty()) {
-                session_tokens.insert(session_tokens.begin(), bos_token);
-            }
-
-            n_past = (int)embd_inp.size();
-            n_session_consumed = n_past;
-            printf("[BOS]");
-        }
-    } else {
-        fprintf(stderr, "WARNING: vocab_llama is null, cannot check BOS token\n");
-    }
-
-    // ------------------------------------------------------------------------
-    // ШАГ 8: Отключаем сессию после сдвига
-    // ------------------------------------------------------------------------
-    path_session = "";
-
-    // ========== 🔧 ==========
-    // После сдвига контекста ОЧИЩАЕМ embd, потому что токены в нём имеют старые pos
-    // Это безопасно: при следующей итерации цикла embd пуст, модель запросит новый токен
-    // ========================
-
-    embd.clear();
-    text_to_speak = "";  // Также очищаем буфер озвучки, чтобы не отправить мусор
-    past_prev_arr.clear();
-    continue;  // Переходим к следующей итерации, минуя декодирование старых токенов
-}
-
-}
-    // Попытка повторного использования совпадающего префикса из загруженной сессии
-    if (n_session_consumed < (int) session_tokens.size()) {
-        size_t i = 0;
-        // Добавляем безопасные границы
-        int max_check = std::min((int)embd.size(), (int)session_tokens.size() - n_session_consumed);
-
-        for ( ; i < (size_t)max_check; i++) {
-            // Дополнительная проверка индекса
-            if (n_session_consumed >= (int)session_tokens.size()) {
-                break;
-            }
-
-            if (embd[i] != session_tokens[n_session_consumed]) {
-                session_tokens.resize(n_session_consumed);
-                break;
-            }
-
-            //Вместо n_past++ — добавляем токен в embd_inp, чтобы сохранить инвариант
-            embd_inp.push_back(embd[i]);
-            n_session_consumed++;
-
-            if (n_session_consumed >= (int) session_tokens.size()) {
-                i++;
-                break;
-            }
-        }
-        if (i > 0) {
-            embd.erase(embd.begin(), embd.begin() + i);
-        }
-        //Обновляем n_past один раз — после всех изменений embd_inp
-        n_past = embd_inp.size();
-    }
-
-    // Если есть новые токены и используется сессия, добавляем их в сессию
-    if (embd.size() > 0 && !path_session.empty()) {
-        session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
-        n_session_consumed = session_tokens.size();  // Обновляем счётчик потреблённых токенов
-    }
-        // безопасная подготовка batch с обнулением logits
-    {
-        if (embd.empty()) {
-            embd.clear();
-            continue;
-        }
-        if (embd.size() > 2048) {
-            fprintf(stderr, "ERROR: Input sequence too long (%zu tokens). Max batch size is 2048.\n", embd.size());
-            embd.clear();
-            continue;
-        }
-
-        batch.n_tokens = static_cast<int>(embd.size());
-
-        // Обнуляем logits только для реально используемых токенов
-        // memset безопасен, так как работает с байтами и не выходит за границы
-        memset(batch.logits, 0, sizeof(batch.logits[0]) * batch.n_tokens);
-
-        for (int i = 0; i < batch.n_tokens; ++i) {
-            batch.token[i] = embd[i];
-            batch.pos[i] = n_past + i;
-            batch.n_seq_id[i] = 1;
-            batch.seq_id[i][0] = 0;
-            batch.logits[i] = (i == batch.n_tokens - 1);
-        }
-    }
-
-// Выполняем декодирование (потокобезопасно с защитой от reset)
-{
-    std::lock_guard<std::mutex> lock(g_llama_mutex);
-
-    // Проверяем, что контекст не был сброшен во время генерации
-    if (!ctx_llama) {
-        fprintf(stderr, "\n[Context was reset during generation - aborting]\n");
-        done = true;
-        break;
-    }
-
-    if (llama_decode(ctx_llama, batch)) {
-        fprintf(stderr, "%s : failed to decode\n", __func__);
-        fprintf(stderr, "\n LLaMA decoding failed. Press ENTER to continue...\n");
-        fflush(stderr);
-        std::string dummy;
-        std::getline(std::cin, dummy);
-        embd.clear();
-        n_past = embd_inp.size();
-        n_session_consumed = n_past;
-        continue;
-    }
-}
-}  // Закрываем блок декодирования
-
-// Добавляем обработанные токены в общий контекст
-embd_inp.insert(embd_inp.end(), embd.begin(), embd.end());
-n_past = embd_inp.size();  // Обновляем позицию в контексте
-embd.clear();  // Очищаем временный буфер
-if (done) break;  // Если завершено, выходим из цикла
-// Инициализируем переменные для обработки следующего токена
-std::string out_token_str = "";
-char out_token_symbol;
-// Запоминаем время начала генерации (если ещё не установлено)
-    if (llama_start_generation_time == 0.0f) llama_start_generation_time = get_current_time_ms();
-    {
-        // Обработка вне пользовательского ввода, сэмплирование следующего токена
-        // Если используется сессия и нужно сохранить её
-        if (!path_session.empty() && need_to_save_session) {
-            need_to_save_session = false;
-            // Сохраняем состояние модели в файл сессии
-            llama_state_save_file(ctx_llama, path_session.c_str(), session_tokens.data(), session_tokens.size());
-        }
-        llama_token id = 0;  // ID сгенерированного токена
-        int person_name_is_found = 0; // Флаг обнаружения имени пользователя
-        int bot_name_is_found = 0;    // Флаг обнаружения имени бота
-        // Сэмплирование токена с возможным изменением температуры
-        if (temp != temp_next) // Повышенная температура только для 1 токена
-            {
-                id = llama_sampler_sample(smpl_high_temp, ctx_llama, -1);  // Сэмплируем с высокой температурой
-                temp = temp_next = params.temp; // Возвращаем нормальную температуру
-            }
-        else // Нормальная температура
-            {
-                // std::lock_guard<std::mutex> lock(g_llama_mutex);
-                id = llama_sampler_sample(smpl, ctx_llama, -1);  // Сэмплируем с нормальной температурой
-            }
-
-        // ============================================================
-        // ПРОВЕРКА: является ли токен специальным стоп-токеном
-        // (включая EOS, bot_message_suffix и другие из JSON-пресета)
-        // ============================================================
-        bool is_stop_token = false;
-        for (int i = 0; i < special_token_count; i++) {
-            if (id == special_token_ids[i]) {
-                is_stop_token = true;
-                break;
-            }
-        }
-        // Дополнительно проверяем стандартный EOS (на всякий случай)
-        if (id == llama_vocab_eos(vocab_llama)) {
-            is_stop_token = true;
-        }
-
-        if (is_stop_token) {
-            // Немедленно останавливаем генерацию, не добавляя токен в контекст
-            done = true;
-            break;
-        }
-        // ============================================================
-
-        // Если токен не является токеном окончания (EOS) – эта проверка теперь избыточна,
-        // но оставляем для совместимости (EOS уже отловлен выше).
-        if (id != llama_vocab_eos(vocab_llama)) {
-
-            // Добавляем токен в контекст для следующей итерации
-            embd.push_back(id);
-
-        out_token_str = llama_token_to_piece(ctx_llama, id);
-
-        // ============================================================
-        // ФИЗИЧЕСКИЙ СМЫСЛ: Замена плейсхолдеров {0}/{1} и фильтрация мусора
-        // Модели могут генерировать плейсхолдеры из весов ИЛИ разбивать их на субтокены.
-        // Обрабатываем оба случая: полную строку и частичные совпадения.
-        // ============================================================
-
-        // 1. Полная замена для обычных токенов
-        size_t pos0 = out_token_str.find("{0}");
-        if (pos0 != std::string::npos) {
-            out_token_str.replace(pos0, 3, params.person);
-        }
-        size_t pos1 = out_token_str.find("{1}");
-        if (pos1 != std::string::npos) {
-            out_token_str.replace(pos1, 3, params.bot_name);
-        }
-        size_t pos2 = out_token_str.find("{2}");
-        if (pos2 != std::string::npos) {
-            out_token_str.replace(pos2, 3, time_str);
-        }
-        size_t pos3 = out_token_str.find("{3}");
-        if (pos3 != std::string::npos) {
-            out_token_str.replace(pos3, 3, year_str);
-        }
-        size_t pos5 = out_token_str.find("{5}");
-        if (pos5 != std::string::npos) {
-            out_token_str.replace(pos5, 3, ymd);
-        }
-
-        // 2. Обработка разбитых токенов (субтокены типа "{0", "}", "{1")
-        if (out_token_str == "{0" || out_token_str == "{0}") {
-            out_token_str = params.person;
-        } else if (out_token_str == "{1" || out_token_str == "{1}") {
-            out_token_str = params.bot_name;
-        } else if (out_token_str == "{2" || out_token_str == "{2}") {
-            out_token_str = time_str;
-        } else if (out_token_str == "{3" || out_token_str == "{3}") {
-            out_token_str = year_str;
-        } else if (out_token_str == "{5" || out_token_str == "{5}") {
-            out_token_str = ymd;
-        } else if (out_token_str == "}" && !text_to_speak.empty()) {
-            if (text_to_speak.size() >= 2) {
-                std::string last2 = text_to_speak.substr(text_to_speak.size() - 2);
-                if (last2 == "{0" || last2 == "{1" || last2 == "{2" || last2 == "{3" || last2 == "{5") {
-                    text_to_speak.pop_back();
-                    out_token_str = "";
-                }
-            }
-        }
-
-        // ============================================================
-        // 3. УМНАЯ ФИЛЬТРАЦИЯ СПЕЦТОКЕНОВ (полностью переработанная)
-        // ============================================================
-        // Проблема: BPE-токенизатор разбивает спецтокены типа <|start_header_id|>
-        // на множество мелких токенов: "<", "|", "start", "_", "header", ...
-        // Старая логика накапливала их в pending_fragment, но при превышении
-        // MAX_PENDING (8 токенов) вываливала в консоль как обычный текст.
-        //
-        // Новое решение:
-        // 1. Проверяем ID токена по списку special_token_ids (стоп-токены).
-        // 2. Токены с '<' или '|' накапливаем в буфер.
-        // 3. Как только в буфере образовался полный паттерн <|...|> —
-        //    молча хороним ВЕСЬ буфер (это был спецтокен).
-        // 4. Если накопилось > MAX_PENDING и нет полного паттерна —
-        //    это обычный текст с угловыми скобками, выводим как есть.
-        // 5. Обычные токены выводим сразу, предварительно вытолкнув буфер.
-        // ============================================================
-
-        // Шаг 3a: Проверяем ID токена по заранее собранному списку стоп-токенов
-        bool is_special_id = false;
-        for (int si = 0; si < special_token_count; si++) {
-            if (id == special_token_ids[si]) {
-                is_special_id = true;
-                break;
-            }
-        }
-
-        // Шаг 3b: Дополнительно проверяем EOS через токен конца словаря
-        if (!is_special_id) {
-            llama_token eos_token = llama_vocab_eos(vocab_llama);
-            if (id == eos_token) {
-                is_special_id = true;
-            }
-        }
-
-        // Шаг 3c: Буфер для накопления подозрительных фрагментов
-        static std::string pending_fragment = "";
-        static int pending_count = 0;
-        static const int MAX_PENDING = 20;  // Увеличено, т.к. спецтокены могут быть длинными
-
-        // Шаг 3d: Определяем, похож ли токен на фрагмент спецтокена
-        bool looks_like_special = false;
-        if (!out_token_str.empty()) {
-            for (size_t ci = 0; ci < out_token_str.size(); ci++) {
-                if (out_token_str[ci] == '<' || out_token_str[ci] == '|') {
-                    looks_like_special = true;
-                    break;
-                }
-            }
-        }
-
-        bool should_print = true;
-
-        if (is_special_id) {
-            // Токен гарантированно стоп-токен — подавляем и очищаем буфер
-            should_print = false;
-            pending_fragment = "";
-            pending_count = 0;
-        } else if (looks_like_special && !out_token_str.empty()) {
-            // Токен похож на фрагмент спецтокена — накапливаем
-            pending_fragment += out_token_str;
-            pending_count++;
-
-            // ===== КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: проверяем, не собрался ли целый спецтокен =====
-            // Если в буфере уже есть и открывающий "<|", и закрывающий "|>",
-            // значит мы накопили полный спецтокен — выбрасываем его молча.
-            bool has_open = (pending_fragment.find("<|") != std::string::npos);
-            bool has_close = (pending_fragment.find("|>") != std::string::npos);
-
-            if (has_open && has_close) {
-                // Это полный спецтокен — тихо хороним
-                pending_fragment = "";
-                pending_count = 0;
-                should_print = false;
-            }
-            // ===== КОНЕЦ КЛЮЧЕВОГО ИСПРАВЛЕНИЯ =====
-            else if (pending_count >= MAX_PENDING) {
-                // Слишком много фрагментов, а полного спецтокена нет —
-                // это обычный текст с угловыми скобками, выводим
-                printf("%s", pending_fragment.c_str());
-                fflush(stdout);
-                text_to_speak += pending_fragment;
-                tokens_in_reply += utf8_length(pending_fragment);
-                pending_fragment = "";
-                pending_count = 0;
-                should_print = true;  // чтобы текущий токен тоже вывелся ниже
-            } else {
-                should_print = false;
-            }
-        } else {
-            // Обычный токен — сначала выталкиваем накопленный буфер, если есть
-            if (!pending_fragment.empty()) {
-                printf("%s", pending_fragment.c_str());
-                fflush(stdout);
-                text_to_speak += pending_fragment;
-                tokens_in_reply += utf8_length(pending_fragment);
-                pending_fragment = "";
-                pending_count = 0;
-            }
-        }
-
-        // Убираем лишний пробел в начале первого токена после имени бота
-        {
-            static bool first_token_after_bot_static = true;
-            if (first_token_after_bot_static && !out_token_str.empty() && out_token_str[0] == ' ') {
-                out_token_str.erase(0, 1);  // убираем первый пробел
-            }
-            first_token_after_bot_static = false;
-        }
-
-        // Выводим только очищенный и безопасный токен
-        if (should_print && !out_token_str.empty()) {
-            // Очистка спецтокенов для вывода на экран
-            // Используем регулярку для удаления ЛЮБЫХ паттернов <|...|>
-            std::string display_str = out_token_str;
-            try {
-                // Удаляем всё, что похоже на <|что-угодно|>
-                display_str = std::regex_replace(display_str, std::regex(R"(<\|[^>]*\|>)"), "");
-                // Удаляем одиночные роли (могут остаться после очистки тегов)
-                display_str = std::regex_replace(display_str, std::regex(R"(\b(assistant|system|user|end_header_id|eot_id|start_header_id|eo)\b)"), "");
-            } catch (const std::regex_error&) {
-                // Fallback: ручная очистка, если регулярка не сработала
-                display_str = ::replace(display_str, "<|start_header_id|>", "");
-                display_str = ::replace(display_str, "<|end_header_id|>", "");
-                display_str = ::replace(display_str, "<|eot_id|>", "");
-                display_str = ::replace(display_str, "<|im_start|>", "");
-                display_str = ::replace(display_str, "<|im_end|>", "");
-                display_str = ::replace(display_str, "<|eo|>", "");
-                display_str = ::replace(display_str, "assistant", "");
-                display_str = ::replace(display_str, "system", "");
-                display_str = ::replace(display_str, "user", "");
-            }
-
-            if (!display_str.empty()) {
-                printf("%s", display_str.c_str());
-                fflush(stdout);
-            }
-            // В TTS идёт исходная строка — она очистится в send_tts_async()
-            text_to_speak += out_token_str;
-        }
-
-        if (should_print) {
-            tokens_in_reply += utf8_length(out_token_str);
-        }
-        // ============================================================
-
-            // Проверка на зацикливание последовательности
-            if (params.seqrep)  // Если включена проверка на повторения
-            {
-                // Обновляем "игольчатый" буфер (для поиска повторений)
-                if (utf8_length(last_output_needle) > 25)
-                    last_output_needle = utf8_substr(last_output_needle, 5, utf8_length(last_output_needle)-5);
-                last_output_needle += out_token_str;  // Добавляем текущий токен
-
-                out_token_symbol = out_token_str[out_token_str.size()-1];  // Последний символ токена
-
-                // Если символ является знаком препинания (конец слова/предложения)
-                if (out_token_symbol == ' ' || out_token_symbol == '.' || out_token_symbol == ',' ||
-                    out_token_symbol == '!' || out_token_symbol == '?')
+                // Добавляем обработанные токены в общий контекст
+                embd_inp.insert(embd_inp.end(), embd.begin(), embd.end());
+                n_past = static_cast<int>(embd_inp.size());  // Обновляем позицию в контексте
+                embd.clear();  // Очищаем временный буфер
+                if (done) break;  // Если завершено, выходим из цикла
+
+                // Инициализируем переменные для обработки следующего токена
+                std::string out_token_str = "";
+                char out_token_symbol;
+                // Запоминаем время начала генерации (если ещё не установлено)
+                if (llama_start_generation_time == 0.0f) llama_start_generation_time = get_current_time_ms();
                 {
-                    // Проверяем, есть ли эта последовательность в буфере
-                    if (utf8_length(last_output_buffer) > 300 && utf8_length(last_output_needle) >= 20 &&
-                        last_output_buffer.find(last_output_needle) != std::string::npos)
+                    // Обработка вне пользовательского ввода, сэмплирование следующего токена
+                    // Если используется сессия и нужно сохранить её
+                    if (!path_session.empty() && need_to_save_session) {
+                        need_to_save_session = false;
+                        // Сохраняем состояние модели в файл сессии
+                        llama_state_save_file(ctx_llama, path_session.c_str(), session_tokens.data(), session_tokens.size());
+                    }
+                    llama_token id = 0;  // ID сгенерированного токена
+                    int person_name_is_found = 0; // Флаг обнаружения имени пользователя
+                    int bot_name_is_found = 0;    // Флаг обнаружения имени бота
+                    // Сэмплирование токена с возможным изменением температуры
+                    if (temp != temp_next) // Повышенная температура только для 1 токена
                     {
-                        // Обнаружено зацикливание - выводим сообщение
-                        printf(" [LOOP: %s] (length: %d)\n", last_output_needle.c_str(), utf8_length(last_output_needle));
-                        // Рассчитываем количество символов и токенов для удаления
-                        int symbols_to_delete = static_cast<int>(utf8_length(last_output_needle) * 1); // Удаляем всю последовательность
-                        const std::vector<llama_token> tokens_to_del = llama_tokenize(ctx_llama, last_output_needle.c_str(), false);
-                        int rollback_num = tokens_to_del.size();  // Количество токенов для отката
-                        if (rollback_num) // Если есть токены для удаления
-                        {
-                            // Удаляем токены из контекста
-                            embd_inp.erase(embd_inp.end() - rollback_num, embd_inp.end());
-                            n_past = embd_inp.size();  // Обновляем позицию
-                            n_session_consumed = n_past;  // Обновляем сессию
+                        id = llama_sampler_sample(smpl_high_temp, ctx_llama, -1);  // Сэмплируем с высокой температурой
+                        temp = temp_next = params.temp; // Возвращаем нормальную температуру
+                    }
+                    else // Нормальная температура
+                    {
+                        id = llama_sampler_sample(smpl, ctx_llama, -1);  // Сэмплируем с нормальной температурой
+                    }
 
-                            // Очищаем KV-кэш модели (через новый memory API)
-                            llama_memory_seq_rm(llama_get_memory(ctx_llama), 0, embd_inp.size(), -1);
-
-                            // Удаляем текст из буферов
-                            text_to_speak = utf8_substr(text_to_speak, 0, utf8_length(text_to_speak)-symbols_to_delete);
-                            last_output_needle = utf8_substr(last_output_needle, 0, utf8_length(last_output_needle)-symbols_to_delete);
-                            last_output_buffer = utf8_substr(last_output_buffer, 0, utf8_length(last_output_buffer)-symbols_to_delete);
-
-                            temp_next = 1.8; // Повышаем температуру для следующего токена (чтобы выйти из цикла)
+                    // ============================================================
+                    // ПРОВЕРКА: является ли токен специальным стоп-токеном
+                    // (включая EOS, bot_message_suffix и другие из JSON-пресета)
+                    // ============================================================
+                    bool is_stop_token = false;
+                    for (int i = 0; i < special_token_count; i++) {
+                        if (id == special_token_ids[i]) {
+                            is_stop_token = true;
+                            break;
                         }
                     }
-        }
-                // Обновляем буфер для проверки повторений
-                if (utf8_length(last_output_buffer) > 1000)
-                    last_output_buffer = utf8_substr(last_output_buffer, 100, last_output_buffer.size()-100);
-                last_output_buffer += out_token_str;  // Добавляем текущий токен в буфер
-            }
-            // Проверка на появление имён персонажей
-            // Если обнаружено имя пользователя
-            if (text_to_speak == '\n'+params.person+':')
-            {
-                person_name_is_found = 1; // Установить флаг
-                translation_is_going = 0; // Остановить перевод
+                    // Дополнительно проверяем стандартный EOS (на всякий случай)
+                    if (id == llama_vocab_eos(vocab_llama)) {
+                        is_stop_token = true;
+                    }
 
-            }
-            // Если обнаружено имя бота (формат: \nИмя:)
-            else if (text_to_speak[0] == '\n' && text_to_speak[text_to_speak.size()-1] == ':' && text_to_speak.size() < 10)
-            {
-                bot_name_is_found = 1;         // Установить флаг
-                bot_name_current = text_to_speak.substr(1, text_to_speak.size()-2);  // Извлечь имя
-                if (params.translate)
-                bot_name_current_ru = translit_en_ru(bot_name_current);  // Транслитерировать на русский
-                translation_full = "";         // Очистить буфер перевода
-                text_to_speak = "";            // Очистить текст для озвучки
-            }
-            // Обнуляем текст для TTS, если было обнаружено имя бота — в любом виде
-            if (bot_name_is_found) {
-                text_to_speak = "";
-            }
-            // Обработка знаков препинания и разбиение текста
-            int text_len = text_to_speak.size();
-
-            if (text_len > 0 && text_to_speak[text_len-1] == ',') n_comas++;
-            // Пропускаем разбиение на апострофе, не ломая счётчик split_after
-            if (text_len > 0 && new_tokens == split_after && params.split_after && text_to_speak[text_len-1] == '\'')
-            {
-                // Ничего не делаем — просто не отправляем в TTS на этом токене
-            }
-            // Не разбиваем по Mr.
-            if (text_to_speak.size() >= 3 && text_to_speak.substr(text_to_speak.size()-3, 3) == "Mr.")
-                text_to_speak[text_len-1] = ' ';
-
-
-                // Проверяем прерывание КАЖДЫЕ 2 ТОКЕНА после первых 50 токенов (исходная логика)
-                if (new_tokens % 2 == 0 && new_tokens > 50)
-                {
-                    // Берём короткое аудио для проверки
-                    audio.get(500, pcmf32_cur);
-                    
-                    // Проверяем уровень энергии (VAD - Voice Activity Detection)
-                    int vad_result = ::vad_simple_int(pcmf32_cur, WHISPER_SAMPLE_RATE, 
-                                                    500,
-                                                    params.vad_thold, params.freq_thold, 
-                                                    params.print_energy, params.vad_start_thold);
-
-                    /// Если обнаружена речь
-                    if ((!params.push_to_talk && vad_result == 1))
-                    {
-                        // ===== КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: вызываем stop_tts_immediately() =====
-                        // Это остановит текущий TTS через HTTP + файл
-                        stop_tts_immediately();
-                        
-                        // Флаги прерывания
-                        llama_interrupted.store(1);
-                        g_is_interrupted.store(true);
-                        
-                        text_to_speak = "";
-                        
+                    if (is_stop_token) {
+                        // Немедленно останавливаем генерацию, не добавляя токен в контекст
                         done = true;
-                        
-                        if (params.verbose) {
-                            printf(" [interrupted]\n");
-                        }
                         break;
                     }
-                }
-                
-                // Отдельная проверка горячей клавиши (быстрая)
-                {
-                    std::string hk_local;
-                    {
-                        std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
-                        hk_local = g_hotkey_pressed;
-                    }
-                    if (hk_local == "Ctrl+Space" || hk_local == "Alt") {
-                        llama_interrupted.store(1);
-                        g_is_interrupted.store(true);
-                        text_to_speak = "";
-                        SDL_PauseAudio(1);
-                        SDL_ClearQueuedAudio(2);
-                        SDL_PauseAudio(0);
-                        done = true;
-                        {
-                            std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
-                            g_hotkey_pressed = "";
+                    // ============================================================
+
+                    // Если токен не является токеном окончания (EOS) – эта проверка теперь избыточна,
+                    // но оставляем для совместимости (EOS уже отловлен выше).
+                    if (id != llama_vocab_eos(vocab_llama)) {
+
+                        // Добавляем токен в контекст для следующей итерации
+                        embd.push_back(id);
+
+                        out_token_str = llama_token_to_piece(ctx_llama, id);
+
+                        // ============================================================
+                        // ФИЗИЧЕСКИЙ СМЫСЛ: Замена плейсхолдеров {0}/{1} и фильтрация мусора
+                        // Модели могут генерировать плейсхолдеры из весов ИЛИ разбивать их на субтокены.
+                        // Обрабатываем оба случая: полную строку и частичные совпадения.
+                        // ============================================================
+
+                        // 1. Полная замена для обычных токенов
+                        size_t pos0 = out_token_str.find("{0}");
+                        if (pos0 != std::string::npos) {
+                            out_token_str.replace(pos0, 3, params.person);
                         }
-                        if (params.verbose) {
-                            printf(" [keyboard stop]\n");
+                        size_t pos1 = out_token_str.find("{1}");
+                        if (pos1 != std::string::npos) {
+                            out_token_str.replace(pos1, 3, params.bot_name);
                         }
-                        break;
-                    }
-                }
-    // Очистка микрофона после генерации 20 токенов
-    // Это помогает избежать накопления шума в буфере микрофона
-        if (new_tokens == 20 && !llama_interrupted)
-        {
-            audio.clear();  // Очищаем буфер аудио
-        }
-
-
-        // =================================================================
-        // УМНОЕ РАЗБИЕНИЕ ТЕКСТА ДЛЯ TTS: ПО ПРЕДЛОЖЕНИЯМ, НЕ ПО ТОКЕНАМ
-        // =================================================================
-        // Используем ЕДИНЫЙ статический буфер, объявленный в начале цикла
-        // (tts_smart_buffer уже объявлен как static выше, не объявляем повторно)
-        
-        // Добавляем текущий токен в буфер (НЕ отправляем сразу)
-        tts_smart_buffer += text_to_speak;
-        text_to_speak.clear();
-        
-        bool should_send = false;
-        size_t buf_len = tts_smart_buffer.size();
-        
-        // ========== ПРОВЕРКА 1: Естественные концы предложений ==========
-        // В диалоговой речи важны все знаки препинания, включая двоеточие
-        if (buf_len >= 1) {
-            char last_char = tts_smart_buffer[buf_len - 1];
-            if (last_char == '.' || last_char == '!' || last_char == '?' || 
-                last_char == ':' || last_char == '\n') {
-                should_send = true;
-            }
-        }
-        
-        // Проверка: знак препинания + пробел
-        if (!should_send && buf_len >= 2) {
-            char c1 = tts_smart_buffer[buf_len - 2];
-            char c2 = tts_smart_buffer[buf_len - 1];
-            if ((c1 == '.' || c1 == '!' || c1 == '?') && std::isspace(static_cast<unsigned char>(c2))) {
-                should_send = true;
-            }
-        }
-        
-        // Проверка: знак препинания + кавычка/скобка + пробел
-        if (!should_send && buf_len >= 3) {
-            char c1 = tts_smart_buffer[buf_len - 3];
-            char c2 = tts_smart_buffer[buf_len - 2];
-            char c3 = tts_smart_buffer[buf_len - 1];
-            if ((c1 == '.' || c1 == '!' || c1 == '?') && 
-                (c2 == '"' || c2 == '\'' || c2 == ')' || c2 == ']' || c2 == '»') && 
-                std::isspace(static_cast<unsigned char>(c3))) {
-                should_send = true;
-            }
-        }
-        
-        // ========== ПРОВЕРКА 2: Защита от слишком длинного буфера ==========
-        // Увеличен лимит до 500 символов, чтобы дать модели закончить мысль
-        if (!should_send && buf_len > 500) {
-            // Ищем ТОЛЬКО настоящие концы предложений, а не любые разделители
-            size_t cut_pos = tts_smart_buffer.find_last_of(".!?", buf_len - 100);
-            if (cut_pos != std::string::npos && cut_pos > 150) {
-                should_send = true;
-
-                // Отправляем часть, остальное оставляем
-                std::string to_send_part = tts_smart_buffer.substr(0, cut_pos + 1);
-                tts_smart_buffer = tts_smart_buffer.substr(cut_pos + 1);
-                
-                // Очистка и отправка
-                to_send_part = ::replace(to_send_part, params.bot_name + ":", "");
-                to_send_part = ::replace(to_send_part, params.bot_name + " :", "");
-                to_send_part = ::replace(to_send_part, "<|eot_id|>", "");
-                to_send_part = ::replace(to_send_part, "<|start_header_id|>", "");
-                to_send_part = ::replace(to_send_part, "<|end_header_id|>", "");
-                to_send_part = ::replace(to_send_part, "<|im_end|>", "");
-                to_send_part = ::replace(to_send_part, "<|im_start|>", "");
-                trim(to_send_part);
-                
-                if (!to_send_part.empty() && !person_name_is_found) {
-                    // Сохраняем для Regenerate
-                    full_response_text += to_send_part;
-                    
-                    // Отправляем в TTS (если нет перевода)
-                    if (!params.translate || translation_is_going != 0) {
-                        std::string voice_copy = current_voice;
-                        safe_thread_emplace(threads, [to_send_part, voice_copy, params]() {
-                            send_tts_async(to_send_part, voice_copy, params.language, params.xtts_url);
-                        });
-                        if (params.sleep_before_xtts) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(params.sleep_before_xtts));
+                        size_t pos2 = out_token_str.find("{2}");
+                        if (pos2 != std::string::npos) {
+                            out_token_str.replace(pos2, 3, time_str);
                         }
-                    }
-                }
-                continue; // Возвращаемся в начало цикла генерации
-            }
-        }
-        
-        // ========== ЕСЛИ НУЖНО ОТПРАВИТЬ - ОТПРАВЛЯЕМ ==========
-        if (should_send && !tts_smart_buffer.empty()) {
-            std::string to_send = tts_smart_buffer;
-            tts_smart_buffer.clear();
-            
-            // Удаляем имя бота
-            to_send = ::replace(to_send, params.bot_name + ":", "");
-            to_send = ::replace(to_send, params.bot_name + " :", "");
-            trim(to_send);
-            
-            // Удаляем имя пользователя, если оно в конце
-            if (!antiprompts.empty() && !antiprompts[0].empty()) {
-                std::string user_marker = antiprompts[0];
-                if (to_send.size() >= user_marker.size()) {
-                    std::string end_part = to_send.substr(to_send.size() - user_marker.size());
-                    if (end_part == user_marker) {
-                        to_send = to_send.substr(0, to_send.size() - user_marker.size());
-                        trim(to_send);
-                    }
-                }
-            }
-            
-            // Очистка от спецтокенов
-            to_send = ::replace(to_send, "<|eot_id|>", "");
-            to_send = ::replace(to_send, "<|start_header_id|>", "");
-            to_send = ::replace(to_send, "<|end_header_id|>", "");
-            to_send = ::replace(to_send, "<|im_end|>", "");
-            to_send = ::replace(to_send, "<|im_start|>", "");
-            to_send = ::replace(to_send, "</s>", "");
-            to_send = ::replace(to_send, "<|endoftext|>", "");
-            to_send = ::replace(to_send, "<|", "");
-            to_send = ::replace(to_send, "|>", "");
-            trim(to_send);
-            
-            if (!to_send.empty() && !person_name_is_found) {
-                // ===== ОБРАБОТКА ПЕРЕВОДА =====
-                if (params.translate && translation_is_going == 0) {
-                    // Начинаем перевод
-                    n_embd_inp_before_trans = embd_inp.size();
-                    std::string trans_prompt = "\nПеревод последнего предложения на русский.\n" + bot_name_current_ru + ":" + translation_full + to_send;
-                    std::vector<llama_token> trans_prompt_emb = ::llama_tokenize(ctx_llama, trans_prompt, false);
-                    embd.insert(embd.end(), trans_prompt_emb.begin(), trans_prompt_emb.end());
-                    translation_is_going = 1;
-                    translation_full = to_send; // Сохраняем для перевода
-                    text_to_speak = "";
-                    continue;
-                }
-                
-                // Сохраняем для команды Regenerate
-                full_response_text += to_send;
-                
-                // Отправляем в TTS
-                std::string voice_copy = current_voice;
-                safe_thread_emplace(threads, [to_send, voice_copy, params]() {
-                    send_tts_async(to_send, voice_copy, params.language, params.xtts_url);
-                });
-                
-                if (params.sleep_before_xtts) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(params.sleep_before_xtts));
-                }
-            }
-        }
-        
-        // ========== ОТКАТ ПЕРЕВОДА ПОСЛЕ ЗАВЕРШЕНИЯ ==========
-        if (params.translate && translation_is_going == 1) {
-            translation_is_going = 0;
-            if (n_embd_inp_before_trans && embd_inp.size()) {
-                int rollback_num = embd_inp.size() - n_embd_inp_before_trans;
-                if (rollback_num) {
-                    embd_inp.erase(embd_inp.end() - rollback_num, embd_inp.end());
-                    n_past = embd_inp.size();
-                    n_session_consumed = n_past;
-                    llama_memory_seq_rm(llama_get_memory(ctx_llama), 0, embd_inp.size(), -1);
-                    printf("\n");
-                }
-            }
-
-        }
-    }
-}
-
-        // Обработка последнего вывода и антипромптов
-        {
-            // Возвращаемся к старой, проверенной логике: собираем последние токены из embd_inp
-            // Это более стабильно для определения антипромптов, включая EOT-маркеры
-            std::string last_output;
-
-            // Собираем последние 50 символов из контекста (не токенов, а символов!)
-            // Это даёт достаточно контекста для определения конца предложения
-            int total_chars = 0;
-            int start_index = (int)embd_inp.size() - 1;
-
-            for (int i = start_index; i >= 0 && total_chars < 100; i--) {
-                std::string piece = llama_token_to_piece(ctx_llama, embd_inp[i]);
-                total_chars += utf8_length(piece);
-                last_output = piece + last_output;
-            }
-
-            // Также добавляем текущий текст, который ещё не в embd_inp
-            if (!text_to_speak.empty()) {
-                last_output += text_to_speak;
-            }
-
-
-            int i_antiprompt = 0;
-            last_output_has_username = false;  // Флаг наличия имени пользователя
-            bool antiprompt_matched = false;  // Флаг, был ли найден антипромпт
-
-            // Проходим по всем антипромптам
-            for (std::string & antiprompt : antiprompts)
-            {
-                // ============================================================
-                // ОБРАБОТКА НЕСКОЛЬКИХ ИМЁН ПЕРСОНАЖЕЙ ДЛЯ XTTS (multi_chars)
-                // ============================================================
-                if (params.multi_chars && last_output.size()>=4)
-                {
-                    // Очищаем текст от различных знаков препинания
-                    last_output = ::replace(last_output, " ???", "");
-                    last_output = ::replace(last_output, " ??", "");
-                    last_output = ::replace(last_output, " ?", "");
-                    last_output = ::replace(last_output, " !!!", "");
-                    last_output = ::replace(last_output, " !!", "");
-                    last_output = ::replace(last_output, " !", "");
-                    last_output = ::replace(last_output, "!!!", "");
-                    last_output = ::replace(last_output, "!!", "");
-                    last_output = ::replace(last_output, " ...", "");
-                    last_output = ::replace(last_output, " .", "");
-                    last_output = ::replace(last_output, " ,", "");
-                    last_output = ::replace(last_output, "...", "");
-                    last_output = ::replace(last_output, "(", "");
-                    last_output = ::replace(last_output, ")", "");
-
-                    // Поиск нового персонажа
-                    std::smatch matches;
-                    std::regex r("\n([^:]*):", std::regex::icase | std::regex::optimize);
-
-                    if (std::regex_search(last_output, matches, r) && !matches.empty() &&
-                        matches.size() >= 2 && !matches[1].str().empty() &&
-                        matches[1].str() != params.person &&
-                        matches[1].str() != " \n"+params.person)
-                    {
-                        std::string current_voice_tmp = matches[1].str();
-                        current_voice_tmp = ::replace(current_voice_tmp, ":", "");
-                        current_voice_tmp = ::replace(current_voice_tmp, "\"", "");
-                        trim(current_voice_tmp);
-
-                        if (current_voice_tmp.size()>1 && current_voice_tmp.size()<30)
-                        {
-                            current_voice = current_voice_tmp;
-                            std::regex regEx("\n" + current_voice + ":");
-                            text_to_speak = std::regex_replace(text_to_speak, regEx, "\n");
+                        size_t pos3 = out_token_str.find("{3}");
+                        if (pos3 != std::string::npos) {
+                            out_token_str.replace(pos3, 3, year_str);
                         }
-                    }
-                }
-
-                // ============================================================
-                // ОБРАБОТКА СТОП-СЛОВ (АНТИПРОМПТОВ)
-                // ============================================================
-
-                // Проверяем, заканчивается ли last_output на antiprompt (игнорируем пробелы в конце)
-                if (last_output.length() >= antiprompt.length())
-                {
-                    // Обрезаем пробелы в конце для чистого сравнения
-                    std::string last_output_trimmed = last_output;
-                    rtrim(last_output_trimmed);
-                    
-                    std::string end_of_output = last_output_trimmed.substr(last_output_trimmed.length() - antiprompt.length());
-                    
-                    // Также проверяем, что antiprompt находится в конце строки (а не в середине)
-                    bool is_at_end = (last_output_trimmed.length() >= antiprompt.length() && 
-                                     last_output_trimmed.substr(last_output_trimmed.length() - antiprompt.length()) == antiprompt);
-
-                    if (is_at_end || end_of_output == antiprompt)
-                    {
-                        // --------------------------------------------------------
-                        // 1. ПРОВЕРКА MIN_TOKENS (слишком короткий ответ)
-                        // --------------------------------------------------------
-                        if (params.min_tokens > 0 && tokens_in_reply < params.min_tokens) {
-                            if (params.verbose) {
-                                printf(" [ignoring antiprompt '%s', too short (%d < %d)] ",
-                                    antiprompt.c_str(), tokens_in_reply, params.min_tokens);
-                            }
-                            continue;
+                        size_t pos5 = out_token_str.find("{5}");
+                        if (pos5 != std::string::npos) {
+                            out_token_str.replace(pos5, 3, ymd);
                         }
 
-                        // --------------------------------------------------------
-                        // 2. ОБРАБОТКА ИМЕНИ ПОЛЬЗОВАТЕЛЯ (Друг:, Друг :)
-                        // --------------------------------------------------------
-                        bool is_user_name_antiprompt = (antiprompt == "\n" + params.person + chat_symb ||
-                                                        antiprompt == "\n" + params.person + " " + chat_symb);
-
-                        if (is_user_name_antiprompt)
-                        {
-                            // Проверяем, есть ли текст ДО этого антипромпта
-                            if (text_to_speak.empty() || text_to_speak.length() < 2) {
-                                if (params.debug) {
-                                    fprintf(stderr, "[DEBUG] User name antiprompt but text_to_speak empty - IGNORED\n");
+                        // 2. Обработка разбитых токенов (субтокены типа "{0", "}", "{1")
+                        if (out_token_str == "{0" || out_token_str == "{0}") {
+                            out_token_str = params.person;
+                        } else if (out_token_str == "{1" || out_token_str == "{1}") {
+                            out_token_str = params.bot_name;
+                        } else if (out_token_str == "{2" || out_token_str == "{2}") {
+                            out_token_str = time_str;
+                        } else if (out_token_str == "{3" || out_token_str == "{3}") {
+                            out_token_str = year_str;
+                        } else if (out_token_str == "{5" || out_token_str == "{5}") {
+                            out_token_str = ymd;
+                        } else if (out_token_str == "}" && !text_to_speak.empty()) {
+                            if (text_to_speak.size() >= 2) {
+                                std::string last2 = text_to_speak.substr(text_to_speak.size() - 2);
+                                if (last2 == "{0" || last2 == "{1" || last2 == "{2" || last2 == "{3" || last2 == "{5") {
+                                    text_to_speak.pop_back();
+                                    out_token_str = "";
                                 }
-                                i_antiprompt++;
+                            }
+                        }
+
+                        // ============================================================
+                        // 3. УМНАЯ ФИЛЬТРАЦИЯ СПЕЦТОКЕНОВ (полностью переработанная)
+                        // ============================================================
+                        // Проблема: BPE-токенизатор разбивает спецтокены типа <|start_header_id|>
+                        // на множество мелких токенов: "<", "|", "start", "_", "header", ...
+                        // Старая логика накапливала их в pending_fragment, но при превышении
+                        // MAX_PENDING (8 токенов) вываливала в консоль как обычный текст.
+                        //
+                        // Новое решение:
+                        // 1. Проверяем ID токена по списку special_token_ids (стоп-токены).
+                        // 2. Токены с '<' или '|' накапливаем в буфер.
+                        // 3. Как только в буфере образовался полный паттерн <|...|> —
+                        //    молча хороним ВЕСЬ буфер (это был спецтокен).
+                        // 4. Если накопилось > MAX_PENDING и нет полного паттерна —
+                        //    это обычный текст с угловыми скобками, выводим как есть.
+                        // 5. Обычные токены выводим сразу, предварительно вытолкнув буфер.
+                        // ============================================================
+
+                        // Шаг 3a: Проверяем ID токена по заранее собранному списку стоп-токенов
+                        bool is_special_id = false;
+                        for (int si = 0; si < special_token_count; si++) {
+                            if (id == special_token_ids[si]) {
+                                is_special_id = true;
+                                break;
+                            }
+                        }
+
+                        // Шаг 3b: Дополнительно проверяем EOS через токен конца словаря
+                        if (!is_special_id) {
+                            llama_token eos_token = llama_vocab_eos(vocab_llama);
+                            if (id == eos_token) {
+                                is_special_id = true;
+                            }
+                        }
+
+                        // Шаг 3c: Буфер для накопления подозрительных фрагментов
+                        std::string pending_fragment = "";
+                        int pending_count = 0;
+                        static const int MAX_PENDING = 20;  // Константу оставляем static (экономия памяти)
+
+                        // Шаг 3d: Определяем, похож ли токен на фрагмент спецтокена
+                        bool looks_like_special = false;
+                        if (!out_token_str.empty()) {
+                            for (size_t ci = 0; ci < out_token_str.size(); ci++) {
+                                if (out_token_str[ci] == '<' || out_token_str[ci] == '|') {
+                                    looks_like_special = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        bool should_print = true;
+
+                        if (is_special_id) {
+                            // Токен гарантированно стоп-токен — подавляем и очищаем буфер
+                            should_print = false;
+                            pending_fragment = "";
+                            pending_count = 0;
+                        } else if (looks_like_special && !out_token_str.empty()) {
+                            // Токен похож на фрагмент спецтокена — накапливаем
+                            pending_fragment += out_token_str;
+                            pending_count++;
+
+                            // ===== КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: проверяем, не собрался ли целый спецтокен =====
+                            // Если в буфере уже есть и открывающий "<|", и закрывающий "|>",
+                            // значит мы накопили полный спецтокен — выбрасываем его молча.
+                            bool has_open = (pending_fragment.find("<|") != std::string::npos);
+                            bool has_close = (pending_fragment.find("|>") != std::string::npos);
+
+                            if (has_open && has_close) {
+                                // Это полный спецтокен — тихо хороним
+                                pending_fragment = "";
+                                pending_count = 0;
+                                should_print = false;
+                            }
+                            // ===== КОНЕЦ КЛЮЧЕВОГО ИСПРАВЛЕНИЯ =====
+                            else if (pending_count >= MAX_PENDING) {
+                                // Слишком много фрагментов, а полного спецтокена нет —
+                                // это обычный текст с угловыми скобками, выводим
+                                printf("%s", pending_fragment.c_str());
+                                fflush(stdout);
+                                text_to_speak += pending_fragment;
+                                tokens_in_reply += utf8_length(pending_fragment);
+                                pending_fragment = "";
+                                pending_count = 0;
+                                should_print = true;  // чтобы текущий токен тоже вывелся ниже
+                            } else {
+                                should_print = false;
+                            }
+                        } else {
+                            // Обычный токен — сначала выталкиваем накопленный буфер, если есть
+                            if (!pending_fragment.empty()) {
+                                printf("%s", pending_fragment.c_str());
+                                fflush(stdout);
+                                text_to_speak += pending_fragment;
+                                tokens_in_reply += utf8_length(pending_fragment);
+                                pending_fragment = "";
+                                pending_count = 0;
+                            }
+                        }
+
+                        // Убираем лишний пробел в начале первого токена после имени бота
+                        {
+                            static bool first_token_after_bot_static = true;
+                            if (first_token_after_bot_static && !out_token_str.empty() && out_token_str[0] == ' ') {
+                                out_token_str.erase(0, 1);  // убираем первый пробел
+                            }
+                            first_token_after_bot_static = false;
+                        }
+
+                        // Выводим только очищенный и безопасный токен
+                        if (should_print && !out_token_str.empty()) {
+                            // Очистка спецтокенов для вывода на экран
+                            // Используем регулярку для удаления ЛЮБЫХ паттернов <|...|>
+                            std::string display_str = out_token_str;
+                            try {
+                                // Удаляем всё, что похоже на <|что-угодно|>
+                                display_str = std::regex_replace(display_str, std::regex(R"(<\|[^>]*\|>)"), "");
+                                // Удаляем одиночные роли (могут остаться после очистки тегов)
+                                display_str = std::regex_replace(display_str, std::regex(R"(\b(assistant|system|user|end_header_id|eot_id|start_header_id|eo)\b)"), "");
+                            } catch (const std::regex_error&) {
+                                // Fallback: ручная очистка, если регулярка не сработала
+                                display_str = ::replace(display_str, "<|start_header_id|>", "");
+                                display_str = ::replace(display_str, "<|end_header_id|>", "");
+                                display_str = ::replace(display_str, "<|eot_id|>", "");
+                                display_str = ::replace(display_str, "<|im_start|>", "");
+                                display_str = ::replace(display_str, "<|im_end|>", "");
+                                display_str = ::replace(display_str, "<|eo|>", "");
+                                display_str = ::replace(display_str, "assistant", "");
+                                display_str = ::replace(display_str, "system", "");
+                                display_str = ::replace(display_str, "user", "");
+                            }
+
+                            if (!display_str.empty()) {
+                                printf("%s", display_str.c_str());
+                                fflush(stdout);
+                            }
+                            // В TTS идёт исходная строка — она очистится в send_tts_async()
+                            text_to_speak += out_token_str;
+                        }
+
+                        if (should_print) {
+                            tokens_in_reply += utf8_length(out_token_str);
+                        }
+                        // ============================================================
+
+                        // Проверка на зацикливание последовательности
+                        if (params.seqrep)  // Если включена проверка на повторения
+                        {
+                            // Обновляем "игольчатый" буфер (для поиска повторений)
+                            if (utf8_length(last_output_needle) > 25)
+                                last_output_needle = utf8_substr(last_output_needle, 5, utf8_length(last_output_needle)-5);
+                            last_output_needle += out_token_str;  // Добавляем текущий токен
+
+                            out_token_symbol = out_token_str[out_token_str.size()-1];  // Последний символ токена
+
+                            // Если символ является знаком препинания (конец слова/предложения)
+                            if (out_token_symbol == ' ' || out_token_symbol == '.' || out_token_symbol == ',' ||
+                                out_token_symbol == '!' || out_token_symbol == '?')
+                            {
+                                // Проверяем, есть ли эта последовательность в буфере
+                                if (utf8_length(last_output_buffer) > 300 && utf8_length(last_output_needle) >= 20 &&
+                                    last_output_buffer.find(last_output_needle) != std::string::npos)
+                                {
+                                    // Обнаружено зацикливание - выводим сообщение
+                                    printf(" [LOOP: %s] (length: %d)\n", last_output_needle.c_str(), utf8_length(last_output_needle));
+                                    // Рассчитываем количество символов и токенов для удаления
+                                    int symbols_to_delete = static_cast<int>(utf8_length(last_output_needle) * 1); // Удаляем всю последовательность
+                                    const std::vector<llama_token> tokens_to_del = llama_tokenize(ctx_llama, last_output_needle.c_str(), false);
+                                    int rollback_num = static_cast<int>(tokens_to_del.size());  // Количество токенов для отката
+                                    if (rollback_num) // Если есть токены для удаления
+                                    {
+                                        // Удаляем токены из контекста
+                                        embd_inp.erase(embd_inp.end() - rollback_num, embd_inp.end());
+                                        n_past = static_cast<int>(embd_inp.size());  // Обновляем позицию
+                                        n_session_consumed = n_past;  // Обновляем сессию
+
+                                        // Очищаем KV-кэш модели (через новый memory API)
+                                        llama_memory_seq_rm(llama_get_memory(ctx_llama), 0, static_cast<int>(embd_inp.size()), -1);
+
+                                        // Удаляем текст из буферов
+                                        text_to_speak = utf8_substr(text_to_speak, 0, utf8_length(text_to_speak)-symbols_to_delete);
+                                        last_output_needle = utf8_substr(last_output_needle, 0, utf8_length(last_output_needle)-symbols_to_delete);
+                                        last_output_buffer = utf8_substr(last_output_buffer, 0, utf8_length(last_output_buffer)-symbols_to_delete);
+
+                                        temp_next = 1.8f; // Повышаем температуру для следующего токена (чтобы выйти из цикла)
+                                    }
+                                }
+                            }
+                            // Обновляем буфер для проверки повторений
+                            if (utf8_length(last_output_buffer) > 1000)
+                                last_output_buffer = utf8_substr(last_output_buffer, 100, last_output_buffer.size()-100);
+                            last_output_buffer += out_token_str;  // Добавляем текущий токен в буфер
+                        }
+                        // Проверка на появление имён персонажей
+                        // Если обнаружено имя пользователя
+                        if (text_to_speak == '\n'+params.person+':')
+                        {
+                            person_name_is_found = 1; // Установить флаг
+                            translation_is_going = 0; // Остановить перевод
+
+                        }
+                        // Если обнаружено имя бота (формат: \nИмя:)
+                        else if (text_to_speak[0] == '\n' && text_to_speak[text_to_speak.size()-1] == ':' && text_to_speak.size() < 10)
+                        {
+                            bot_name_is_found = 1;         // Установить флаг
+                            bot_name_current = text_to_speak.substr(1, text_to_speak.size()-2);  // Извлечь имя
+                            if (params.translate)
+                            bot_name_current_ru = translit_en_ru(bot_name_current);  // Транслитерировать на русский
+                            translation_full = "";         // Очистить буфер перевода
+                            text_to_speak = "";            // Очистить текст для озвучки
+                        }
+                        // Обнуляем текст для TTS, если было обнаружено имя бота — в любом виде
+                        if (bot_name_is_found) {
+                            text_to_speak = "";
+                        }
+                        // Обработка знаков препинания и разбиение текста
+                        int text_len = static_cast<int>(text_to_speak.size());
+
+                        if (text_len > 0 && text_to_speak[text_len-1] == ',') n_comas++;
+                        // Пропускаем разбиение на апострофе, не ломая счётчик split_after
+                        if (text_len > 0 && new_tokens == params.split_after && params.split_after && text_to_speak[text_len-1] == '\'')
+                        {
+                            // Ничего не делаем — просто не отправляем в TTS на этом токене
+                        }
+                        // Не разбиваем по Mr.
+                        if (text_to_speak.size() >= 3 && text_to_speak.substr(text_to_speak.size()-3, 3) == "Mr.")
+                            text_to_speak[text_len-1] = ' ';
+
+                        // Очистка микрофона после генерации 20 токенов
+                        // Это помогает избежать накопления шума в буфере микрофона
+                        if (new_tokens == 20 && g_interrupt_reason.load() == InterruptReason::NONE)
+                        {
+                            audio.clear();  // Очищаем буфер аудио
+                        }
+
+                        // =================================================================
+                        // УМНОЕ РАЗБИЕНИЕ ТЕКСТА ДЛЯ TTS: ПО ПРЕДЛОЖЕНИЯМ, НЕ ПО ТОКЕНАМ
+                        // =================================================================
+                        // Используем ЕДИНЫЙ статический буфер, объявленный в начале цикла
+                        // (tts_smart_buffer уже объявлен как static выше, не объявляем повторно)
+                        
+                        // Добавляем текущий токен в буфер (НЕ отправляем сразу)
+                        tts_smart_buffer += text_to_speak;
+                        text_to_speak.clear();
+                        
+                        bool should_send = false;
+                        size_t buf_len = tts_smart_buffer.size();
+                        
+                        // ========== ПРОВЕРКА 1: Естественные концы предложений ==========
+                        // В диалоговой речи важны все знаки препинания, включая двоеточие
+                        if (buf_len >= 1) {
+                            char last_char = tts_smart_buffer[buf_len - 1];
+                            if (last_char == '.' || last_char == '!' || last_char == '?' || 
+                                last_char == ':' || last_char == '\n') {
+                                should_send = true;
+                            }
+                        }
+                        
+                        // Проверка: знак препинания + пробел
+                        if (!should_send && buf_len >= 2) {
+                            char c1 = tts_smart_buffer[buf_len - 2];
+                            char c2 = tts_smart_buffer[buf_len - 1];
+                            if ((c1 == '.' || c1 == '!' || c1 == '?') && std::isspace(static_cast<unsigned char>(c2))) {
+                                should_send = true;
+                            }
+                        }
+                        
+                        // Проверка: знак препинания + кавычка/скобка + пробел
+                        if (!should_send && buf_len >= 3) {
+                            char c1 = tts_smart_buffer[buf_len - 3];
+                            char c2 = tts_smart_buffer[buf_len - 2];
+                            char c3 = tts_smart_buffer[buf_len - 1];
+                            if ((c1 == '.' || c1 == '!' || c1 == '?') && 
+                                (c2 == '"' || c2 == '\'' || c2 == ')' || c2 == ']' || c2 == '»') && 
+                                std::isspace(static_cast<unsigned char>(c3))) {
+                                should_send = true;
+                            }
+                        }
+                        
+                        // ========== ПРОВЕРКА 2: Защита от слишком длинного буфера ==========
+                        // Увеличен лимит до 500 символов, чтобы дать модели закончить мысль
+                        if (!should_send && buf_len > 500) {
+                            // Ищем ТОЛЬКО настоящие концы предложений, а не любые разделители
+                            size_t cut_pos = tts_smart_buffer.find_last_of(".!?", buf_len - 100);
+                            if (cut_pos != std::string::npos && cut_pos > 150) {
+                                should_send = true;
+
+                                // Отправляем часть, остальное оставляем
+                                std::string to_send_part = tts_smart_buffer.substr(0, cut_pos + 1);
+                                tts_smart_buffer = tts_smart_buffer.substr(cut_pos + 1);
+                                
+                                // Очистка и отправка
+                                to_send_part = ::replace(to_send_part, params.bot_name + ":", "");
+                                to_send_part = ::replace(to_send_part, params.bot_name + " :", "");
+                                to_send_part = ::replace(to_send_part, "<|eot_id|>", "");
+                                to_send_part = ::replace(to_send_part, "<|start_header_id|>", "");
+                                to_send_part = ::replace(to_send_part, "<|end_header_id|>", "");
+                                to_send_part = ::replace(to_send_part, "<|im_end|>", "");
+                                to_send_part = ::replace(to_send_part, "<|im_start|>", "");
+                                trim(to_send_part);
+                                
+                                if (!to_send_part.empty() && person_name_is_found == 0) {
+                                    // Сохраняем для Regenerate
+                                    full_response_text += to_send_part;
+                                    
+                                    // Отправляем в TTS (если нет перевода)
+                                    if (!params.translate || translation_is_going != 0) {
+                                        std::string voice_copy = current_voice;
+                                        safe_thread_emplace(threads, [to_send_part, voice_copy, params]() {
+                                            send_tts_async(to_send_part, voice_copy, params.language, params.xtts_url);
+                                        });
+                                        if (params.sleep_before_xtts) {
+                                            int sleep_remaining = params.sleep_before_xtts;
+                                            while (sleep_remaining > 0 && g_interrupt_reason.load() == InterruptReason::NONE) {
+                                                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                                                sleep_remaining -= 20;
+                                            }
+                                        }
+                                    }
+                                }
+                                continue; // Возвращаемся в начало цикла генерации
+                            }
+                        }
+                        
+                        // ========== ЕСЛИ НУЖНО ОТПРАВИТЬ - ОТПРАВЛЯЕМ ==========
+                        if (should_send && !tts_smart_buffer.empty()) {
+                            std::string to_send = tts_smart_buffer;
+                            tts_smart_buffer.clear();
+                            
+                            // Удаляем имя бота
+                            to_send = ::replace(to_send, params.bot_name + ":", "");
+                            to_send = ::replace(to_send, params.bot_name + " :", "");
+                            trim(to_send);
+                            
+                            // Удаляем имя пользователя, если оно в конце
+                            if (!antiprompts.empty() && !antiprompts[0].empty()) {
+                                std::string user_marker = antiprompts[0];
+                                if (to_send.size() >= user_marker.size()) {
+                                    std::string end_part = to_send.substr(to_send.size() - user_marker.size());
+                                    if (end_part == user_marker) {
+                                        to_send = to_send.substr(0, to_send.size() - user_marker.size());
+                                        trim(to_send);
+                                    }
+                                }
+                            }
+                            
+                            // Очистка от спецтокенов
+                            to_send = ::replace(to_send, "<|eot_id|>", "");
+                            to_send = ::replace(to_send, "<|start_header_id|>", "");
+                            to_send = ::replace(to_send, "<|end_header_id|>", "");
+                            to_send = ::replace(to_send, "<|im_end|>", "");
+                            to_send = ::replace(to_send, "<|im_start|>", "");
+                            to_send = ::replace(to_send, "</s>", "");
+                            to_send = ::replace(to_send, "<|endoftext|>", "");
+                            to_send = ::replace(to_send, "<|", "");
+                            to_send = ::replace(to_send, "|>", "");
+                            trim(to_send);
+                            
+                            if (!to_send.empty() && person_name_is_found == 0) {
+                                // ===== ОБРАБОТКА ПЕРЕВОДА =====
+                                if (params.translate && translation_is_going == 0) {
+                                    // Начинаем перевод
+                                    n_embd_inp_before_trans = static_cast<int>(embd_inp.size());
+                                    std::string trans_prompt = "\nПеревод последнего предложения на русский.\n" + bot_name_current_ru + ":" + translation_full + to_send;
+                                    std::vector<llama_token> trans_prompt_emb = ::llama_tokenize(ctx_llama, trans_prompt, false);
+                                    embd.insert(embd.end(), trans_prompt_emb.begin(), trans_prompt_emb.end());
+                                    translation_is_going = 1;
+                                    translation_full = to_send; // Сохраняем для перевода
+                                    text_to_speak = "";
+                                    continue;
+                                }
+                                
+                                // Сохраняем для команды Regenerate
+                                full_response_text += to_send;
+                                
+                                // Отправляем в TTS
+                                std::string voice_copy = current_voice;
+                                safe_thread_emplace(threads, [to_send, voice_copy, params]() {
+                                    send_tts_async(to_send, voice_copy, params.language, params.xtts_url);
+                                });
+                                
+                                if (params.sleep_before_xtts) {
+                                    int sleep_remaining = params.sleep_before_xtts;
+                                    while (sleep_remaining > 0 && g_interrupt_reason.load() == InterruptReason::NONE) {
+                                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                                        sleep_remaining -= 20;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // ========== ОТКАТ ПЕРЕВОДА ПОСЛЕ ЗАВЕРШЕНИЯ ==========
+                        if (params.translate && translation_is_going == 1) {
+                            translation_is_going = 0;
+                            if (n_embd_inp_before_trans && !embd_inp.empty()) {
+                                int rollback_num = static_cast<int>(embd_inp.size() - n_embd_inp_before_trans);
+                                if (rollback_num) {
+                                    embd_inp.erase(embd_inp.end() - rollback_num, embd_inp.end());
+                                    n_past = static_cast<int>(embd_inp.size());
+                                    n_session_consumed = n_past;
+                                    llama_memory_seq_rm(llama_get_memory(ctx_llama), 0, static_cast<int>(embd_inp.size()), -1);
+                                    printf("\n");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Обработка последнего вывода и антипромптов
+            {
+                // Возвращаемся к старой, проверенной логике: собираем последние токены из embd_inp
+                // Это более стабильно для определения антипромптов, включая EOT-маркеры
+                std::string last_output;
+
+                // Собираем последние 50 символов из контекста (не токенов, а символов!)
+                // Это даёт достаточно контекста для определения конца предложения
+                int total_chars = 0;
+                int start_index = static_cast<int>(embd_inp.size()) - 1;
+
+                for (int i = start_index; i >= 0 && total_chars < 100; i--) {
+                    std::string piece = llama_token_to_piece(ctx_llama, embd_inp[i]);
+                    total_chars += utf8_length(piece);
+                    last_output = piece + last_output;
+                }
+
+                // Также добавляем текущий текст, который ещё не в embd_inp
+                if (!text_to_speak.empty()) {
+                    last_output += text_to_speak;
+                }
+
+
+                int i_antiprompt = 0;
+                last_output_has_username = false;  // Флаг наличия имени пользователя
+                bool antiprompt_matched = false;  // Флаг, был ли найден антипромпт
+
+                // Проходим по всем антипромптам
+                for (std::string & antiprompt : antiprompts)
+                {
+                    // ============================================================
+                    // ОБРАБОТКА НЕСКОЛЬКИХ ИМЁН ПЕРСОНАЖЕЙ ДЛЯ XTTS (multi_chars)
+                    // ============================================================
+                    if (params.multi_chars && last_output.size()>=4)
+                    {
+                        // Очищаем текст от различных знаков препинания
+                        last_output = ::replace(last_output, " ???", "");
+                        last_output = ::replace(last_output, " ??", "");
+                        last_output = ::replace(last_output, " ?", "");
+                        last_output = ::replace(last_output, " !!!", "");
+                        last_output = ::replace(last_output, " !!", "");
+                        last_output = ::replace(last_output, " !", "");
+                        last_output = ::replace(last_output, "!!!", "");
+                        last_output = ::replace(last_output, "!!", "");
+                        last_output = ::replace(last_output, " ...", "");
+                        last_output = ::replace(last_output, " .", "");
+                        last_output = ::replace(last_output, " ,", "");
+                        last_output = ::replace(last_output, "...", "");
+                        last_output = ::replace(last_output, "(", "");
+                        last_output = ::replace(last_output, ")", "");
+
+                        // Поиск нового персонажа
+                        std::smatch matches;
+                        std::regex r("\n([^:]*):", std::regex::icase | std::regex::optimize);
+
+                        if (std::regex_search(last_output, matches, r) && !matches.empty() &&
+                            matches.size() >= 2 && !matches[1].str().empty() &&
+                            matches[1].str() != params.person &&
+                            matches[1].str() != " \n"+params.person)
+                        {
+                            std::string current_voice_tmp = matches[1].str();
+                            current_voice_tmp = ::replace(current_voice_tmp, ":", "");
+                            current_voice_tmp = ::replace(current_voice_tmp, "\"", "");
+                            trim(current_voice_tmp);
+
+                            if (current_voice_tmp.size()>1 && current_voice_tmp.size()<30)
+                            {
+                                current_voice = current_voice_tmp;
+                                std::regex regEx("\n" + current_voice + ":");
+                                text_to_speak = std::regex_replace(text_to_speak, regEx, "\n");
+                            }
+                        }
+                    }
+
+                    // ============================================================
+                    // ОБРАБОТКА СТОП-СЛОВ (АНТИПРОМПТОВ)
+                    // ============================================================
+
+                    // Проверяем, заканчивается ли last_output на antiprompt (игнорируем пробелы в конце)
+                    if (last_output.length() >= antiprompt.length())
+                    {
+                        // Обрезаем пробелы в конце для чистого сравнения
+                        std::string last_output_trimmed = last_output;
+                        rtrim(last_output_trimmed);
+                        
+                        std::string end_of_output = last_output_trimmed.substr(last_output_trimmed.length() - antiprompt.length());
+                        
+                        // Также проверяем, что antiprompt находится в конце строки (а не в середине)
+                        bool is_at_end = (last_output_trimmed.length() >= antiprompt.length() && 
+                                         last_output_trimmed.substr(last_output_trimmed.length() - antiprompt.length()) == antiprompt);
+
+                        if (is_at_end || end_of_output == antiprompt)
+                        {
+                            // --------------------------------------------------------
+                            // 1. ПРОВЕРКА MIN_TOKENS (слишком короткий ответ)
+                            // --------------------------------------------------------
+                            if (params.min_tokens > 0 && tokens_in_reply < params.min_tokens) {
+                                if (params.verbose) {
+                                    printf(" [ignoring antiprompt '%s', too short (%d < %d)] ",
+                                        antiprompt.c_str(), tokens_in_reply, params.min_tokens);
+                                }
                                 continue;
                             }
 
-                            // Удаляем антипромпт из text_to_speak
-                            size_t pos_in_speak = text_to_speak.find(antiprompt);
-                            if (pos_in_speak != std::string::npos) {
-                                text_to_speak = text_to_speak.substr(0, pos_in_speak);
-                                trim(text_to_speak);
-                            }
-
-                            antiprompt_matched = true;
-                            done = true;
-                            
-                            if (params.debug) {
-                                fprintf(stderr, "[DEBUG] User name antiprompt '%s' matched - stopping\n", antiprompt.c_str());
-                            }
-                        }
-                        else
-                        {
                             // --------------------------------------------------------
-                            // 3. ОБРАБОТКА ОСТАЛЬНЫХ АНТИПРОМПТОВ
+                            // 2. ОБРАБОТКА ИМЕНИ ПОЛЬЗОВАТЕЛЯ (Друг:, Друг :)
                             // --------------------------------------------------------
-                            // Удаляем антипромпт из text_to_speak, если он там есть
-                            size_t pos_in_speak = text_to_speak.find(antiprompt);
-                            if (pos_in_speak != std::string::npos) {
-                                text_to_speak = text_to_speak.substr(0, pos_in_speak);
-                                trim(text_to_speak);
-                            }
-                            
-                            antiprompt_matched = true;
-                            done = true;
+                            bool is_user_name_antiprompt = (antiprompt == "\n" + params.person + chat_symb ||
+                                                            antiprompt == "\n" + params.person + " " + chat_symb);
 
-                            if (params.debug) {
-                                printf("\n[DEBUG] Antiprompt '%s' matched - stopping\n", antiprompt.c_str());
-                            }
-                        }
-
-                        // --------------------------------------------------------
-                        // 5. ВЫПОЛНЯЕМ ДЕЙСТВИЯ ПРИ ОСТАНОВКЕ
-                        // --------------------------------------------------------
-                        if (done)
-                        {
-                            // Удаляем антипромпт из текста для озвучки
-                            text_to_speak = ::replace(text_to_speak, antiprompt, "");
-
-                            fflush(stdout);
-                            need_to_save_session = true;
-
-                            // Запоминаем, что это был первый антипромпт (имя пользователя)
-                            if (i_antiprompt == 0)
+                            if (is_user_name_antiprompt)
                             {
-                                last_output_has_username = true;
-                                printf(" ");
-                            }
-
-                            // --------------------------------------------------------
-                            // ПРОВЕРКА МИНИМАЛЬНОГО КОЛИЧЕСТВА ТОКЕНОВ
-                            // --------------------------------------------------------
-                            static int short_response_attempts = 0;
-
-                            if (params.min_tokens && tokens_in_reply < params.min_tokens)
-                            {
-                                short_response_attempts++;
-
-                                if (short_response_attempts > 5) {
-                                    if (params.verbose) {
-                                        printf("\n[WARN] Too many short responses (%d attempts), accepting as is\n",
-                                            short_response_attempts);
-                                    }
-                                    short_response_attempts = 0;
+                                // Проверяем, есть ли текст ДО этого антипромпта
+                                if (text_to_speak.empty() || text_to_speak.length() < 2) {
                                     if (params.debug) {
+                                        fprintf(stderr, "[DEBUG] User name antiprompt but text_to_speak empty - IGNORED\n");
+                                    }
+                                    i_antiprompt++;
+                                    continue;
+                                }
+
+                                // Удаляем антипромпт из text_to_speak
+                                size_t pos_in_speak = text_to_speak.find(antiprompt);
+                                if (pos_in_speak != std::string::npos) {
+                                    text_to_speak = text_to_speak.substr(0, pos_in_speak);
+                                    trim(text_to_speak);
+                                }
+
+                                antiprompt_matched = true;
+                                done = true;
+                                
+                                if (params.debug) {
+                                    fprintf(stderr, "[DEBUG] User name antiprompt '%s' matched - stopping\n", antiprompt.c_str());
+                                }
+                            }
+                            else
+                            {
+                                // --------------------------------------------------------
+                                // 3. ОБРАБОТКА ОСТАЛЬНЫХ АНТИПРОМПТОВ
+                                // --------------------------------------------------------
+                                // Удаляем антипромпт из text_to_speak, если он там есть
+                                size_t pos_in_speak = text_to_speak.find(antiprompt);
+                                if (pos_in_speak != std::string::npos) {
+                                    text_to_speak = text_to_speak.substr(0, pos_in_speak);
+                                    trim(text_to_speak);
+                                }
+                                
+                                antiprompt_matched = true;
+                                done = true;
+
+                                if (params.debug) {
+                                    printf("\n[DEBUG] Antiprompt '%s' matched - stopping\n", antiprompt.c_str());
+                                }
+                            }
+
+                            // --------------------------------------------------------
+                            // 5. ВЫПОЛНЯЕМ ДЕЙСТВИЯ ПРИ ОСТАНОВКЕ
+                            // --------------------------------------------------------
+                            if (done)
+                            {
+                                // Удаляем антипромпт из текста для озвучки
+                                text_to_speak = ::replace(text_to_speak, antiprompt, "");
+
+                                fflush(stdout);
+                                need_to_save_session = true;
+
+                                // Запоминаем, что это был первый антипромпт (имя пользователя)
+                                if (i_antiprompt == 0)
+                                {
+                                    last_output_has_username = true;
+                                    printf(" ");
+                                }
+
+                                // --------------------------------------------------------
+                                // ПРОВЕРКА МИНИМАЛЬНОГО КОЛИЧЕСТВА ТОКЕНОВ
+                                // --------------------------------------------------------
+                                static int short_response_attempts = 0;
+
+                                if (params.min_tokens && tokens_in_reply < params.min_tokens)
+                                {
+                                    short_response_attempts++;
+
+                                    if (short_response_attempts > 5) {
+                                        if (params.verbose) {
+                                            printf("\n[WARN] Too many short responses (%d attempts), accepting as is\n",
+                                                short_response_attempts);
+                                        }
+                                        short_response_attempts = 0;
+                                        if (params.debug) {
+                                            std::string full_dialog = emb_to_str(ctx_llama, embd_inp);
+                                            printf("\n=====FULL text in embd (%zd tokens, %zd symbols)=====\n%s\n====END====\n",
+                                                embd_inp.size(), full_dialog.size(), full_dialog.c_str());
+                                        }
+                                        break;
+                                    }
+
+                                    int symbols_to_delete = static_cast<int>(utf8_length(antiprompt) * 1) + 1;
+                                    const std::vector<llama_token> tokens_to_del = llama_tokenize(ctx_llama, antiprompt.c_str(), false);
+                                    int rollback_num = static_cast<int>(tokens_to_del.size()) + 1;
+
+                                    if (rollback_num)
+                                    {
+                                        embd_inp.erase(embd_inp.end() - rollback_num, embd_inp.end());
+                                        n_past = static_cast<int>(embd_inp.size());
+                                        n_session_consumed = n_past;
+                                        llama_memory_seq_rm(llama_get_memory(ctx_llama), 0, static_cast<int>(embd_inp.size()), -1);
+
+                                        if (symbols_to_delete > utf8_length(text_to_speak))
+                                            text_to_speak = "";
+                                        else
+                                            text_to_speak = utf8_substr(text_to_speak, 0, utf8_length(text_to_speak)-symbols_to_delete);
+
+                                        temp_next = 1.8f;
+                                        fflush(stdout);
+                                        printf("\b\b\b\b\b\b\b\b\b\b\b\b");
+                                        fflush(stdout);
+                                        done = false;
+
+                                        if (params.debug) {
+                                            printf("\n[DEBUG] Response too short (%d < %d), retry %d/5 with higher temp\n",
+                                                tokens_in_reply, params.min_tokens, short_response_attempts);
+                                        }
+                                    }
+
+                                    if (params.debug)
+                                    {
+                                        std::string full_dialog = emb_to_str(ctx_llama, embd_inp);
+                                        printf("\n=====FULL text in embd (%zd tokens, %zd symbols)=====\n%s\n====END====\n",
+                                            embd_inp.size(), full_dialog.size(), full_dialog.c_str());
+                                    }
+                                }
+                                else
+                                {
+                                    short_response_attempts = 0;
+                                    if (params.debug)
+                                    {
                                         std::string full_dialog = emb_to_str(ctx_llama, embd_inp);
                                         printf("\n=====FULL text in embd (%zd tokens, %zd symbols)=====\n%s\n====END====\n",
                                             embd_inp.size(), full_dialog.size(), full_dialog.c_str());
                                     }
                                     break;
                                 }
-
-                                int symbols_to_delete = static_cast<int>(utf8_length(antiprompt) * 1) + 1;
-                                const std::vector<llama_token> tokens_to_del = llama_tokenize(ctx_llama, antiprompt.c_str(), false);
-                                int rollback_num = tokens_to_del.size() + 1;
-
-                                if (rollback_num)
-                                {
-                                    embd_inp.erase(embd_inp.end() - rollback_num, embd_inp.end());
-                                    n_past = embd_inp.size();
-                                    n_session_consumed = n_past;
-                                    llama_memory_seq_rm(llama_get_memory(ctx_llama), 0, embd_inp.size(), -1);
-
-                                    if (symbols_to_delete > utf8_length(text_to_speak))
-                                        text_to_speak = "";
-                                    else
-                                        text_to_speak = utf8_substr(text_to_speak, 0, utf8_length(text_to_speak)-symbols_to_delete);
-
-                                    temp_next = 1.8;
-                                    fflush(stdout);
-                                    printf("\b\b\b\b\b\b\b\b\b\b\b\b");
-                                    fflush(stdout);
-                                    done = false;
-
-                                    if (params.debug) {
-                                        printf("\n[DEBUG] Response too short (%d < %d), retry %d/5 with higher temp\n",
-                                            tokens_in_reply, params.min_tokens, short_response_attempts);
-                                    }
-                                }
-
-                                if (params.debug)
-                                {
-                                    std::string full_dialog = emb_to_str(ctx_llama, embd_inp);
-                                    printf("\n=====FULL text in embd (%zd tokens, %zd symbols)=====\n%s\n====END====\n",
-                                        embd_inp.size(), full_dialog.size(), full_dialog.c_str());
-                                }
-                            }
-                            else
-                            {
-                                short_response_attempts = 0;
-                                if (params.debug)
-                                {
-                                    std::string full_dialog = emb_to_str(ctx_llama, embd_inp);
-                                    printf("\n=====FULL text in embd (%zd tokens, %zd symbols)=====\n%s\n====END====\n",
-                                        embd_inp.size(), full_dialog.size(), full_dialog.c_str());
-                                }
-                                break;
                             }
                         }
                     }
+                    i_antiprompt++;
                 }
-                i_antiprompt++;
-            }
 
-            // ========== ФИНАЛЬНАЯ ПРОВЕРКА ==========
-            if (antiprompt_matched && params.min_tokens > 0 && tokens_in_reply < params.min_tokens) {
-                done = false;
-                if (params.verbose) {
-                    printf(" [Safety: short response protected] ");
+                // ========== ФИНАЛЬНАЯ ПРОВЕРКА ==========
+                if (antiprompt_matched && params.min_tokens > 0 && tokens_in_reply < params.min_tokens) {
+                    done = false;
+                    if (params.verbose) {
+                        printf(" [Safety: short response protected] ");
+                    }
                 }
-            }
-        } // КОНЕЦ БЛОКА антипромптов
-    }
+            } // КОНЕЦ БЛОКА антипромптов
 
-// ### ОБРАБОТКА АУДИОВХОДА И СИГНАЛОВ (VAD) ###
-// ВНИМАНИЕ: проверка событий УДАЛЕНА из цикла генерации
-// Она теперь выполняется только в главном цикле программы
-// для максимальной скорости генерации токенов
-
-        // ========== ФИНАЛЬНАЯ ОБРАБОТКА ОСТАВШЕГОСЯ ТЕКСТА ==========
-        // КРИТИЧЕСКИ ВАЖНО: Принудительно отправляем всё, что осталось в буфере умного сплита
-        
-        // Добавляем остаток буфера в text_to_speak для финальной обработки
-        if (!tts_smart_buffer.empty()) {
-            text_to_speak = tts_smart_buffer + text_to_speak;
-            tts_smart_buffer.clear();
-        }
-
-        // Очистка от спецтокенов (упрощённая, без лишних пробелов)
-        text_to_speak = ::replace(text_to_speak, "<|eot_id|>", "");
-        text_to_speak = ::replace(text_to_speak, "<|start_header_id|>", "");
-        text_to_speak = ::replace(text_to_speak, "<|end_header_id|>", "");
-        text_to_speak = ::replace(text_to_speak, "<|im_end|>", "");
-        text_to_speak = ::replace(text_to_speak, "<|im_start|>", "");
-        text_to_speak = ::replace(text_to_speak, "</s>", "");
-        text_to_speak = ::replace(text_to_speak, "<|endoftext|>", "");
-        text_to_speak = ::replace(text_to_speak, "<|", "");
-        text_to_speak = ::replace(text_to_speak, "|>", "");
-        trim(text_to_speak);
-
-        // Финальная отправка: если остался хоть какой-то текст — озвучиваем его
-        if (!text_to_speak.empty()) {
-            full_response_text += text_to_speak;
+            // ========== ФИНАЛЬНАЯ ОБРАБОТКА ОСТАВШЕГОСЯ ТЕКСТА ==========
+            // КРИТИЧЕСКИ ВАЖНО: Принудительно отправляем всё, что осталось в буфере умного сплита
             
-            // Сохраняем для Regenerate
-            {
+            // Добавляем остаток буфера в text_to_speak для финальной обработки
+            if (!tts_smart_buffer.empty()) {
+                text_to_speak = tts_smart_buffer + text_to_speak;
+                tts_smart_buffer.clear();
+            }
+
+            // Очистка от спецтокенов (упрощённая, без лишних пробелов)
+            text_to_speak = ::replace(text_to_speak, "<|eot_id|>", "");
+            text_to_speak = ::replace(text_to_speak, "<|start_header_id|>", "");
+            text_to_speak = ::replace(text_to_speak, "<|end_header_id|>", "");
+            text_to_speak = ::replace(text_to_speak, "<|im_end|>", "");
+            text_to_speak = ::replace(text_to_speak, "<|im_start|>", "");
+            text_to_speak = ::replace(text_to_speak, "</s>", "");
+            text_to_speak = ::replace(text_to_speak, "<|endoftext|>", "");
+            text_to_speak = ::replace(text_to_speak, "<|", "");
+            text_to_speak = ::replace(text_to_speak, "|>", "");
+            trim(text_to_speak);
+
+            // Финальная отправка: если остался хоть какой-то текст — озвучиваем его
+            if (!text_to_speak.empty()) {
+                full_response_text += text_to_speak;
+                
+                // Сохраняем для Regenerate
+                {
+                    std::lock_guard<std::mutex> lock(g_last_tts_mutex);
+                    g_last_tts_text = full_response_text;
+                }
+
+                std::string final_text = text_to_speak;
+                std::string voice_copy = current_voice;
+                
+                try {
+                    safe_thread_emplace(threads, [final_text, voice_copy, params]() {
+                        send_tts_async(final_text, voice_copy, params.language, params.xtts_url);
+                    });
+                    if (params.sleep_before_xtts) {
+                        int sleep_remaining = params.sleep_before_xtts;
+                        while (sleep_remaining > 0 && g_interrupt_reason.load() == InterruptReason::NONE) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                            sleep_remaining -= 20;
+                        }
+                    }
+                } catch (const std::exception& ex) {
+                    if (params.verbose) {
+                        std::cerr << "[Exception] Final TTS flush failed: " << ex.what() << '\n';
+                    }
+                }
+            } else if (!full_response_text.empty()) {
+                // Если текста для озвучки нет, но full_response_text не пуст — сохраняем для Regenerate
                 std::lock_guard<std::mutex> lock(g_last_tts_mutex);
-                g_last_tts_text = full_response_text;
-            }
-
-            std::string final_text = text_to_speak;
-            std::string voice_copy = current_voice;
-            
-            try {
-                safe_thread_emplace(threads, [final_text, voice_copy, params]() {
-                    send_tts_async(final_text, voice_copy, params.language, params.xtts_url);
-                });
-                if (params.sleep_before_xtts) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(params.sleep_before_xtts));
+                if (g_last_tts_text.empty()) {
+                    g_last_tts_text = full_response_text;
                 }
-            } catch (const std::exception& ex) {
-                std::cerr << "[Exception] Final TTS flush failed: " << ex.what() << '\n';
             }
-        } else if (!full_response_text.empty()) {
-            // Если текста для озвучки нет, но full_response_text не пуст — сохраняем для Regenerate
-            std::lock_guard<std::mutex> lock(g_last_tts_mutex);
-            if (g_last_tts_text.empty()) {
-                g_last_tts_text = full_response_text;
-            }
-        }
-        // ========== КОНЕЦ ФИНАЛЬНОЙ ОБРАБОТКИ ==========
-
-
+            // ========== КОНЕЦ ФИНАЛЬНОЙ ОБРАБОТКИ ==========
 
             // Безопасная очистка всех предыдущих потоков TTS — ВСЕ предыдущие потоки TTS должны быть завершены.
             // Это гарантирует, что при Regenerate/Reset/Exit не будет joinable-потоков в threads.
@@ -6074,32 +6388,51 @@ char out_token_symbol;
                 temp_threads.swap(threads); // ← ИСПРАВЛЕНО: swap вместо swape
 
                 // Безопасное ожидание завершения потоков (упрощённый вариант без таймаута)
-            for (auto& t : temp_threads) {
-                if (t.joinable()) {
-                    try {
-                        t.join();
-                    } catch (const std::exception& e) {
-                        std::cerr << "[warn] exception joining thread: " << e.what() << std::endl;
-                    } catch (...) {
-                        std::cerr << "[warn] unknown exception joining thread\n";
+                for (auto& t_local : temp_threads) {
+                    if (t_local.joinable()) {
+                        try {
+                            t_local.join();
+                        } catch (const std::exception& e) {
+                            if (params.verbose) {
+                                std::cerr << "[warn] exception joining thread: " << e.what() << std::endl;
+                            }
+                        } catch (...) {
+                            if (params.verbose) {
+                                std::cerr << "[warn] unknown exception joining thread\n";
+                            }
+                        }
                     }
                 }
-            }
                 // temp_threads уничтожается здесь — все потоки гарантированно завершены или отсоединены
             }
+            
             // Обработка прерывания генерации
-            if (llama_interrupted.load() /*&& llama_interrupted_time - llama_start_time < 2.0*/)
+            if (g_interrupt_reason.load() != InterruptReason::NONE)
             {
-                1;  // Пустая операция (заглушка)
-                //printf(" \n[continue speech] (%f)", (llama_interrupted_time - llama_start_time));  // Отладочный вывод
+                // Пустая операция — прерывание уже обработано
+                // printf(" \n[continue speech] (%f)", (llama_interrupted_time - llama_start_time));
             }
             else
             {
                 audio.clear();  // Очищаем аудио буфер
-                //printf("\n [audio cleared fin]\n");  // Отладочный вывод
+                // printf("\n [audio cleared fin]\n");
             }
+            
+            // ========== ОЧИСТКА ЗАВЕРШЁННЫХ ПОТОКОВ TTS ==========
+            static int response_counter = 0;
+            response_counter++;
+            if (response_counter >= THREAD_CLEANUP_INTERVAL) {
+                cleanup_finished_threads(threads);
+                response_counter = 0;
+                if (params.verbose) {
+                    printf("[Threads] Cleaned up, %zu active\n", threads.size());
+                }
+            }
+            // ========== КОНЕЦ ОЧИСТКИ ==========
+            
             // Вывод статистики времени выполнения
             llama_end_time = get_current_time_ms();
+            
             if (params.verbose)
             {
                 // Рассчитываем временные метрики
@@ -6113,43 +6446,55 @@ char out_token_symbol;
                         llama_time_input, llama_time_output, llama_time_total);
 
                 // Защита от деления на ноль при выводе скорости
-                float input_speed = (llama_time_input > 0.001f) ? input_tokens_count / llama_time_input : 0.0f;
-                float output_speed = (llama_time_output > 0.001f) ? new_tokens / llama_time_output : 0.0f;
-                float total_speed = (llama_time_total > 0.001f) ? new_tokens / llama_time_total : 0.0f;
+                float input_speed = (llama_time_input > 0.001f) ? static_cast<float>(input_tokens_count) / llama_time_input : 0.0f;
+                float output_speed = (llama_time_output > 0.001f) ? static_cast<float>(new_tokens) / llama_time_output : 0.0f;
+                float total_speed = (llama_time_total > 0.001f) ? static_cast<float>(new_tokens) / llama_time_total : 0.0f;
 
                 printf("\n[Speed: input %.2f t/s + output %.2f t/s = total: %.2f t/s]\n",
                         input_speed, output_speed, total_speed);
             }
-            // Сброс флагов и переменных
-            llama_interrupted.store(0);         // Сбрасываем флаг прерывания
-            llama_interrupted_time = 0.0;       // Сбрасываем время прерывания
-            llama_start_generation_time = 0.0;  // Сбрасываем время начала генерации
-           {                                    // Сброс под защитой мьютекса
+            // Сброс единого флага прерывания
+            g_interrupt_reason.store(InterruptReason::NONE);
+            g_interrupt_processed.store(false);
+            llama_interrupted_time = 0.0;
+            llama_start_generation_time = 0.0;
+            {
                 std::lock_guard<std::mutex> lock(g_hotkey_pressed_mutex);
                 g_hotkey_pressed = "";
-            }         // Сбрасываем горячую клавишу
+            }
 
-        // ===== ПРИГЛАШЕНИЕ ПОСЛЕ ОТВЕТА БОТА =====
-        // Гарантируем ровно один перенос строки между репликами
-        // Проверяем, не закончился ли ответ уже с \n (чтобы не дублировать)
-        if (!full_response_text.empty()) {
-            char last_ch = full_response_text.back();
-            if (last_ch != '\n' && last_ch != '\r') {
+            // ===== ПРИГЛАШЕНИЕ ПОСЛЕ ОТВЕТА БОТА =====
+            // ВАЖНО: ответ бота УЖЕ может содержать \n в конце (из-за split_after или антипромптов)
+            // Нужно вывести ровно ОДИН \n перед следующим приглашением, если его ещё нет
+            
+            // Проверяем, заканчивается ли ответ бота на перевод строки
+            bool ends_with_newline = false;
+            if (!full_response_text.empty()) {
+                size_t len = full_response_text.length();
+                ends_with_newline = (full_response_text[len-1] == '\n' || full_response_text[len-1] == '\r');
+                // Также проверяем последние 2 символа на \r\n
+                if (len >= 2 && full_response_text[len-2] == '\r' && full_response_text[len-1] == '\n') {
+                    ends_with_newline = true;
+                }
+            }
+            
+            // Выводим \n только если ответ не заканчивается на него
+            if (!ends_with_newline) {
                 printf("\n");
             }
-        } else {
-            printf("\n");
-        }
-        // Выводим приглашение для следующей реплики пользователя
-        printf("%s%s  ", params.person.c_str(), chat_symb.c_str());
-        fflush(stdout);
-
+            
+            // Принудительно выводим приглашение для следующей реплики пользователя
+            // БЕЗ лишнего пробела в конце, ТОЛЬКО имя и разделитель
+            printf("%s%s ", params.person.c_str(), chat_symb.c_str());
+            fflush(stdout);
         }
     }
 }
 
  // Завершение работы - очистка потоков
-printf("Cleaning up TTS threads...\n");
+if (params.verbose) {
+    printf("Cleaning up TTS threads...\n");
+}
 
 // ДОБАВИТЬ: запрещаем создание новых потоков
 g_shutting_down.store(true);
@@ -6163,70 +6508,83 @@ std::vector<std::thread> local_threads;
 }
 
 // ШАГ 2: Ждём завершения всех потоков БЕЗ блокировки
-printf("Waiting for %zu TTS threads to finish...\n", local_threads.size());
+if (params.verbose) {
+    printf("Waiting for %zu TTS threads to finish...\n", local_threads.size());
+}
 
-for (auto& t : local_threads) {
-    if (t.joinable()) {
+for (auto& t_local : local_threads) {
+    if (t_local.joinable()) {
         try {
-            t.join();
+            t_local.join();
         } catch (const std::exception& e) {
-            fprintf(stderr, "Warning: Exception joining thread: %s\n", e.what());
-            t.detach();
+            if (params.verbose) {
+                fprintf(stderr, "Warning: Exception joining thread: %s\n", e.what());
+            }
+            t_local.detach();
         } catch (...) {
-            fprintf(stderr, "Warning: Unknown exception joining thread\n");
-            t.detach();
+            if (params.verbose) {
+                fprintf(stderr, "Warning: Unknown exception joining thread\n");
+            }
+            t_local.detach();
         }
     }
 }
 
-printf("Cleanup complete.\n");
+if (params.verbose) {
+    printf("Cleanup complete.\n");
+}
 
-    // ### ЗАВЕРШЕНИЕ РАБОТЫ И ОСВОБОЖДЕНИЕ РЕСУРСОВ ###
+// ### ЗАВЕРШЕНИЕ РАБОТЫ И ОСВОБОЖДЕНИЕ РЕСУРСОВ ###
 
-    // Приостанавливаем аудио
-    audio.pause();
+// Приостанавливаем аудио
+audio.pause();
 
-    // ===== ВАЖНО: Сначала выводим статистику, потом освобождаем память =====
-    // Выводим метрики Whisper
-    whisper_print_timings(ctx_wsp);
+// ===== ВАЖНО: Сначала выводим статистику, потом освобождаем память =====
+// Выводим метрики Whisper
+whisper_print_timings(ctx_wsp);
 
-    if (ctx_llama) {
-        llama_perf_context_print(ctx_llama);
-    }
+if (ctx_llama) {
+    llama_perf_context_print(ctx_llama);
+}
 
-    // ===== Теперь безопасно освобождаем все ресурсы =====
-    // Освобождаем контекст Whisper
-    whisper_free(ctx_wsp);
+// ===== Теперь безопасно освобождаем все ресурсы =====
+// Освобождаем контекст Whisper
+whisper_free(ctx_wsp);
 
-    // Освобождаем сэмплеры LLaMA.
-    // llama_perf_sampler_print() выводит статистику и сама освобождает сэмплер.
-    if (smpl) {
-        llama_perf_sampler_print(smpl);
-    }
-    if (smpl_high_temp) {
-        llama_sampler_free(smpl_high_temp);
-    }
-    // Освобождаем батч LLaMA
-    llama_batch_free(batch);
+// Освобождаем сэмплеры LLaMA.
+// llama_perf_sampler_print() выводит статистику и сама освобождает сэмплер.
+if (smpl) {
+    llama_perf_sampler_print(smpl);
+}
+if (smpl_high_temp) {
+    llama_sampler_free(smpl_high_temp);
+}
+// Освобождаем батч LLaMA
+llama_batch_free(batch);
 
-    // Освобождаем контекст LLaMA
-    llama_free(ctx_llama);
+// Освобождаем контекст LLaMA
+llama_free(ctx_llama);
 
-    // Освобождаем модель LLaMA
-    llama_model_free(model_llama);
+// Освобождаем модель LLaMA
+llama_model_free(model_llama);
 
-    // Освобождаем бэкенд LLaMA
-    llama_backend_free();
+// Освобождаем бэкенд LLaMA
+llama_backend_free();
 
-    // Завершаем потоки ввода
-    if (input_thread.joinable()) {
-        input_thread.detach();
-    }
+// Завершаем потоки ввода
+if (input_thread.joinable()) {
+    input_thread.join();
+}
+keyboard_input_running.store(false);
 
-    // Останавливаем поток горячих клавиш
-    g_shortcut_thread_running.store(false);
-    if (shortcut_thread.joinable()) {
+// Останавливаем поток горячих клавиш
+g_shortcut_thread_running.store(false);
+if (shortcut_thread.joinable()) {
         shortcut_thread.join();
+    }
+
+    if (vad_monitor_thread.joinable()) {
+        vad_monitor_thread.join();
     }
 
     return 0;
@@ -6256,6 +6614,11 @@ int main(int argc, const char ** argv_UTF8) {
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
         std::cerr << "Failed to initialize libcurl" << std::endl;
         return 1;
+    }
+    // Устанавливаем глобальный флаг verbose из переменной окружения (опционально)
+    const char* verbose_env = std::getenv("TALK_LLAMA_VERBOSE");
+    if (verbose_env && (std::string(verbose_env) == "1" || std::string(verbose_env) == "true")) {
+        g_verbose_mode.store(true);
     }
     // ИНИЦИАЛИЗАЦИЯ консоли
     console::init(true, true);
