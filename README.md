@@ -13,9 +13,13 @@
 - XTTSv2 server in streaming-mode
 - langchain google-serper
 
+<<<<<<< HEAD
 ## Новости
 - [2025.11.27] Собственные доработки, которых очень много.
 - [2025.11.01] Все изменения из https://github.com/Mozer/talk-llama-fast/
+=======
+Stable: [v1.9.1](https://github.com/ggml-org/whisper.cpp/releases/tag/v1.9.1) / [Roadmap](https://github.com/orgs/ggml-org/projects/4/)
+>>>>>>> master
 
 
 ## Заметки
