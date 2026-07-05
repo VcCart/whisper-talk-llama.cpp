@@ -404,10 +404,6 @@ namespace console {
         line.erase(pos);
     }
 
-    // ============================================================
-    // UTF-8 ��������������� ������� (���������)
-    // ============================================================
-
     static char32_t decode_utf8(const std::string & input, size_t pos, size_t & advance) {
         unsigned char c = static_cast<unsigned char>(input[pos]);
         if ((c & 0x80u) == 0u) {
@@ -472,9 +468,6 @@ namespace console {
         return pos;
     }
 
-    // ============================================================
-    // ����������� �������
-    // ============================================================
 
     static void move_cursor(int delta) {
         if (delta == 0) return;
@@ -509,9 +502,6 @@ namespace console {
 #endif
     }
 
-    // ============================================================
-    // �������
-    // ============================================================
 
     struct history_t {
         std::vector<std::string> entries;
@@ -560,9 +550,6 @@ namespace console {
         }
     } history;
 
-    // ============================================================
-    // readline_advanced (� �������� � ����������)
-    // ============================================================
 
     static bool readline_advanced(std::string & line, bool multiline_input) {
         if (out != stdout) {
@@ -585,7 +572,6 @@ namespace console {
                 break;
             }
 
-            // ������� �� �������� �����/����
             if (input_char == 0xE002 || input_char == 0xE003) {
                 if (input_char == 0xE002) {
                     if (!history.is_viewing()) {
@@ -633,7 +619,6 @@ namespace console {
                 continue;
             }
 
-            // ������� Left / Right
             if (input_char == 0xE000 || input_char == 0xE001) {
                 if (input_char == 0xE000 && char_pos > 0) {
                     size_t prev_pos = prev_utf8_char_pos(line, byte_pos);
