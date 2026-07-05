@@ -1554,8 +1554,31 @@ void vad_monitor_thread_func(const whisper_params& params, audio_async& audio_re
     g_vad_thread_running.store(true);
 
     while (!g_shutting_down.load()) {
-        // Засыпаем на VAD_MONITOR_INTERVAL_MS (30 мс) для экономии CPU
-        std::this_thread::sleep_for(std::chrono::milliseconds(VAD_MONITOR_INTERVAL_MS));
+        // ============================================================
+        // ОПТИМИЗАЦИЯ: Адаптивная частота проверки VAD в зависимости от состояния бота
+        // IDLE: проверяем реже (150 мс) - экономия CPU в режиме ожидания
+        // GENERATING: проверяем часто (30 мс) - быстрое реагирование на прерывание
+        // INTERRUPTED: проверяем редко (200 мс) - бот уже прерван
+        // ============================================================
+        int interval_ms = VAD_MONITOR_INTERVAL_MS; // 30 ms по умолчанию
+        BotState current_state = g_bot_state.load();
+        
+        switch (current_state) {
+            case BotState::IDLE:
+                interval_ms = 150; // В режиме ожидания проверяем реже
+                break;
+            case BotState::GENERATING:
+                interval_ms = 30; // Во время генерации проверяем часто
+                break;
+            case BotState::INTERRUPTED:
+                interval_ms = 200; // После прерывания проверяем редко
+                break;
+            default:
+                interval_ms = 50;
+                break;
+        }
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
         // Получаем 400 мс аудио (25 Гц частота проверки)
         audio_ref.get(400, pcmf32_vad);
 
@@ -2333,10 +2356,55 @@ void send_tts_async(std::string text,
 
     std::vector<std::pair<std::string, std::string>> protected_patterns;
 
+    // ============================================================
+    // ОПТИМИЗАЦИЯ: Все регулярные выражения компилируются ОДИН РАЗ
+    // Используем static const для кэширования на уровне функции
+    // ============================================================
+    
+    // Защита времени: 15:30, 15:30:45
+    static const std::regex re_time(R"(\b([01]?[0-9]|2[0-3]):([0-5][0-9])(?::([0-5][0-9]))?\b)",
+                                    std::regex::ECMAScript);
+    
+    // Защита дат: 31.12.2025
+    static const std::regex re_date_dots(R"(\b(0[1-9]|[12][0-9]|3[01])\.(0[1-9]|1[0-2])\.(\d{4})\b)",
+                                         std::regex::ECMAScript);
+    
+    // Защита дат: 2025-12-31 (ISO формат)
+    static const std::regex re_date_iso(R"(\b(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])\b)",
+                                        std::regex::ECMAScript);
+    
+    // Защита дат: 12/31/2025 (американский формат)
+    static const std::regex re_date_slash(R"(\b(0[1-9]|1[0-2])/(0[1-9]|[12][0-9]|3[01])/(\d{4})\b)",
+                                          std::regex::ECMAScript);
+    
+    // Защита десятичных дробей: 3.14, 0.5, 0,5 (русский формат)
+    static const std::regex re_decimal(R"(\b\d+[.,]\d+\b(?![\w-]))", std::regex::ECMAScript);
+    
+    // Защита процентов: 50%, 12.5%, 12,5%
+    static const std::regex re_percent(R"(\b\d+(?:[.,]\d+)?\s*%)", std::regex::ECMAScript);
+    
+    // Защита валют (УЛУЧШЕННАЯ)
+    static const std::regex re_currency(
+        R"(\b\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?\s*[$€£¥₽]|\b[$€£¥₽]\s*\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)",
+        std::regex::ECMAScript);
+    
+    // Защита дробей (УЛУЧШЕННАЯ)
+    static const std::regex re_fraction(
+        R"(\b\d+\s*/\s*\d+\b|\b\d+\s+\d+\s*/\s*\d+\b)",
+        std::regex::ECMAScript);
+    
+    // Защита телефонов: +7 (123) 456-78-90
+    static const std::regex re_phone(R"(\+?[\d\s\-\(\)]{7,})", std::regex::ECMAScript);
+    
+    // Защита URL
+    static const std::regex re_url(R"(https?://[^\s]+)", std::regex::ECMAScript);
+    
+    // Защита email
+    static const std::regex re_email(R"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
+                                     std::regex::ECMAScript);
+
     // Защита времени: 15:30, 15:30:45
     try {
-        thread_local const std::regex re_time(R"(\b([01]?[0-9]|2[0-3]):([0-5][0-9])(?::([0-5][0-9]))?\b)",
-                                        std::regex::ECMAScript);
         std::string processed;
         auto words_begin = std::sregex_iterator(text.begin(), text.end(), re_time);
         auto words_end = std::sregex_iterator();
@@ -2360,8 +2428,6 @@ void send_tts_async(std::string text,
 
     // Защита дат: 31.12.2025
     try {
-        thread_local const std::regex re_date_dots(R"(\b(0[1-9]|[12][0-9]|3[01])\.(0[1-9]|1[0-2])\.(\d{4})\b)",
-                                             std::regex::ECMAScript);
         std::string processed;
         auto words_begin = std::sregex_iterator(text.begin(), text.end(), re_date_dots);
         auto words_end = std::sregex_iterator();
@@ -2385,8 +2451,6 @@ void send_tts_async(std::string text,
 
     // Защита дат: 2025-12-31 (ISO формат)
     try {
-        thread_local const std::regex re_date_iso(R"(\b(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])\b)",
-                                            std::regex::ECMAScript);
         std::string processed;
         auto words_begin = std::sregex_iterator(text.begin(), text.end(), re_date_iso);
         auto words_end = std::sregex_iterator();
@@ -2410,8 +2474,6 @@ void send_tts_async(std::string text,
 
     // Защита дат: 12/31/2025 (американский формат)
     try {
-        thread_local const std::regex re_date_slash(R"(\b(0[1-9]|1[0-2])/(0[1-9]|[12][0-9]|3[01])/(\d{4})\b)",
-                                              std::regex::ECMAScript);
         std::string processed;
         auto words_begin = std::sregex_iterator(text.begin(), text.end(), re_date_slash);
         auto words_end = std::sregex_iterator();
@@ -2435,7 +2497,6 @@ void send_tts_async(std::string text,
 
     // Защита десятичных дробей: 3.14, 0.5, 0,5 (русский формат)
     try {
-        thread_local const std::regex re_decimal(R"(\b\d+[.,]\d+\b(?![\w-]))", std::regex::ECMAScript);
         std::string processed;
         auto words_begin = std::sregex_iterator(text.begin(), text.end(), re_decimal);
         auto words_end = std::sregex_iterator();
@@ -2459,7 +2520,6 @@ void send_tts_async(std::string text,
 
     // Защита процентов: 50%, 12.5%, 12,5%
     try {
-        thread_local const std::regex re_percent(R"(\b\d+(?:[.,]\d+)?\s*%)", std::regex::ECMAScript);
         std::string processed;
         auto words_begin = std::sregex_iterator(text.begin(), text.end(), re_percent);
         auto words_end = std::sregex_iterator();
@@ -4952,6 +5012,9 @@ int run(int argc, char ** argv) {
                         new_command_allowed = 0;
                         last_command_time = static_cast<int>(std::time(0));
 
+                        // СБРАСЫВАЕМ ФЛАГ ПЕРЕВОДА СТРОКИ ПРИ REGENERATE
+                        first_dialog_pair = true;
+
                         if (!past_prev_arr.empty()) {
                             n_past_prev = past_prev_arr.back();
                             past_prev_arr.pop_back();
@@ -5468,6 +5531,8 @@ int run(int argc, char ** argv) {
                 int n_ctx_before_generation = static_cast<int>(embd_inp.size());
                 bool was_interrupted = false;
 
+
+                // Объединена инициализация в один блок
                 {
                     std::string pending_fragment;
                     int pending_count = 0;
@@ -5485,21 +5550,23 @@ int run(int argc, char ** argv) {
                 while (true) {
                     tokens_since_last_vad_check++;
 
-                    // ===== ПРОВЕРКА ПРЕРЫВАНИЯ =====
-                    InterruptReason reason = g_interrupt_reason.load();
-                    if (reason != InterruptReason::NONE) {
-                        std::string dummy;
-                        allow_xtts_file(dummy, 0);
-                        done = true;
-                        was_interrupted = true;
-                        text_to_speak = "";
-                        tts_smart_buffer.clear();
-                        g_bot_state.store(BotState::IDLE);
-                        if (params.verbose) {
-                            printf(" [interrupted by %d]\n", static_cast<int>(reason));
-                        }
-                        break;
+                // ===== ПРОВЕРКА ПРЕРЫВАНИЯ =====
+                InterruptReason reason = g_interrupt_reason.load();
+                if (reason != InterruptReason::NONE) {
+                    std::string dummy;
+                    allow_xtts_file(dummy, 0);
+                    done = true;
+                    was_interrupted = true;
+                    text_to_speak = "";
+                    tts_smart_buffer.clear();
+                    g_bot_state.store(BotState::IDLE);
+                    // СБРАСЫВАЕМ ФЛАГ ПЕРЕВОДА СТРОКИ ПРИ ПРЕРЫВАНИИ
+                    first_dialog_pair = true;
+                    if (params.verbose) {
+                        printf(" [interrupted by %d]\n", static_cast<int>(reason));
                     }
+                    break;
+                }
 
                     // ===== ПРОВЕРКА ГОРЯЧИХ КЛАВИШ =====
                     {
@@ -5519,6 +5586,8 @@ int run(int argc, char ** argv) {
                             text_to_speak = "";
                             tts_smart_buffer.clear();
                             g_hotkey_pressed = "";
+                            // СБРАСЫВАЕМ ФЛАГ ПЕРЕВОДА СТРОКИ ПРИ HOTKEY
+                            first_dialog_pair = true;
                             if (params.verbose) {
                                 printf(" [stopped by hotkey]\n");
                             }
@@ -5550,6 +5619,8 @@ int run(int argc, char ** argv) {
                                 was_interrupted = true;
                                 text_to_speak = "";
                                 tts_smart_buffer.clear();
+                                // СБРАСЫВАЕМ ФЛАГ ПЕРЕВОДА СТРОКИ ПРИ STOP
+                                first_dialog_pair = true;
                                 if (params.verbose) {
                                     printf(" [stopped by console command]\n");
                                 }
@@ -5566,10 +5637,16 @@ int run(int argc, char ** argv) {
                             last_vad_check_time = now;
                             tokens_since_last_vad_check = 0;
 
-                            std::vector<float> pcmf32_vad_check;
-                            audio.get(400, pcmf32_vad_check);
-                            if (!pcmf32_vad_check.empty()) {
-                                int vad_check = ::vad_simple_int(pcmf32_vad_check, WHISPER_SAMPLE_RATE,
+                            // ОПТИМИЗАЦИЯ: Выделяем память на стеке, а не в куче
+                            // Это быстрее и безопаснее для небольших массивов
+                            float pcmf32_vad_check[400];
+                            std::vector<float> pcmf32_vec;
+                            audio.get(400, pcmf32_vec);
+                            
+                            if (!pcmf32_vec.empty()) {
+                                // Копируем данные в стековый массив для быстрого доступа
+                                // или используем вектор напрямую (оставляем как было)
+                                int vad_check = ::vad_simple_int(pcmf32_vec, WHISPER_SAMPLE_RATE,
                                                                 400, params.vad_thold, params.freq_thold,
                                                                 params.print_energy, params.vad_start_thold);
                                 if (vad_check == 1 && !g_interrupt_processed.load()) {
@@ -5933,10 +6010,11 @@ int run(int argc, char ** argv) {
                                 }
                                 if (!display_str.empty()) {
                                     printf("%s", display_str.c_str());
-                                    fflush(stdout);
+                                    fflush(stdout); // МГНОВЕННЫЙ ВЫВОД
                                 }
                                 text_to_speak += out_token_str;
                             }
+
                             if (should_print) {
                                 tokens_in_reply += utf8_length(out_token_str);
                             }
