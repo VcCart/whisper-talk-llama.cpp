@@ -16,6 +16,7 @@
 ## Новости
 - [2025.11.27] Собственные доработки, которых очень много.
 - [2025.11.01] Все изменения из https://github.com/Mozer/talk-llama-fast/
+Stable: [v1.9.2](https://github.com/ggml-org/whisper.cpp/releases/tag/v1.9.2) / [Roadmap](https://github.com/orgs/ggml-org/projects/4/)
 
 
 ## Заметки
