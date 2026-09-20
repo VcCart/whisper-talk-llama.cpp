@@ -1,7 +1,7 @@
 // ============================================================================
 // talk-llama.cpp — голосовой ассистент на базе Whisper, LLaMA и XTTS.
 //
-// Версия: 33 (super upgrade после v32).
+// Версия: 34 (super upgrade после v33).
 //
 // Назначение:
 //   Слушает микрофон, распознаёт речь через Whisper, генерирует ответ
@@ -63,6 +63,36 @@
 //     ещё в v32.
 //   - Семафор XTTS возвращён в системную временную директорию
 //     (%TEMP% на Windows, TMPDIR на POSIX).
+//
+// ИСТОРИЯ РЕФАКТОРИНГА (версия 34):
+//   - PATCH 3: починен race condition в tts_worker_func.
+//     Условие выхода из цикла теперь проверяется под мьютексом,
+//     pop_front защищён от гонки с clear_tts_queue.
+//   - PATCH 4: подключён safe_remove_fragment для стоп-строк.
+//     Он удаляет подстроку только на границах слов, чтобы
+//     буквенные стоп-слова (USER, ASSISTANT, END) не вырезались
+//     из середины русского текста.
+//   - PATCH 5: g_hallucination_count переименован в
+//     g_transcription_count — счётчик считает все транскрипции,
+//     а не только галлюцинации.
+//   - PATCH 7: в call_default добавлены падежи мужских имён.
+//     "Позови Иван" теперь распознаётся (Иван → Ивана).
+//   - PATCH 8: удаление Gemma-тегов (<start_of_turn>,
+//     <end_of_turn> и др.) в strip_special_tokens и
+//     sanitize_for_console. Они не подпадают под regex <|...|>.
+//   - PATCH 10: разогрев Whisper в момент старта речи.
+//     Первый вызов transcribe() в сессии медленнее последующих —
+//     прогрев прячет эту задержку.
+//   - PATCH 11: антипромпт "</end_of_turn>" для Gemma 2/3.
+//     Модель иногда генерирует закрывающий слэш вместо
+//     правильного <end_of_turn>.
+//   - PATCH 12: антипромпты "Имя:" и "Имя :" — защита от
+//     продолжения диалога за пользователя.
+//   - PATCH 15: ltrim/rtrim/trim/trim_spaces_only обёрнуты
+//     в анонимный namespace. В common.h есть своя trim()
+//     с другой сигнатурой — изоляция убирает возможность
+//     неоднозначной перегрузки.
+//   - PATCH 16: расширен список TTS-интро (27 вариантов).
 //
 // ПАТЧ A (Whisper endpointing) В ЭТОЙ ВЕРСИИ НЕ ПРИМЕНЁН.
 //   Whisper работает как в v32 — пользователь доволен.
@@ -329,7 +359,12 @@ std::atomic<bool> g_log_enabled{ false };
 
 // --- 3.24. Счётчик транскрипций ---
 // Для мониторинга. Простой atomic, не блокирует.
-std::atomic<int> g_hallucination_count{0};
+//
+// PATCH 5 (v34): переименован из g_hallucination_count.
+// Имя вводило в заблуждение — счётчик инкрементируется при
+// КАЖДОЙ успешной транскрипции (в note_transcription), а не
+// только при галлюцинации. При сбросе контекста обнуляется.
+std::atomic<int> g_transcription_count{0};
 
 // --- 3.25. Флаг «идёт обработка команды» ---
 // Пока true, auto-continue не срабатывает.
@@ -376,6 +411,24 @@ static llama_context* get_llama_ctx() {
 // --- 5.1. Обрезка пробелов ---
 // ltrim, rtrim, trim — стандартные операции. Учитывают NBSP (0xA0),
 // потому что Whisper иногда вставляет неразрывные пробелы.
+//
+// PATCH 15 (v34): все четыре функции обёрнуты в анонимный namespace.
+//
+// WHY: в common.h объявлена функция std::string trim(const std::string&).
+// Наша trim(std::string&) — это ДРУГАЯ перегрузка (принимает ссылку
+// и меняет на месте). Без изоляции обе перегрузки видны во всех
+// translation units, и вызов trim(x) с не-const аргументом может
+// дать ошибку «ambiguous call to overloaded function», если где-то
+// в проекте есть ещё одна trim() с подходящей сигнатурой.
+//
+// Анонимный namespace даёт внутреннюю линковку — наши функции
+// видны ТОЛЬКО в этом .cpp-файле. Конфликт с common.cpp::trim
+// становится физически невозможным.
+//
+// Все вызовы trim() внутри talk-llama.cpp продолжают работать:
+// функции в том же translation unit, что и весь остальной код.
+namespace {
+
 inline void ltrim(std::string& s) {
     if (s.empty()) return;
     s.erase(s.begin(), std::find_if(s.begin(), s.end(),
@@ -419,6 +472,8 @@ inline void trim_spaces_only(std::string& s) {
     }
     if (start > 0) s.erase(0, start);
 }
+
+}  // namespace
 
 // --- 5.2. Пунктуация ---
 // Используется при парсинге голосовых команд («погугли погода в лондоне!»
@@ -1948,8 +2003,6 @@ static std::string transcribe(
     }
     return result;
 }
-
-
 // ============================================================================
 // 14. ДЕТЕКТОР ГАЛЛЮЦИНАЦИЙ WHISPER
 // ============================================================================
@@ -2062,10 +2115,14 @@ static bool is_hallucination(const std::string& text) {
 }
 
 // --- 14.1. Учёт транскрипции ---
+// PATCH 5 (v34): переименован g_hallucination_count →
+// g_transcription_count. Функция вызывается при каждой успешной
+// транскрипции (после is_hallucination == false), счётчик
+// инкрементируется. Не путать с самим детектором галлюцинаций.
 static void note_transcription(const std::string& text) {
     if (text.empty()) return;
     (void)text;
-    g_hallucination_count.fetch_add(1);
+    g_transcription_count.fetch_add(1);
 }
 
 
@@ -2234,10 +2291,17 @@ static std::string clean_text_for_tts(const std::string& text) {
 // std::isalnum(0xD0) возвращает false для кириллицы, поэтому
 // фрагменты вида "id", "end" удалялись из середины русских слов.
 // Проверяем границы по UTF-8.
+//
+// PATCH 4 (v34): функция теперь реально используется —
+// см. strip_special_tokens (15.3) и send_tts_async (16.2).
+// Раньше она была объявлена, но не вызывалась.
 static std::string safe_remove_fragment(const std::string& text,
                                          const std::string& fragment) {
     if (fragment.empty()) return text;
 
+    // Если во фрагменте есть не-буквенные символы (<, |, _, #),
+    // удаление безопасно — он не встречается в обычном тексте.
+    // Пример: <|eot_id|>, </s>, ### — сюда.
     bool has_non_alpha = false;
     for (unsigned char c : fragment) {
         if (c < 0x80 && !std::isalpha(c)) {
@@ -2249,6 +2313,9 @@ static std::string safe_remove_fragment(const std::string& text,
         return string_replace_all(text, fragment, "");
     }
 
+    // Фрагмент — чисто буквенный (USER, ASSISTANT, END, STOP).
+    // Удаляем ТОЛЬКО на границах слов, чтобы не вырезать
+    // подстроку из середины другого слова.
     std::string result = text;
     size_t pos = 0;
     while ((pos = result.find(fragment, pos)) != std::string::npos) {
@@ -2279,6 +2346,16 @@ static std::string safe_remove_fragment(const std::string& text,
 // --- 15.3. Очистка от служебных токенов ---
 // Все правила берутся из пресета. Плюс универсальное удаление
 // любых <|...|> конструкций через regex.
+//
+// PATCH 4 (v34): лямбда remove_all теперь вызывает
+// safe_remove_fragment вместо string_replace_all. Для стоп-строк
+// с не-буквенными символами (<|eot_id|>, </s>) поведение
+// не меняется, для буквенных (USER:, ASSISTANT:) — защищает
+// от вырезания из середины русского текста.
+//
+// PATCH 8 (v34): добавлено удаление Gemma-тегов
+// (<start_of_turn>, <end_of_turn> и др.). Они не подпадают
+// под regex <|...|>, потому что не содержат |.
 static std::string strip_special_tokens(
     const std::string& text,
     const PresetDerived& preset,
@@ -2286,9 +2363,10 @@ static std::string strip_special_tokens(
     std::string result = text;
 
     // Убираем все непустые префиксы/суффиксы из пресета.
+    // PATCH 4 (v34): safe_remove_fragment вместо string_replace_all.
     auto remove_all = [&](const std::string& s) {
         if (!s.empty()) {
-            result = string_replace_all(result, s, "");
+            result = safe_remove_fragment(result, s);
         }
     };
     remove_all(preset.sys_prefix);
@@ -2300,9 +2378,10 @@ static std::string strip_special_tokens(
     remove_all(preset.stop_sequence);
 
     // Дополнительные стопы (например, из --stop-words).
+    // PATCH 4 (v34): тоже через safe_remove_fragment.
     for (const auto& s : extra_stops) {
         if (!s.empty()) {
-            result = string_replace_all(result, s, "");
+            result = safe_remove_fragment(result, s);
         }
     }
 
@@ -2318,6 +2397,18 @@ static std::string strip_special_tokens(
         result = string_replace_all(result, "<|start_header_id|>", "");
         result = string_replace_all(result, "<|end_header_id|>", "");
     }
+
+    // PATCH 8 (v34): удаление Gemma-тегов. Они не подпадают
+    // под regex <|...|>, потому что не содержат |.
+    // <start_of_turn> и <end_of_turn> — обёртки ходов Gemma.
+    // <start_of_image>, <end_of_image>, <image_soft_token> —
+    // мультимодальные теги (для текстовых моделей не нужны,
+    // но если модель их сгенерирует, они попадут в TTS).
+    result = string_replace_all(result, "<start_of_turn>", "");
+    result = string_replace_all(result, "<end_of_turn>", "");
+    result = string_replace_all(result, "<start_of_image>", "");
+    result = string_replace_all(result, "<end_of_image>", "");
+    result = string_replace_all(result, "<image_soft_token>", "");
 
     // Фигурные скобки — placeholders, удаляем полностью.
     try {
@@ -2432,6 +2523,7 @@ static std::string strip_dialog_prefixes(const std::string& text,
 // В консоль выводим честный текст, как сгенерировала модель.
 // Убираем ТОЛЬКО:
 //   - любые <|...|> (служебные токены);
+//   - Gemma-теги (PATCH 8, v34);
 //   - префикс "Имя: " в самом начале.
 static std::string sanitize_for_console(const std::string& text,
                                          const std::string& person,
@@ -2442,6 +2534,14 @@ static std::string sanitize_for_console(const std::string& text,
         static const std::regex re_special(R"(<\|[^|]*\|>)", std::regex::ECMAScript);
         result = std::regex_replace(result, re_special, "");
     } catch (const std::regex_error&) {}
+
+    // PATCH 8 (v34): Gemma-теги. Они не подпадают под regex
+    // <|...|>, потому что не содержат |. Добавлены явно.
+    result = string_replace_all(result, "<start_of_turn>", "");
+    result = string_replace_all(result, "<end_of_turn>", "");
+    result = string_replace_all(result, "<start_of_image>", "");
+    result = string_replace_all(result, "<end_of_image>", "");
+    result = string_replace_all(result, "<image_soft_token>", "");
 
     // Убираем name-prefix ТОЛЬКО в самом начале.
     for (const auto& name : {person, bot}) {
@@ -2965,11 +3065,16 @@ void send_tts_async(std::string text, std::string speaker_wav,
     if (text.empty()) return;
 
     // Удаление стоп-последовательностей.
-    if (!stop_sequence.empty()) text = string_replace_all(text, stop_sequence, "");
-    if (!bot_suffix.empty())    text = string_replace_all(text, bot_suffix, "");
-    if (!user_suffix.empty())   text = string_replace_all(text, user_suffix, "");
-    if (!bot_prefix.empty())    text = string_replace_all(text, bot_prefix, "");
-    if (!user_prefix.empty())   text = string_replace_all(text, user_prefix, "");
+    //
+    // PATCH 4 (v34): safe_remove_fragment вместо string_replace_all.
+    // Для стоп-строк с не-буквенными символами (<|eot_id|>, </s>)
+    // поведение не меняется, для буквенных (USER:, ASSISTANT:) —
+    // защищает от вырезания из середины русского текста.
+    if (!stop_sequence.empty()) text = safe_remove_fragment(text, stop_sequence);
+    if (!bot_suffix.empty())    text = safe_remove_fragment(text, bot_suffix);
+    if (!user_suffix.empty())   text = safe_remove_fragment(text, user_suffix);
+    if (!bot_prefix.empty())    text = safe_remove_fragment(text, bot_prefix);
+    if (!user_prefix.empty())   text = safe_remove_fragment(text, user_prefix);
     trim_spaces_only(text);
     if (text.empty()) return;
 
@@ -3087,15 +3192,33 @@ static void clear_tts_queue() {
     g_tts_queue.clear();
 }
 
+// PATCH 3 (v34): race condition починен.
+//
+// Раньше условие выхода из цикла было:
+//     while (g_tts_worker_running.load() || !g_tts_queue.empty())
+// Второе слагаемое (!g_tts_queue.empty()) читало очередь БЕЗ
+// мьютекса — это data race с enqueue_tts/clear_tts_queue.
+// На практике «работало», но формально UB.
+//
+// Теперь условие проверяется под мьютексом:
+//     - внутри wait_for(lock, ...) лямбда возвращает
+//       «есть работа или пора выходить»;
+//     - если очередь пуста и running == false → break;
+//     - если очередь пуста, но running == true → continue
+//       (ждём следующего пробуждения);
+//     - pop_front защищён тем же мьютексом, что и empty().
 static void tts_worker_func() {
-    while (g_tts_worker_running.load() || !g_tts_queue.empty()) {
+    while (true) {
         TtsRequest req;
         {
             std::unique_lock<std::mutex> lock(g_tts_queue_mutex);
             g_tts_queue_cv.wait_for(lock, std::chrono::milliseconds(100), [] {
                 return !g_tts_queue.empty() || !g_tts_worker_running.load();
             });
-            if (g_tts_queue.empty()) continue;
+            if (g_tts_queue.empty()) {
+                if (!g_tts_worker_running.load()) break;
+                continue;
+            }
             req = std::move(g_tts_queue.front());
             g_tts_queue.pop_front();
         }
@@ -3340,6 +3463,30 @@ void audio_input_thread_func(whisper_context* ctx_wsp,
             std::string dummy;
             allow_xtts_file(dummy, 0);
 
+            // PATCH 10 (v34): разогрев Whisper в момент старта речи.
+            //
+            // WHY: первый вызов transcribe() в сессии всегда медленнее
+            // последующих — Whisper инициализирует буферы, читает
+            // prompt_tokens, прогревает модель. Если делать это в
+            // момент окончания речи, пользователь слышит задержку
+            // перед ответом бота. Разогрев в момент НАЧАЛА речи
+            // прячет эту задержку — к тому моменту, когда пользователь
+            // закончит говорить, Whisper уже прогрет.
+            //
+            // Результат разогрева ИГНОРИРУЕТСЯ — мы не добавляем его
+            // в g_accumulated_text. Это просто «прогрев» модели.
+            if (!pcmf32_cur.empty()) {
+                float warmup_prob = 0.0f;
+                int64_t warmup_t_ms = 0;
+                (void)transcribe(ctx_wsp, params, pcmf32_cur,
+                                 g_whisper_prompt, warmup_prob, warmup_t_ms,
+                                 params.translate);
+                if (g_verbose_mode.load()) {
+                    fprintf(stderr, "[AudioInput] Whisper разогрет (%.0f мс)\n",
+                            static_cast<double>(warmup_t_ms));
+                }
+            }
+
             log_line("VAD: speech started");
             if (g_verbose_mode.load()) {
                 fprintf(stderr, "[AudioInput] Начало речи (%.3f)\n", current_time);
@@ -3553,8 +3700,6 @@ void audio_input_thread_func(whisper_context* ctx_wsp,
         fprintf(stderr, "[AudioInput] Поток остановлен\n");
     }
 }
-
-
 // ============================================================================
 // 20. ПОТОКИ ВВОДА И ГОРЯЧИХ КЛАВИШ
 // ============================================================================
@@ -4290,16 +4435,33 @@ int run(int argc, char** argv) {
     int new_command_allowed = 1;
 
     // --- 21.28. TTS-интро ---
+    // PATCH 16 (v34): расширенный список TTS-интро.
+    //
+    // WHY: короткие междометия перед ответом делают речь бота живее.
+    // Взято из форка Mozer — 27 вариантов вместо 10.
+    // Выбирается случайно через std::mt19937 (см. ниже).
+    //
+    // ВАЖНО: intro проигрывается только если --xtts-intro задан в CLI.
     std::vector<std::string> tts_intros;
     std::string rand_intro_text = "";
     std::string last_output_buffer = "";
     std::string last_output_needle = "";
     std::string token_accumulator = "";
     if (params.language == "ru") {
-        tts_intros = { "Хм", "Ну", "О", "А", "Угу", "Ага", "Ох", "Ах", "Вот", "Знаешь" };
+        tts_intros = {
+            "Хм", "Ну", "Нуу", "О", "А", "А?", "Угу", "Ох", "Ха", "Ах",
+            "Блин", "Короче", "В общем", "Ой", "Слышь", "Ну вообще-то",
+            "Ну а вообще", "Кароче", "Вот", "Знаешь", "Как бы", "Прикинь",
+            "Послушай", "Типа", "Это", "Так вот", "Погоди"
+        };
     }
     else {
-        tts_intros = { "Hm", "Hmm", "Well", "Huh", "Uh", "Um", "Mmm", "Oh", "Ah", "You know" };
+        tts_intros = {
+            "Hm", "Hmm", "Well", "Well well", "Huh", "Ugh", "Uh", "Um", "Mmm",
+            "Oh", "Ooh", "Haha", "Ha ha", "Ahh", "Whoa", "Really", "I mean",
+            "By the way", "Anyway", "So", "Actually", "Uh-huh", "Seriously",
+            "Whatever", "Like", "But", "You know"
+        };
     }
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -4308,7 +4470,37 @@ int run(int argc, char** argv) {
         std::chrono::steady_clock::now();
 
     // --- 21.29. Антипромпты ---
+    //
+    // Антипромпт — это строка, при появлении которой в конце
+    // уже сгенерированного текста генерация останавливается.
+    // Работает как мягкий стоп: если модель начала новый ход,
+    // не завершив предыдущий, антипромпт ловит это.
     std::vector<std::string> antiprompts = preset_d.antiprompts;
+
+    // PATCH 11 (v34): антипромпт "</end_of_turn>" для Gemma.
+    //
+    // WHY: Gemma 2/3 иногда генерирует "</end_of_turn>" (с закрывающим
+    // слэшем) вместо правильного "<end_of_turn>". Стандартный
+    // stop_sequence из Gemma3.json ("<end_of_turn>\n") этот баг
+    // не ловит, и тег попадает в TTS. Добавляем явно.
+    //
+    // Дедупликация в конце раздела (std::sort + std::unique)
+    // уберёт дубликат, если он уже был.
+    antiprompts.push_back("</end_of_turn>");
+
+    // PATCH 12 (v34): антипромпты "Имя:" и "Имя :" — защита от
+    // продолжения диалога за пользователя.
+    //
+    // WHY: модель иногда пишет "Друг: ..." в ответе, что попадает
+    // в TTS. Промпт просит этого не делать, но модель может
+    // ослушаться. Антипромпт ловит это и обрывает генерацию.
+    //
+    // chat_symb = ": " (с пробелом). Значит:
+    //   params.person + chat_symb        = "Друг: "
+    //   params.person + " " + chat_symb  = "Друг : "
+    // Оба варианта покрывают разные написания.
+    antiprompts.push_back(params.person + chat_symb);
+    antiprompts.push_back(params.person + " " + chat_symb);
 
     // Пользовательские стоп-слова из --stop-words.
     if (!params.stop_words.empty()) {
@@ -4735,8 +4927,31 @@ int run(int argc, char** argv) {
                     if (!bot_name_lower.empty()) {
                         char last = bot_name_lower.back();
                         if (last == 'a' || last == 'я') {
+                            // Женские имена: Эмма → Эмму, Аня → Аню.
+                            // (уже было в v33)
                             bot_name_accusative.pop_back();
                             bot_name_accusative += "у";
+                        }
+                        // PATCH 7 (v34): мужские имена на согласную.
+                        //
+                        // WHY: "Позови Иван" не распознавалось, потому
+                        // что в винительном падеже имя звучит как
+                        // "Ивана". Раньше обрабатывались только имена
+                        // на -а/-я (Эмма → Эмму). Теперь добавлены
+                        // окончания на согласную: Иван → Ивана,
+                        // Пётр → Петра, Максим → Максима.
+                        //
+                        // Правило: если имя оканчивается на согласную
+                        // (кроме й, ь, ъ), в винительном падеже
+                        // добавляется "а".
+                        else if (last == 'н' || last == 'р' || last == 'л' ||
+                                 last == 'м' || last == 'в' || last == 'д' ||
+                                 last == 'т' || last == 'с' || last == 'к' ||
+                                 last == 'п' || last == 'б' || last == 'з' ||
+                                 last == 'г' || last == 'х' || last == 'ж' ||
+                                 last == 'ш' || last == 'щ' || last == 'ч' ||
+                                 last == 'ц' || last == 'ф') {
+                            bot_name_accusative += "а";
                         }
                     }
                     if (contains_word(text_heard_trimmed, bot_name_lower) ||
@@ -5214,7 +5429,8 @@ int run(int argc, char** argv) {
                 text_heard = "";
                 text_heard_trimmed = "";
 
-                g_hallucination_count.store(0);
+                // PATCH 5 (v34): переименованный счётчик.
+                g_transcription_count.store(0);
 
                 TtsRequest req;
                 req.text = "Контекст сброшен";

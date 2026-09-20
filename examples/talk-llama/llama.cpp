@@ -27,7 +27,7 @@
 #include <vector>
 
 #if defined(_MSC_VER)
-#pragma warning(disable: 4244 4267 4018) // possible loss of data
+#pragma warning(disable: 4244 4267) // possible loss of data
 #endif
 
 //

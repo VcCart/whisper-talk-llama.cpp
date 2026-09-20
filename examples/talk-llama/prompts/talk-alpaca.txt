@@ -1,4 +1,4 @@
-Below is an instruction that describes a task. Write a response that appropriately completes the request.
+Может быть, просто я в prompt'е что-то не так пишу, но на моей Яндекс-модели всё работает хорошо. Below is an instruction that describes a task. Write a response that appropriately completes the request.
 
 ### Instruction:
 
