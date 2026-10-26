@@ -20,32 +20,19 @@ set(TARGET common)
 
 unset(COMMON_EXTRA_LIBS)
 
-if (WHISPER_COMMON_FFMPEG)
-    # As of cmake 3.27, there is no official cmake support for FindFFmpeg.
-    # Consequnelty we added a FindFFmpeg.cmake script the cmake subfolder:
-    # whisper.cpp does not need the full ffmpeg libs, just AVFORMAT AVCODEC AVUTIL SWRESAMPLE
-    # libswresample  performs highly optimized audio resampling, rematrixing and sample format conversion operations
-    # libavcodec provides a generic encoding/decoding framework and contains multiple decoders and encoders for audio, video and subtitle streams, and several bitstream filters.
-    # libavformat provides a generic framework for multiplexing and demultiplexing (muxing and demuxing) audio, video and subtitle streams.
-    find_package(FFmpeg REQUIRED)
-
-    if (NOT ${FFMPEG_FOUND})
-        message(FATAL_ERROR "Cannot find ffmpeg libs/headers")
-    endif()
-
-    message(STATUS "Found ffmpeg libs:       ${FFMPEG_LIBRARIES}")
-    message(STATUS "Found ffmpeg headers in: ${FFMPEG_INCLUDE_DIRS}")
-    message(STATUS "ffmpeg definitions:      ${FFMPEG_DEFINITIONS}")
-    message(STATUS "Found avformat           ${AVFORMAT_VERSION}")
-
-    include_directories(${FFMPEG_INCLUDE_DIRS})
-    add_compile_definitions(WHISPER_COMMON_FFMPEG)
-
-    list(APPEND COMMON_EXTRA_LIBS ${FFMPEG_LIBRARIES})
-
-    set(COMMON_SOURCES_FFMPEG ffmpeg-transcode.cpp)
-endif()
-
+# WHY: WHISPER_COMMON_FFMPEG is OFF by default and ffmpeg-transcode.cpp
+#      has been removed from this project. Left commented out in case
+#      FFmpeg support is ever re-enabled.
+# if (WHISPER_COMMON_FFMPEG)
+#     find_package(FFmpeg REQUIRED)
+#     if (NOT ${FFMPEG_FOUND})
+#         message(FATAL_ERROR "Cannot find ffmpeg libs/headers")
+#     endif()
+#     include_directories(${FFMPEG_INCLUDE_DIRS})
+#     add_compile_definitions(WHISPER_COMMON_FFMPEG)
+#     list(APPEND COMMON_EXTRA_LIBS ${FFMPEG_LIBRARIES})
+#     set(COMMON_SOURCES_FFMPEG ffmpeg-transcode.cpp)
+# endif()
 
 add_library(${TARGET} STATIC
     common.h
@@ -56,7 +43,6 @@ add_library(${TARGET} STATIC
     common-whisper.cpp
     grammar-parser.h
     grammar-parser.cpp
-    ${COMMON_SOURCES_FFMPEG}
     )
 
 include(DefaultTargetOptions)
@@ -93,35 +79,13 @@ target_include_directories(json_cpp INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
-if (EMSCRIPTEN)
-    add_subdirectory(whisper.wasm)
-    add_subdirectory(stream.wasm)
-    add_subdirectory(command.wasm)
-    add_subdirectory(bench.wasm)
-    add_subdirectory(wchess)
-elseif(CMAKE_JS_VERSION)
-    add_subdirectory(addon.node)
-else()
-    add_subdirectory(cli)
-    add_subdirectory(bench)
-    add_subdirectory(server)
-    add_subdirectory(quantize)
-    add_subdirectory(vad-speech-segments)
-    add_subdirectory(parakeet-cli)
-    add_subdirectory(parakeet-quantize)
-    if (WHISPER_SDL2)
-        add_subdirectory(stream)
-        add_subdirectory(command)
-        add_subdirectory(talk-llama)
-        add_subdirectory(lsp)
-        if (GGML_SYCL)
-            add_subdirectory(sycl)
-        endif()
-    endif (WHISPER_SDL2)
-
-    add_subdirectory(deprecation-warning)
-endif()
-
+# WHY: Only talk-llama is built in this project. The whisper.wasm,
+#      command.wasm and addon.node subdirectories do not exist here,
+#      so the EMSCRIPTEN / CMAKE_JS_VERSION branches are removed to
+#      avoid accidental "directory not found" errors.
 if (WHISPER_SDL2)
-    add_subdirectory(wchess)
-endif (WHISPER_SDL2)
+    add_subdirectory(talk-llama)
+    if (GGML_SYCL)
+        add_subdirectory(sycl)
+    endif()
+endif()

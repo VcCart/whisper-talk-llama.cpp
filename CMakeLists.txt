@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5) # for add_link_options and implicit target directories.
+cmake_minimum_required(VERSION 3.10) # for add_link_options and implicit target directories.
 project("whisper.cpp" C CXX)
 project("whisper.cpp" VERSION 1.9.2)
 include(CheckIncludeFileCXX)
@@ -18,6 +18,14 @@ endif()
 # Add path to modules
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
 
+# WHY: SDL2 lives locally in ${CMAKE_SOURCE_DIR}/SDL2/cmake/sdl2-config.cmake.
+#      Without SDL2_DIR, find_package(SDL2) cannot locate the config file.
+#      Setting the default path avoids passing -DSDL2_DIR every time.
+#      Can be overridden via -DSDL2_DIR=... at configure time.
+if (NOT DEFINED SDL2_DIR)
+    set(SDL2_DIR "${CMAKE_SOURCE_DIR}/SDL2/cmake" CACHE PATH "SDL2 config directory")
+endif()
+
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
@@ -26,8 +34,10 @@ if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 
     include(git-vars)
 
-    # configure project version
-    configure_file(${CMAKE_SOURCE_DIR}/bindings/javascript/package-tmpl.json ${CMAKE_SOURCE_DIR}/bindings/javascript/package.json @ONLY)
+    # WHY: bindings/ folder has been removed. The previous
+    #      configure_file() call generated bindings/javascript/package.json
+    #      which is no longer needed.
+    # configure_file(${CMAKE_SOURCE_DIR}/bindings/javascript/package-tmpl.json ${CMAKE_SOURCE_DIR}/bindings/javascript/package.json @ONLY)
 else()
     set(WHISPER_STANDALONE OFF)
 endif()
@@ -77,9 +87,10 @@ option(WHISPER_SANITIZE_ADDRESS   "whisper: enable address sanitizer"   OFF)
 option(WHISPER_SANITIZE_UNDEFINED "whisper: enable undefined sanitizer" OFF)
 
 # extra artifacts
-option(WHISPER_BUILD_TESTS    "whisper: build tests"          ${WHISPER_STANDALONE})
+# WHY: Only the talk-llama example is built. Tests and server are not used.
+option(WHISPER_BUILD_TESTS    "whisper: build tests"          OFF)
 option(WHISPER_BUILD_EXAMPLES "whisper: build examples"       ${WHISPER_STANDALONE})
-option(WHISPER_BUILD_SERVER   "whisper: build server example" ${WHISPER_STANDALONE})
+option(WHISPER_BUILD_SERVER   "whisper: build server example" OFF)
 
 # 3rd party libs
 option(WHISPER_CURL "whisper: use libcurl to download model from an URL" OFF)
@@ -125,7 +136,7 @@ whisper_option_depr(WARNING     WHISPER_CCACHE              GGML_CCACHE)
 whisper_option_depr(WARNING     WHISPER_FFMPEG              WHISPER_COMMON_FFMPEG)
 
 if (GGML_CUDA AND NOT MSVC)
-    #GGML_CUDA enabled, add the necessary compile options -Wno-deprecated-gpu-targets
+    # GGML_CUDA enabled, add the necessary compile options -Wno-deprecated-gpu-targets
     add_compile_options(-Wno-deprecated-gpu-targets)
 endif()
 
@@ -188,13 +199,6 @@ target_compile_definitions(whisper PRIVATE
     WHISPER_VERSION="${PROJECT_VERSION}"
 )
 
-set_target_properties(parakeet PROPERTIES PUBLIC_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/include/parakeet.h)
-install(TARGETS parakeet LIBRARY PUBLIC_HEADER)
-
-target_compile_definitions(parakeet PRIVATE
-    PARAKEET_VERSION="${PROJECT_VERSION}"
-)
-
 configure_package_config_file(
         ${CMAKE_CURRENT_SOURCE_DIR}/cmake/whisper-config.cmake.in
         ${CMAKE_CURRENT_BINARY_DIR}/whisper-config.cmake
@@ -220,43 +224,14 @@ configure_file(cmake/whisper.pc.in
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/whisper.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 
-set(PARAKEET_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR} CACHE PATH "Location of header  files")
-set(PARAKEET_LIB_INSTALL_DIR     ${CMAKE_INSTALL_LIBDIR}     CACHE PATH "Location of library files")
-set(PARAKEET_BIN_INSTALL_DIR     ${CMAKE_INSTALL_BINDIR}     CACHE PATH "Location of binary  files")
-
-configure_package_config_file(
-        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/parakeet-config.cmake.in
-        ${CMAKE_CURRENT_BINARY_DIR}/parakeet-config.cmake
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/parakeet
-    PATH_VARS
-    PARAKEET_INCLUDE_INSTALL_DIR
-    PARAKEET_LIB_INSTALL_DIR
-    PARAKEET_BIN_INSTALL_DIR)
-
-write_basic_package_version_file(
-    ${CMAKE_CURRENT_BINARY_DIR}/parakeet-version.cmake
-    VERSION ${WHISPER_INSTALL_VERSION}
-    COMPATIBILITY SameMajorVersion)
-
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/parakeet-config.cmake
-              ${CMAKE_CURRENT_BINARY_DIR}/parakeet-version.cmake
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/parakeet)
-
-configure_file(cmake/parakeet.pc.in
-        "${CMAKE_CURRENT_BINARY_DIR}/parakeet.pc"
-        @ONLY)
-
-install(FILES "${CMAKE_CURRENT_BINARY_DIR}/parakeet.pc"
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+# WHY: Parakeet support is not used in this project.
+# set(PARAKEET_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR} CACHE PATH "Location of header  files")
+# set(PARAKEET_LIB_INSTALL_DIR     ${CMAKE_INSTALL_LIBDIR}     CACHE PATH "Location of library files")
+# set(PARAKEET_BIN_INSTALL_DIR     ${CMAKE_INSTALL_BINDIR}     CACHE PATH "Location of binary  files")
 
 #
 # programs, examples and tests
 #
-
-if (WHISPER_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
-    include(CTest)
-    add_subdirectory(tests)
-endif ()
 
 if (WHISPER_BUILD_EXAMPLES)
     add_subdirectory(examples)
@@ -280,18 +255,12 @@ if (MSVC)
     endfunction()
 
     if (WHISPER_BUILD_EXAMPLES)
+        # WHY: Only the targets that are actually built in this project.
+        #      lsp, wchess-core, whisper-command, whisper-cli,
+        #      whisper-server, whisper-stream are not built here.
         disable_msvc_warnings(whisper)
         disable_msvc_warnings(common)
         disable_msvc_warnings(common-sdl)
-        disable_msvc_warnings(lsp)
-        disable_msvc_warnings(wchess-core)
-        disable_msvc_warnings(whisper-command)
-        disable_msvc_warnings(whisper-cli)
-        disable_msvc_warnings(whisper-server)
-        disable_msvc_warnings(whisper-stream)
         disable_msvc_warnings(whisper-talk-llama)
-        disable_msvc_warnings(whisper-bench)
-        disable_msvc_warnings(quantize)
-        disable_msvc_warnings(vad-speech-segments)
     endif()
 endif()
