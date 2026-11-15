@@ -3,7 +3,7 @@ if (WHISPER_SDL2)
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
     # --- llama.cpp version ---
-    # WHY: нужно до configure_file(llama-version.h.in).
+    # WHY: РЅСѓР¶РЅРѕ РґРѕ configure_file(llama-version.h.in).
     set(LLAMA_VERSION_MAJOR 0)
     set(LLAMA_VERSION_MINOR 7)
     set(LLAMA_VERSION_PATCH 0)
@@ -11,17 +11,17 @@ if (WHISPER_SDL2)
     set(LLAMA_VERSION "${LLAMA_VERSION_BASE}-dev")
     set(LLAMA_BUILD_COMMIT "unknown")
 
-    # WHY: llama.cpp включает "llama-version.h" (генерируется из .in).
-    #      Без этого файла падают llama.cpp, llama-model.cpp, llama-context.cpp,
-    #      llama-vocab.cpp и ещё ~15 файлов.
+    # WHY: llama.cpp РІРєР»СЋС‡Р°РµС‚ "llama-version.h" (РіРµРЅРµСЂРёСЂСѓРµС‚СЃВ¤ РёР· .in).
+    #      Р…РµР· СЌС‚РѕРіРѕ С„Р°Р№Р»Р° РїР°РґР°СЋС‚ llama.cpp, llama-model.cpp, llama-context.cpp,
+    #      llama-vocab.cpp Рё РµС‰Р„ ~15 С„Р°Р№Р»РѕРІ.
     configure_file(
         ${CMAKE_CURRENT_SOURCE_DIR}/llama-version.h.in
         ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h
         @ONLY
     )
 
-    # WHY: file(GLOB ...) только для моделей. Для llama-kv-cache-* и
-    #      llama-memory-* используем явный список (иначе дубликаты).
+    # WHY: file(GLOB ...) С‚РѕР»СЊРєРѕ РґР»В¤ РјРѕРґРµР»РµР№. Ж’Р»В¤ llama-kv-cache-* Рё
+    #      llama-memory-* РёСЃРїРѕР»СЊР·СѓРµРј В¤РІРЅС‹Р№ СЃРїРёСЃРѕРє (РёРЅР°С‡Рµ РґСѓР±Р»РёРєР°С‚С‹).
     file(GLOB SRC_MODELS models/*.cpp)
 
     set(TARGET whisper-talk-llama)
@@ -77,8 +77,8 @@ if (WHISPER_SDL2)
         ${SRC_MODELS}
     )
 
-    # WHY: ${CMAKE_CURRENT_BINARY_DIR} обязателен — там лежит
-    #      сгенерированный llama-version.h.
+    # WHY: ${CMAKE_CURRENT_BINARY_DIR}
+    #      СЃРіРµРЅРµСЂРёСЂРѕРІР°РЅРЅС‹Р№ llama-version.h.
     target_include_directories(${TARGET} PRIVATE
         .
         ${CMAKE_CURRENT_BINARY_DIR}
@@ -88,8 +88,8 @@ if (WHISPER_SDL2)
     find_package(CURL REQUIRED)
     target_link_libraries(${TARGET} PRIVATE CURL::libcurl)
 
-    # WHY: LLAMA_VERSION приходит из llama-version.h — не дублируем
-    #      через target_compile_definitions.
+    # WHY: LLAMA_VERSION РїСЂРёС…РѕРґРёС‚ РёР· llama-version.h Р§ РЅРµ РґСѓР±Р»РёСЂСѓРµРј
+    #      С‡РµСЂРµР· target_compile_definitions.
 
     target_link_libraries(${TARGET} PRIVATE
         common
@@ -107,8 +107,8 @@ if (WHISPER_SDL2)
     endif()
 
     if(MSVC)
-        # WHY: llama-quant.cpp, llama-graph.cpp — огромные файлы,
-        #      без /bigobj MSVC падает на C1128.
+        # WHY: llama-quant.cpp, llama-graph.cpp Р§ РѕРіСЂРѕРјРЅС‹Рµ С„Р°Р№Р»С‹,
+        #      Р±РµР· /bigobj MSVC РїР°РґР°РµС‚ РЅР° C1128.
         target_compile_options(${TARGET} PRIVATE /bigobj)
          target_compile_options(${TARGET} PRIVATE /bigobj /utf-8)
     endif()
