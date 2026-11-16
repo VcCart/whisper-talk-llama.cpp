@@ -3688,19 +3688,20 @@ static void send_tts_async(const TtsRequest& req) {
 static void enqueue_tts(TtsRequest req, bool update_last = true) {
     if (g_cancel_tts_requests.load()) return;
     if (g_tts_muted.load()) return;
-    std::lock_guard<std::mutex> lock(g_tts_queue_mutex);
-    // Повторная проверка под локом: флаг мог измениться между
-    // проверкой сверху и взятием лока.
-    if (g_cancel_tts_requests.load()) return;
-    if (g_tts_muted.load()) return;
-    // WHY: обновляем g_last_tts_text ТОЛЬКО после подтверждения,
-    // что запрос реально попадает в очередь. Иначе «повтори»
-    // озвучит текст, который был отменён.
+    // C3: Порядок блокировок — g_last_tts_mutex → g_tts_queue_mutex.
+    // WHY: обновляем g_last_tts_text ДО взятия g_tts_queue_mutex,
+    // чтобы порядок блокировок соответствовал задокументированному.
+    // Обратный порядок (очередь → last_tts) запрещён.
     if (update_last && !req.text.empty()) {
         std::lock_guard<std::mutex> lk_last(g_last_tts_mutex);
         if (!g_last_tts_text.empty()) g_last_tts_text += " ";
         g_last_tts_text += req.text;
     }
+    std::lock_guard<std::mutex> lock(g_tts_queue_mutex);
+    // Повторная проверка под локом: флаг мог измениться между
+    // проверкой сверху и взятием лока.
+    if (g_cancel_tts_requests.load()) return;
+    if (g_tts_muted.load()) return;
     g_tts_queue.push_back(std::move(req));
     g_tts_queue_cv.notify_one();
 }
@@ -5203,7 +5204,10 @@ int run(int argc, char** argv) {
     }
 
     antiprompts.push_back(params.person + chat_symb);
-
+    // WHY: имя бота тоже должно быть антипромптом. Без этого модель
+    // генерирует "Эмма: " в начале ответа, и оно печатается поверх
+    // уже выведенного цветного префикса (симптом "Эмма: Эмма: ...").
+    antiprompts.push_back(current_bot_name + chat_symb);
     if (!params.stop_words.empty()) {
         size_t start = 0, end = params.stop_words.find(';');
         auto add_word = [&](std::string w) {
@@ -5797,8 +5801,10 @@ int run(int argc, char** argv) {
             size_t nl = text_heard.find('\n');
             if (nl != std::string::npos) text_heard.resize(nl);
         }
-        text_heard = std::regex_replace(text_heard, std::regex("^\\s+"), "");
-        text_heard = std::regex_replace(text_heard, std::regex("\\s+$"), "");
+        // WHY: trim() эквивалентен regex "^\\s+" / "\\s+$", но не
+        // компилирует паттерн на каждый вызов. В цикле 20 мс это
+        // экономит ~20–100 мкс на итерацию.
+        trim(text_heard);
         text_heard = RemoveTrailingCharactersUtf8(text_heard, ",");
         text_heard = RemoveTrailingCharactersUtf8(text_heard, ".");
         text_heard = RemoveTrailingCharactersUtf8(text_heard, "\xC2\xBB");
@@ -6113,10 +6119,20 @@ int run(int argc, char** argv) {
             g_command_in_progress.store(true);
             clear_pending_and_snapshot();
 
+            // WHY: сохраняем предыдущее имя для корректного обновления
+            // антипромптов. Без этого старое имя бота остаётся в векторе,
+            // а новое не добавляется — детектор не ловит "Лео: ".
+            std::string prev_bot_name = current_bot_name;
             current_bot_name = LEO_NAME;
             current_voice = LEO_VOICE;
             current_prompt = alt_prompt;
             g_sanitize_bot = LEO_NAME;
+            // Обновляем антипромпт имени бота: удаляем старое, добавляем новое.
+            antiprompts.erase(
+                std::remove(antiprompts.begin(), antiprompts.end(),
+                            prev_bot_name + chat_symb),
+                antiprompts.end());
+            antiprompts.push_back(current_bot_name + chat_symb);
             {
                 std::lock_guard<std::mutex> lock(g_whisper_prompt_mutex);
 
@@ -6175,10 +6191,18 @@ int run(int argc, char** argv) {
             g_command_in_progress.store(true);
             clear_pending_and_snapshot();
 
+            // WHY: аналогично call_leo — обновляем антипромпт имени бота.
+            std::string prev_bot_name = current_bot_name;
             current_bot_name = default_bot_name;
             current_voice = default_voice;
             current_prompt = default_prompt;
             g_sanitize_bot = default_bot_name;
+            // Обновляем антипромпт имени бота: удаляем старое, добавляем новое.
+            antiprompts.erase(
+                std::remove(antiprompts.begin(), antiprompts.end(),
+                            prev_bot_name + chat_symb),
+                antiprompts.end());
+            antiprompts.push_back(current_bot_name + chat_symb);
             {
                 std::lock_guard<std::mutex> lock(g_whisper_prompt_mutex);
 
@@ -6445,7 +6469,19 @@ int run(int argc, char** argv) {
                 }
                 g_ctx_llama_atomic.store(ctx_llama);
                 batch = llama_batch_init(params.batch_size, 0, 1);
-
+                // WHY: llama_batch_init может вернуть структуру с
+                // nullptr-указателями при нехватке памяти. Без проверки
+                // следующий llama_decode даст segfault.
+                if (!batch.token) {
+                    fprintf(stderr, "%s : ERROR: llama_batch_init failed "
+                            "(OOM, batch_size=%d)\n", __func__, params.batch_size);
+                    g_reset_in_progress.store(false);
+                    g_reset_cv.notify_all();
+                    g_command_in_progress.store(false);
+                    g_shutting_down.store(true);
+                    is_running = false;
+                    break;
+                }
                 embd_inp.clear();
                 auto append_reset = [&](const std::string& part, bool parse_special) {
                     if (part.empty()) return;
@@ -6952,6 +6988,11 @@ int run(int argc, char** argv) {
                         token_accumulator.clear();
                         last_output_buffer.clear();
                         last_output_needle.clear();
+                        // WHY: при hard truncate контекст пересобирается.
+                        // Буфер TTS содержит текст из «старой эпохи» —
+                        // если его не очистить, он уйдёт в XTTS с
+                        // разорванным контекстом.
+                        tts_smart_buffer.clear();
                         embd.clear();
                         llama_sampler_reset(smpl);
                         llama_sampler_reset(smpl_high_temp);
@@ -7005,7 +7046,7 @@ int run(int argc, char** argv) {
                                     (int)llama_memory_can_shift(mem));
                         }
                         embd_inp.resize(std::min(static_cast<size_t>(n_keep),
-                                                 embd_inp.size()));
+                                                embd_inp.size()));
                         llama_memory_seq_rm(mem, 0, n_keep, -1);
                         n_past = static_cast<int>(embd_inp.size());
                         n_session_consumed = n_past;
@@ -7013,6 +7054,9 @@ int run(int argc, char** argv) {
                         token_accumulator.clear();
                         last_output_buffer.clear();
                         last_output_needle.clear();
+                        // WHY: fallback до n_keep — контекст усечён.
+                        // Буфер TTS из «старой эпохи» неактуален.
+                        tts_smart_buffer.clear();
                         for (int& p : past_prev_arr) {
                             if (p > n_keep) p = n_keep;
                         }
@@ -7050,7 +7094,11 @@ int run(int argc, char** argv) {
                                 }
                             }
                             text_heard_prev.clear();
-
+                            // WHY: K-shift удаляет середину контекста.
+                            // Буфер TTS может содержать текст, относящийся
+                            // к удалённой части. Очищаем, чтобы не озвучить
+                            // фрагмент с «дырявым» контекстом.
+                            tts_smart_buffer.clear();
                             kv_updated = true;
                             if (params.verbose) {
                                 fprintf(stderr, "\n[KShift] Удал. %d ток, ост: %zu "
@@ -7439,37 +7487,54 @@ int run(int argc, char** argv) {
                 //      внутренние "размышления" не нужно.
                 {
                     think_tag_buffer += visible_token;
-                    if (think_tag_buffer.size() > 256) {
+                    // WHY: ограничиваем буфер 4096 байтами, чтобы не рос
+                    // бесконечно при длинных think-блоках. 256 было мало:
+                    // закрывающий тег мог не поместиться в окно.
+                    if (think_tag_buffer.size() > 4096) {
                         think_tag_buffer = think_tag_buffer.substr(
                             think_tag_buffer.size() - 256);
                     }
                     // Проверяем открывающий тег — в накопленном буфере,
-                    // а не в одном токене.
-                    if (think_tag_buffer.find("<think>") != std::string::npos || 
-                        think_tag_buffer.find("<|channel|>thought") != std::string::npos) {
-                        in_think_block = true;
-                        visible_token = ""; // Очищаем сам токен-триггер
+                    // а не в одном токене. Обрабатываем только если ещё
+                    // НЕ внутри блока (иначе повторно сработает на "</think>").
+                    if (!in_think_block) {
+                        if (think_tag_buffer.find("<think>") != std::string::npos ||
+                            think_tag_buffer.find("<|channel|>thought") != std::string::npos) {
+                            in_think_block = true;
+                            visible_token = ""; // Очищаем сам токен-триггер
+                            // Текст ДО <think> уже выведен в предыдущих
+                            // итерациях. Очищаем буфер, чтобы не искать
+                            // закрывающий тег в уже выведенном тексте.
+                            think_tag_buffer.clear();
+                        }
                     }
-                     
-                     // Если мы внутри блока размышлений, пропускаем всё
-                     if (in_think_block) {
-                         // Проверяем закрывающий тег
-                         if (visible_token.find("</think>") != std::string::npos || 
-                             visible_token.find("<|/channel|>") != std::string::npos ||
-                             visible_token.find("<|channel|>final") != std::string::npos) {
-                             in_think_block = false;
-                             // Удаляем закрывающий тег из видимой части
-                             size_t pos = visible_token.find("</think>");
-                             if (pos != std::string::npos) visible_token.erase(pos, 8);
-                             pos = visible_token.find("<|/channel|>");
-                             if (pos != std::string::npos) visible_token.erase(pos, 14);
-                             pos = visible_token.find("<|channel|>final");
-                             if (pos != std::string::npos) visible_token.erase(pos, 16);
-                         } else {
-                             visible_token = ""; // Скрываем содержимое блока
-                         }
-                     }
-                 }
+                    // Если мы внутри блока размышлений, ищем закрывающий
+                    // тег В НАКОПЛЕННОМ БУФЕРЕ, а не в текущем токене.
+                    // WHY: тег </think> может прийти разбитым на два
+                    // токена ("</th" + "ink>"). Поиск в visible_token
+                    // его не найдёт; поиск в think_tag_buffer — найдёт.
+                    if (in_think_block) {
+                        size_t close_pos = think_tag_buffer.find("</think>");
+                        size_t close_len = 8;
+                        if (close_pos == std::string::npos) {
+                            close_pos = think_tag_buffer.find("<|/channel|>");
+                            close_len = 14;
+                        }
+                        if (close_pos == std::string::npos) {
+                            close_pos = think_tag_buffer.find("<|channel|>final");
+                            close_len = 16;
+                        }
+                        if (close_pos != std::string::npos) {
+                            in_think_block = false;
+                            // Извлекаем текст ПОСЛЕ закрывающего тега —
+                            // это начало видимого ответа.
+                            visible_token = think_tag_buffer.substr(close_pos + close_len);
+                            think_tag_buffer.clear();
+                        } else {
+                            visible_token = ""; // Скрываем содержимое блока
+                        }
+                    }
+                }
 
                  if (!visible_token.empty()) {
                      std::lock_guard<std::recursive_mutex> lock(g_console_mutex);
@@ -7575,21 +7640,37 @@ int run(int argc, char** argv) {
                                             }
                                         }
                                         if (suffix_matches) {
-                                            embd_inp.erase(embd_inp.end() - rollback,
-                                                           embd_inp.end());
-                                            n_past = static_cast<int>(embd_inp.size());
-                                            n_session_consumed = n_past;
-                                            llama_memory_seq_rm(
+                                            // WHY: сначала пробуем seq_rm с целевой
+                                            // позицией, и только при успехе меняем
+                                            // embd_inp. Иначе при失败е seq_rm
+                                            // embd_inp уже усечён, а KV — нет (И1).
+                                            int new_n_past =
+                                                static_cast<int>(embd_inp.size()) - rollback;
+                                            bool rm_ok = llama_memory_seq_rm(
                                                 llama_get_memory(active_ap), 0,
-                                                n_past, -1);
-                                            if (session_tokens.size() > embd_inp.size()) {
-                                                session_tokens.resize(embd_inp.size());
-                                            }
-                                            if (params.verbose) {
-                                                fprintf(stderr,
-                                                    "[Antiprompt] rollback OK: "
-                                                    "embd_inp=%zu, n_past=%d\n",
-                                                    embd_inp.size(), n_past);
+                                                new_n_past, -1);
+                                            if (rm_ok) {
+                                                embd_inp.erase(embd_inp.end() - rollback,
+                                                            embd_inp.end());
+                                                n_past = new_n_past;
+                                                n_session_consumed = n_past;
+                                                if (session_tokens.size() > embd_inp.size()) {
+                                                    session_tokens.resize(embd_inp.size());
+                                                }
+                                                if (params.verbose) {
+                                                    fprintf(stderr,
+                                                        "[Antiprompt] rollback OK: "
+                                                        "embd_inp=%zu, n_past=%d\n",
+                                                        embd_inp.size(), n_past);
+                                                }
+                                            } else {
+                                                // seq_rm не удался — не трогаем
+                                                // embd_inp, прерываем ход.
+                                                if (params.verbose) {
+                                                    fprintf(stderr,
+                                                        "[Antiprompt] seq_rm failed, "
+                                                        "turn aborted\n");
+                                                }
                                             }
                                         } else {
                                             if (params.verbose) {
