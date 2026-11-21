@@ -7479,74 +7479,160 @@ int run(int argc, char** argv) {
                         }
                     }
 
-                
-                // --- 23.16.8.6. Консоль ---
-                // WHY: Фильтрация reasoning-тегов из консольного вывода.
-                //      Даже если --stop-words сработал, модель могла успеть
-                //      выдать закрывающий тег в буфер. Пользователю видеть
-                //      внутренние "размышления" не нужно.
-                {
-                    think_tag_buffer += visible_token;
-                    // WHY: ограничиваем буфер 4096 байтами, чтобы не рос
-                    // бесконечно при длинных think-блоках. 256 было мало:
-                    // закрывающий тег мог не поместиться в окно.
-                    if (think_tag_buffer.size() > 4096) {
-                        think_tag_buffer = think_tag_buffer.substr(
-                            think_tag_buffer.size() - 256);
-                    }
-                    // Проверяем открывающий тег — в накопленном буфере,
-                    // а не в одном токене. Обрабатываем только если ещё
-                    // НЕ внутри блока (иначе повторно сработает на "</think>").
-                    if (!in_think_block) {
-                        if (think_tag_buffer.find("<think>") != std::string::npos ||
-                            think_tag_buffer.find("<|channel|>thought") != std::string::npos) {
-                            in_think_block = true;
-                            visible_token = ""; // Очищаем сам токен-триггер
-                            // Текст ДО <think> уже выведен в предыдущих
-                            // итерациях. Очищаем буфер, чтобы не искать
-                            // закрывающий тег в уже выведенном тексте.
-                            think_tag_buffer.clear();
+                    // --- 23.16.8.6. Консоль ---
+                    // WHY: Фильтрация reasoning-тегов и ИМЕНИ БОТА из консольного вывода.
+                    //      Даже если --stop-words сработал, модель могла успеть
+                    //      выдать закрывающий тег или свое имя в буфер.
+                    
+                    // >>> ПАТЧ: Принудительное удаление имени бота из начала ответа <<<
+                    // Если модель сгенерировала "Эмма: " в начале, мы это режем.
+                    // Проверяем только если накоплено мало текста (начало фразы).
+                    if (tokens_in_reply < 4 && !visible_token.empty()) {
+                        std::string check_buf = text_to_speak + visible_token;
+                        
+                        // Варианты префиксов, которые нужно вырезать
+                        std::vector<std::string> bad_prefixes = {
+                            current_bot_name + chat_symb,  // "Эмма: "
+                            current_bot_name + ":",        // "Эмма:"
+                            LowerCase(current_bot_name) + chat_symb,
+                            LowerCase(current_bot_name) + ":"
+                        };
+                        
+                        for (const auto& prefix : bad_prefixes) {
+                            if (check_buf.size() >= prefix.size() &&
+                                check_buf.compare(0, prefix.size(), prefix) == 0) {
+                                // Префикс найден в начале check_buf
+                                // Проверяем границу: после префикса должен идти пробел/перевод/конец/UTF-8
+                                bool valid_boundary = false;
+                                if (check_buf.size() == prefix.size()) {
+                                    valid_boundary = true;
+                                } else {
+                                    unsigned char next_c = static_cast<unsigned char>(check_buf[prefix.size()]);
+                                    valid_boundary = (next_c == ' ' || next_c == '\t' || 
+                                                    next_c == '\n' || next_c == '\r' ||
+                                                    next_c >= 0x80);
+                                }
+                                
+                                if (valid_boundary) {
+                                    // Вычисляем, сколько байт префикса уже в text_to_speak
+                                    size_t prefix_in_text = std::min(text_to_speak.size(), prefix.size());
+                                    
+                                    // Находим последнюю валидную границу UTF-8 в text_to_speak
+                                    size_t utf8_boundary = 0;
+                                    while (utf8_boundary < prefix_in_text) {
+                                        unsigned char c = static_cast<unsigned char>(text_to_speak[utf8_boundary]);
+                                        size_t char_len = 1;
+                                        if ((c & 0xE0) == 0xC0) char_len = 2;
+                                        else if ((c & 0xF0) == 0xE0) char_len = 3;
+                                        else if ((c & 0xF8) == 0xF0) char_len = 4;
+                                        if (utf8_boundary + char_len > prefix_in_text) break;
+                                        utf8_boundary += char_len;
+                                    }
+                                    prefix_in_text = utf8_boundary;
+                                    
+                                    // Проверяем, что text_to_speak действительно начинается с части префикса
+                                    if (prefix_in_text == 0 || 
+                                        text_to_speak.compare(0, prefix_in_text, prefix, 0, prefix_in_text) == 0) {
+                                        // Вырезаем префикс из text_to_speak
+                                        if (prefix_in_text > 0) {
+                                            text_to_speak = text_to_speak.substr(prefix_in_text);
+                                        }
+                                        
+                                        // Вычисляем, сколько байт нужно убрать из visible_token
+                                        size_t to_remove_from_visible = prefix.size() - prefix_in_text;
+                                        
+                                        // Находим первую валидную границу UTF-8 в visible_token
+                                        size_t utf8_boundary_vis = to_remove_from_visible;
+                                        while (utf8_boundary_vis < visible_token.size()) {
+                                            unsigned char c = static_cast<unsigned char>(visible_token[utf8_boundary_vis]);
+                                            if ((c & 0xC0) != 0x80) break; // Валидный лид-байт
+                                            utf8_boundary_vis++;
+                                        }
+                                        to_remove_from_visible = utf8_boundary_vis;
+                                        
+                                        if (visible_token.size() <= to_remove_from_visible) {
+                                            // Весь visible_token — часть префикса
+                                            visible_token = "";
+                                        } else {
+                                            // Убираем только часть префикса из visible_token
+                                            visible_token = visible_token.substr(to_remove_from_visible);
+                                        }
+                                        
+                                        if (g_verbose_mode.load()) {
+                                            fprintf(stderr, "[BotPrefix] Удалён дубль '%s' "
+                                                    "(text_to_speak=%zu, visible=%zu)\n",
+                                                    prefix.c_str(), text_to_speak.size(), 
+                                                    visible_token.size());
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
                         }
                     }
-                    // Если мы внутри блока размышлений, ищем закрывающий
-                    // тег В НАКОПЛЕННОМ БУФЕРЕ, а не в текущем токене.
-                    // WHY: тег </think> может прийти разбитым на два
-                    // токена ("</th" + "ink>"). Поиск в visible_token
-                    // его не найдёт; поиск в think_tag_buffer — найдёт.
-                    if (in_think_block) {
-                        size_t close_pos = think_tag_buffer.find("</think>");
-                        size_t close_len = 8;
-                        if (close_pos == std::string::npos) {
-                            close_pos = think_tag_buffer.find("<|/channel|>");
-                            close_len = 14;
-                        }
-                        if (close_pos == std::string::npos) {
-                            close_pos = think_tag_buffer.find("<|channel|>final");
-                            close_len = 16;
-                        }
-                        if (close_pos != std::string::npos) {
-                            in_think_block = false;
-                            // Извлекаем текст ПОСЛЕ закрывающего тега —
-                            // это начало видимого ответа.
-                            visible_token = think_tag_buffer.substr(close_pos + close_len);
-                            think_tag_buffer.clear();
-                        } else {
-                            visible_token = ""; // Скрываем содержимое блока
-                        }
-                    }
-                }
+                    // >>> КОНЕЦ ПАТЧА <<<
 
-                 if (!visible_token.empty()) {
-                     std::lock_guard<std::recursive_mutex> lock(g_console_mutex);
-                     if (!bot_prefix_printed) {
-                         std::string padded = make_padded_name(current_bot_name);
-                         printf("%s%s%s: ", C_BOT, padded.c_str(), C_RESET);
-                         bot_prefix_printed = true;
-                     }
-                     printf("%s", visible_token.c_str());
-                     fflush(stdout);
-                     tokens_in_reply++;
-                 }
+                    {
+                        think_tag_buffer += visible_token;
+                        // WHY: ограничиваем буфер 4096 байтами, чтобы не рос
+                        // бесконечно при длинных think-блоках. 256 было мало:
+                        // закрывающий тег мог не поместиться в окно.
+                        if (think_tag_buffer.size() > 4096) {
+                            think_tag_buffer = think_tag_buffer.substr(
+                                think_tag_buffer.size() - 256);
+                        }
+                        // Проверяем открывающий тег — в накопленном буфере,
+                        // а не в одном токене. Обрабатываем только если ещё
+                        // НЕ внутри блока (иначе повторно сработает на "</think>").
+                        if (!in_think_block) {
+                            if (think_tag_buffer.find("<think>") != std::string::npos ||
+                                think_tag_buffer.find("<|channel|>thought") != std::string::npos) {
+                                in_think_block = true;
+                                visible_token = ""; // Очищаем сам токен-триггер
+                                // Текст ДО <think> уже выведен в предыдущих
+                                // итерациях. Очищаем буфер, чтобы не искать
+                                // закрывающий тег в уже выведенном тексте.
+                                think_tag_buffer.clear();
+                            }
+                        }
+                        // Если мы внутри блока размышлений, ищем закрывающий
+                        // тег В НАКОПЛЕННОМ БУФЕРЕ, а не в текущем токене.
+                        // WHY: тег </think> может прийти разбитым на два
+                        // токена ("</th" + "ink>"). Поиск в visible_token
+                        // его не найдёт; поиск в think_tag_buffer — найдёт.
+                        if (in_think_block) {
+                            size_t close_pos = think_tag_buffer.find("</think>");
+                            size_t close_len = 8;
+                            if (close_pos == std::string::npos) {
+                                close_pos = think_tag_buffer.find("<|/channel|>");
+                                close_len = 14;
+                            }
+                            if (close_pos == std::string::npos) {
+                                close_pos = think_tag_buffer.find("<|channel|>final");
+                                close_len = 16;
+                            }
+                            if (close_pos != std::string::npos) {
+                                in_think_block = false;
+                                // Извлекаем текст ПОСЛЕ закрывающего тега —
+                                // это начало видимого ответа.
+                                visible_token = think_tag_buffer.substr(close_pos + close_len);
+                                think_tag_buffer.clear();
+                            } else {
+                                visible_token = ""; // Скрываем содержимое блока
+                            }
+                        }
+                    }
+                    if (!visible_token.empty()) {
+                        std::lock_guard<std::recursive_mutex> lock(g_console_mutex);
+                        if (!bot_prefix_printed) {
+                            std::string padded = make_padded_name(current_bot_name);
+                            printf("%s%s%s: ", C_BOT, padded.c_str(), C_RESET);
+                            bot_prefix_printed = true;
+                        }
+                        printf("%s", visible_token.c_str());
+                        fflush(stdout);
+                        tokens_in_reply++;
+                    }
 
                     text_to_speak += visible_token;
                     full_response_text += visible_token;
