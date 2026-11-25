@@ -107,10 +107,8 @@ if (WHISPER_SDL2)
     endif()
 
     if(MSVC)
-        # WHY: llama-quant.cpp, llama-graph.cpp Ч огромные файлы,
         #      без /bigobj MSVC падает на C1128.
-        target_compile_options(${TARGET} PRIVATE /bigobj)
-         target_compile_options(${TARGET} PRIVATE /bigobj /utf-8)
+        target_compile_options(${TARGET} PRIVATE /bigobj /utf-8)
     endif()
 
     if(WIN32)

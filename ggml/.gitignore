@@ -1,2 +1,1 @@
-src/ggml-vulkan-shaders.hpp
-src/ggml-vulkan-shaders.cpp
+src/ggml-metal-embed.metal

@@ -27,7 +27,8 @@
 //   И4. clear_snapshot_only() — сброс эпохи БЕЗ стирания речи и VAD.
 //       clear_pending_and_snapshot() = clear_snapshot_only() + очистка
 //       g_accumulated_text/g_display_text + g_force_vad_reset.
-//       Для google/repeat — только clear_snapshot_only().
+//       google — только clear_snapshot_only(); repeat — не сбрасывает
+//       ничего (D2: repeat не меняет эпоху хода).
 //   И5. audio_async ≥ max_segment_ms (30 с), иначе накопленный сегмент
 //       физически не помещается в кольцевой буфер.
 //   И6. Whisper получает сегмент ОТ speech_start_ms, а не фиксированный
@@ -109,7 +110,6 @@
 #include "common-whisper.h"
 #include "whisper.h"
 #include "llama.h"
-#include "llama-chat.h"
 
 // --- 1.3. Пользовательские модули ---
 #include "console.h"
@@ -233,9 +233,6 @@ std::mutex g_last_tts_mutex;
 
 // --- 3.11. Verbose-режим ---
 std::atomic<bool> g_verbose_mode{ false };
-
-// --- 3.12. Режим печати спецтокенов ---
-std::atomic<bool> g_print_special{ false };
 
 // --- 3.13. Мьютекс консольного вывода ---
 // recursive: print_replica может вызываться из вложенных лямбд.
@@ -692,7 +689,9 @@ static std::string extract_complete_utf8(std::string& buffer) {
         else if ((c & 0xF0) == 0xE0) len = 3;
         else if ((c & 0xF8) == 0xF0) len = 4;
         else {
-            // Невалидный лид-байт: пропускаем, чтобы не застрять.
+            // Невалидный лид-байт: продолжение не читаем, байт уходит
+            // в вывод как есть (мусорный символ). complete_end двигаем,
+            // чтобы буфер не завис на битом байте.
             i++;
             complete_end = i;
             continue;
@@ -955,7 +954,10 @@ static std::vector<llama_token> llama_tokenize_ex(
         if (check != -n_tokens) {
             fprintf(stderr, "Warning: token count mismatch after resize\n");
         }
-        result.resize(static_cast<size_t>(n_tokens));
+        // WHY: n_tokens отрицателен (результат первого вызова), реальная
+        // длина после второго вызова — check. resize(size_t(n_tokens))
+        // при n_tokens < 0 давал гигантский размер и length_error.
+        result.resize(static_cast<size_t>(check));
     }
     else {
         result.resize(static_cast<size_t>(n_tokens));
@@ -1261,11 +1263,8 @@ struct whisper_params {
     std::vector<float> tensor_split;
 
     // --- 9.2. Аудиозахват ---
-    // voice_ms — сколько миллисекунд брать при обычном конце речи.
-    // Потолок фактического захвата — AUDIO_BUFFER_MS (И5, И6).
-    // При длинной речи (> voice_ms) сегмент режется в 20.10 и берётся
-    // накопленный буфер от speech_start_ms (И6), а не voice_ms.
-    int32_t voice_ms = 10000;
+    // Фактический захват — capture_ms_for_segment: от speech_start_ms
+    // с потолком MAX_SEGMENT_MS (И6). Фиксированной длины сегмента нет.
     int32_t capture_id = -1;
 
     // --- 9.3. Энергетический VAD ---
@@ -1314,8 +1313,9 @@ struct whisper_params {
     // --- 9.7.1. Гендерная подсказка ---
     // Короткая строка-напоминание о поле персонажа, задаётся через
     // --gender-hint в BAT-файле. Добавляется в конец системного промпта
-    // (защищена n_keep от удаления при переполнении контекста) и
-    // подкрепляется в каждом ходе диалога перед генерацией ответа.
+    // (22.22) — единственный якорь рода: защищён n_keep и НЕ копится
+    // в KV. В user turn на каждом ходу НЕ вставляется (23.15) — иначе
+    // модель воспроизводит повторяющийся паттерн и срывается на повторы.
     // Пример: --gender-hint "Ты женщина, говори о себе в женском роде."
     std::string gender_hint = "";
 
@@ -1328,7 +1328,6 @@ struct whisper_params {
     std::string model_llama = "";
 
     // --- 9.10. Флаги ---
-    bool print_special = false;
     bool print_energy = false;
     bool verbose_prompt = false;
     bool verbose = false;
@@ -1355,9 +1354,6 @@ struct whisper_params {
         {"stop_sequence", ""}
     };
 
-    // --- 9.13. ChatML-шаблон ---
-    // Ручная сборка из пресета (22.15). llm_chat_apply_template не используется.
-    llm_chat_template chat_template = LLM_CHAT_TEMPLATE_UNKNOWN;
 };
 
 
@@ -1369,7 +1365,8 @@ struct whisper_params {
 //   • Любой неизвестный аргумент → печать usage + return false.
 //   • Ошибка stoi/stof → печать usage + return false.
 //   • Пол/гендер не парсятся: это свойство персоны, задаётся промптом.
-//   • Плейсхолдер {5} не упоминается в usage — его нет в коде.
+//   • Плейсхолдер {5} в usage не упоминается и в промпты не
+//     подставляется; из вывода модели он вырезается (23.16.8.4).
 // Используется: run() в самом начале (22.1).
 
 // --- 10.1. Печать справки ---
@@ -1379,7 +1376,6 @@ void whisper_print_usage(int argc, char** argv, const whisper_params & params) {
     fprintf(stderr, "options:\n");
     fprintf(stderr, "  -h,       --help           show this help message and exit\n");
     fprintf(stderr, "  -t N,     --threads N      [%-7d] number of threads (CPU)\n", params.n_threads);
-    fprintf(stderr, "  -vms N,   --voice-ms N     [%-7d] max voice segment length, ms (cap: %d)\n", params.voice_ms, AUDIO_BUFFER_MS);
     fprintf(stderr, "  -c ID,    --capture ID     [%-7d] capture device ID\n", params.capture_id);
     fprintf(stderr, "  -ngl N,   --n-gpu-layers N [%-7d] number of layers to store in VRAM\n", params.n_gpu_layers);
     fprintf(stderr, "  -vth N,   --vad-thold N    [%-7.2f] energy vad threshold\n", params.vad_thold);
@@ -1426,7 +1422,6 @@ void whisper_print_usage(int argc, char** argv, const whisper_params & params) {
     fprintf(stderr, "  --verbose                           print speed, debug info and write log file\n");
     fprintf(stderr, "  --verbose-prompt                    print the full prompt at start\n");
     fprintf(stderr, "  --print-energy                      print energy levels for vad debug\n");
-    fprintf(stderr, "  --print-special                     print special tokens (LLaMA) in console\n");
     fprintf(stderr, "  --push-to-talk                      hold Alt to speak (default: off)\n");
     fprintf(stderr, "  --no-flash-attn                     force-disable flash attention\n");
     fprintf(stderr, "\n");
@@ -1478,18 +1473,6 @@ bool whisper_params_parse(int argc, char** argv, whisper_params& params) {
                 }
                 if (fabs(sum - 1.0f) > 0.001f) {
                     std::cerr << "Warning: tensor-split values sum to " << sum << " (expected ~1.0)" << std::endl;
-                }
-            }
-            else if (arg == "-vms" || arg == "--voice-ms") {
-                if (i + 1 >= argc) { std::cerr << "Error: missing value after " << arg << std::endl; return false; }
-                params.voice_ms = std::stoi(argv[++i]);
-                // Потолок — AUDIO_BUFFER_MS (И5). Если пользователь задал
-                // больше, фактический захват всё равно ограничен буфером.
-                if (params.voice_ms > AUDIO_BUFFER_MS) {
-                    std::cerr << "Warning: --voice-ms " << params.voice_ms
-                              << " > audio buffer " << AUDIO_BUFFER_MS
-                              << ", capped to " << AUDIO_BUFFER_MS << std::endl;
-                    params.voice_ms = AUDIO_BUFFER_MS;
                 }
             }
             else if (arg == "-c" || arg == "--capture") {
@@ -1620,7 +1603,6 @@ bool whisper_params_parse(int argc, char** argv, whisper_params& params) {
                 if (i + 1 >= argc) { std::cerr << "Error: missing value after " << arg << std::endl; return false; }
                 params.model_llama = argv[++i];
             }
-            else if (arg == "-ps" || arg == "--print-special") { params.print_special = true; }
             else if (arg == "-pe" || arg == "--print-energy") { params.print_energy = true; }
             else if (arg == "-vp" || arg == "--verbose-prompt") { params.verbose_prompt = true; }
             else if (arg == "--verbose") { params.verbose = true; g_verbose_mode.store(true); }
@@ -1831,7 +1813,7 @@ std::string ParseCommandAndGetKeyword(std::string textHeardTrimmed,
             if (utf8_rule_applied) trim(sanitizedInput);
         }
         if (sanitizedInput.size() >= 2) {
-            thread_local const std::regex re_male_genitive_ogo_ego(R"((.+)([оe]го)$)", std::regex_constants::icase);
+            thread_local const std::regex re_male_genitive_ogo_ego(R"((.+)([ое]го)$)", std::regex_constants::icase);
             thread_local const std::regex re_male_u(R"((.+)у$)", std::regex_constants::icase);
             thread_local const std::regex re_male_a(R"((.+)а$)", std::regex_constants::icase);
             thread_local const std::regex re_male_om(R"((.+)ом$)", std::regex_constants::icase);
@@ -1983,7 +1965,6 @@ std::string url_to_speech(const std::string& url) {
 //     проверяются при генерации токенов (23.16.8.3).
 //   • antiprompts = stop_strings + {bot_prefix, user_prefix, stop_words} —
 //     проверяются по хвосту text_to_speak (23.16.8.7).
-//   • statuses — список статусов для консоли (tts/int/stop/...).
 //   • bot_suffix (<|eot_id|>) — декодируется в KV через
 //     close_assistant_turn (E1, 22.35) при нормальном завершении
 //     генерации, чтобы следующий ход видел закрытый assistant turn (И2).
@@ -2000,8 +1981,6 @@ struct PresetDerived {
 
     std::vector<std::string> stop_strings;
     std::vector<std::string> antiprompts;
-
-    std::unordered_set<std::string> statuses;
 };
 
 
@@ -2062,11 +2041,6 @@ static PresetDerived build_preset_derived(
             }
         }
     }
-
-    d.statuses = {
-        "google", "reset", "del", "regen", "repeat",
-        "tts", "int", "stop", "call leo"
-    };
 
     return d;
 }
@@ -4026,13 +4000,18 @@ void audio_input_thread_func(whisper_context* ctx_wsp,
                 if (barge_duration_ms >= static_cast<double>(params.interrupt_ms)) {
                     g_interrupt_reason.store(InterruptReason::VAD_SPEECH);
                     g_bot_state.store(BotState::INTERRUPTED);
+                    // Запоминаем момент ПЕРВОГО VAD-хита до обнуления: порог
+                    // срабатывает на interrupt_ms позже, и при
+                    // speech_start_ms = current_time первые ~100–150 мс речи
+                    // выпадали из сегмента (съеденный первый слог).
+                    const double barge_speech_start =
+                        (barge_in_start_ms > 0.0) ? barge_in_start_ms : current_time;
                     barge_in_start_ms = 0.0;
 
-                    // Захватываем речь с момента barge-in. speech_active = true
-                    // с текущим временем — следующий же тик продолжит накопление
-                    // через обычную ветку 20.9–20.11.
+                    // Захватываем речь с момента barge-in. speech_active = true —
+                    // следующий же тик продолжит накопление через 20.9–20.11.
                     speech_active = true;
-                    speech_start_ms = current_time;
+                    speech_start_ms = barge_speech_start;
                     last_speech_end_ms = current_time;
 
                     if (g_verbose_mode.load()) {
@@ -4082,9 +4061,15 @@ void audio_input_thread_func(whisper_context* ctx_wsp,
         // И6: захват идёт от speech_start_ms (capture_ms_for_segment),
         //     а не фиксированный voice_ms. Потолок — MAX_SEGMENT_MS.
         if (speech_active && (vad_result == 0 || vad_result == 1)) {
-            double speech_duration = current_time - speech_start_ms;
+            // WHY: current_time и speech_start_ms — в СЕКУНДАХ
+            // (get_current_time_ms, 5.14), а max_segment_ms — в
+            // миллисекундах. Без перевода порог «30000 мс» срабатывал бы
+            // только через 30000 секунд: аварийное сегментирование (И6)
+            // фактически никогда не включалось, и начало речи длиннее
+            // 30 с терялось (размер кольцевого буфера audio_async).
+            double speech_duration_ms = (current_time - speech_start_ms) * 1000.0;
 
-            if (speech_duration > max_segment_ms) {
+            if (speech_duration_ms > max_segment_ms) {
                 std::vector<float> pcmf32_seg;
                 int capture_ms = capture_ms_for_segment(speech_start_ms, current_time);
                 audio_ref.get(capture_ms, pcmf32_seg);
@@ -4109,7 +4094,16 @@ void audio_input_thread_func(whisper_context* ctx_wsp,
                             if (!g_accumulated_text.empty() && !seg_text.empty()) {
                                 std::string last_part = g_accumulated_text;
                                 if (last_part.length() > 50) {
-                                    last_part = last_part.substr(last_part.length() - 50);
+                                    // Хвост для сравнения: 50 байт могут
+                                    // разрезать UTF-8 символ — сдвигаем
+                                    // границу до ближайшего лид-байта.
+                                    size_t cut = last_part.length() - 50;
+                                    while (cut < last_part.length() &&
+                                           (static_cast<unsigned char>(
+                                                last_part[cut]) & 0xC0) == 0x80) {
+                                        cut++;
+                                    }
+                                    last_part = last_part.substr(cut);
                                 }
                                 if (seg_text.length() >= last_part.length() &&
                                     seg_text.substr(0, last_part.length()) == last_part) {
@@ -4187,7 +4181,16 @@ void audio_input_thread_func(whisper_context* ctx_wsp,
                             if (!g_accumulated_text.empty() && !text.empty()) {
                                 std::string last_part = g_accumulated_text;
                                 if (last_part.length() > 50) {
-                                    last_part = last_part.substr(last_part.length() - 50);
+                                    // Хвост для сравнения: 50 байт могут
+                                    // разрезать UTF-8 символ — сдвигаем
+                                    // границу до ближайшего лид-байта.
+                                    size_t cut = last_part.length() - 50;
+                                    while (cut < last_part.length() &&
+                                           (static_cast<unsigned char>(
+                                                last_part[cut]) & 0xC0) == 0x80) {
+                                        cut++;
+                                    }
+                                    last_part = last_part.substr(cut);
                                 }
                                 if (text.length() >= last_part.length() &&
                                     text.substr(0, last_part.length()) == last_part) {
@@ -4240,15 +4243,20 @@ void audio_input_thread_func(whisper_context* ctx_wsp,
                 if (should_continue) {
                     g_pending_continue_request.store(true);
                     last_speech_end_ms = current_time;
-                    {
-                        std::lock_guard<std::mutex> lock(g_saved_generation_mutex);
-                        g_saved_was_interrupted = false;
-                    }
+                    // WHY: g_saved_was_interrupted здесь НЕ сбрасываем — это
+                    // признак «снимок валиден», его потребляет 23.1. Раньше
+                    // сброс стоял в audio-потоке: 23.1 опрашивает флаг раз в
+                    // 20 мс, а сброс шёл через микросекунды — 23.1 почти
+                    // всегда видел false, и auto-continue не срабатывал.
                     if (g_verbose_mode.load()) {
                         fprintf(stderr, "[AudioInput] Автопродолжение\n");
                     }
                 }
                 else if (!acc.empty() && !g_pending_llm_request.load()) {
+                    // WHY: пользователь заговорил — отменяем запрошенный
+                    // ранее auto-continue. Иначе 23.1 восстановит снимок,
+                    // реплика будет потеряна, а E3 не закроет turn.
+                    g_pending_continue_request.store(false);
                     {
                         std::lock_guard<std::mutex> lock(g_pending_llm_mutex);
                         g_pending_llm_text = acc;
@@ -4844,15 +4852,9 @@ int run(int argc, char** argv) {
         params.instruct_preset = "";
     }
 
-    // --- 22.14. Сборка производных из пресета ---
     PresetDerived preset_d = build_preset_derived(params.instruct_preset_data);
 
-    {
-        preset_d.statuses.insert("call " + LowerCase(params.bot_name));
-    }
-
     // --- 22.15. Ручная сборка из пресета ---
-    params.chat_template = LLM_CHAT_TEMPLATE_UNKNOWN;
     if (params.verbose) {
         fprintf(stderr, "[ChatML] Ручная сборка из пресета '%s'.\n",
                 params.instruct_preset.c_str());
@@ -4910,7 +4912,13 @@ int run(int argc, char** argv) {
     const float top_p = params.top_p;
     const float min_p = params.min_p;
     float temp = params.temp;
-    const int seed = 0;
+    // WHY: seed = 0 делает сэмплеры детерминированными: каждый
+    // llama_sampler_reset (каждый ход и каждый regen) пересеивает
+    // mt19937(0), и поток «случайности» всегда один и тот же. Первые
+    // токены при похожем контексте повторяются, regen не отличается.
+    // LLAMA_DEFAULT_SEED = случайный seed на каждый reset
+    // (get_rng_seed в llama-sampler.cpp).
+    const uint32_t seed = LLAMA_DEFAULT_SEED;
     const int32_t n_vocab = llama_vocab_n_tokens(vocab_llama);
     auto sparams = llama_sampler_chain_default_params();
     smpl = llama_sampler_chain_init(sparams);
@@ -5032,6 +5040,7 @@ int run(int argc, char** argv) {
     // --- 22.24. Загрузка сессии ---
     std::string path_session = params.path_session;
     std::vector<llama_token> session_tokens;
+    bool session_loaded_ok = false;   // KV уже восстановлен из файла сессии
     if (!path_session.empty()) {
         fprintf(stderr, "%s: attempting to load saved session from %s\n",
                 __func__, path_session.c_str());
@@ -5047,16 +5056,24 @@ int run(int argc, char** argv) {
             } else {
                 session_tokens.resize(n_token_count_out);
                 embd_inp.assign(session_tokens.begin(), session_tokens.end());
+                session_loaded_ok = true;   // сессия загружена вместе с KV
             }
         }
     }
 
     // --- 22.25. ПРОГРЕВ КОНТЕКСТА ---
+    // llama_state_load_file УЖЕ восстановила KV вместе с токенами сессии.
+    // Повторное декодирование embd_inp клало промпт в KV ВТОРОЙ РАЗ
+    // (seq_pos_max = 2*n_past), и проверка [Sync] рвала каждый ход.
+    // Декодируем только когда сессии нет.
     if (params.verbose) printf("\n");
     printf("%s : initializing - please wait ...\n", __func__);
     double llama_start_time = get_current_time_ms();
     int n_past = 0;
-    {
+    if (session_loaded_ok) {
+        n_past = static_cast<int>(embd_inp.size());
+    }
+    else {
         if (embd_inp.size() > static_cast<size_t>(params.batch_size)) {
             for (size_t offset = 0; offset < embd_inp.size();
                  offset += params.batch_size) {
@@ -5158,7 +5175,7 @@ int run(int argc, char** argv) {
     g_cancel_tts_requests.store(false);
     g_tts_muted.store(false);
     g_tts_busy.store(false);
-    g_print_special.store(params.print_special);
+
     // Инициализируем глобалы для sanitize_user_text: чтобы случайная
     // вставка "Адам: ..." / "Эмма: ..." в user turn не воспринималась
     // моделью как готовая история диалога.
@@ -5241,17 +5258,17 @@ int run(int argc, char** argv) {
     }
 
     // --- 22.31. Мягкий лимит токенов ---
-     // WHY: ctx_size/3 при 8096 даёт ~2698 токенов. В символах (×3) это
-     // ~8094 знака — пользователь должен говорить >2 минут непрерывно,
-     // прежде чем накопленный текст отправится в основной цикл и появится
-     // в консоли. Ограничиваем 256 токенами (~768 символов, ~30–40 сек
-     // речи). Это обеспечивает своевременную отправку без чрезмерного
-     // дробления: 768 символов — примерно 2–3 законченных предложения.
-     g_soft_limit_tokens.store(std::min(256, params.ctx_size / 3));
-     if (params.verbose) {
-         printf("[Limits] soft_limit_tokens=%d (capped from ctx_size/3=%d)\n",
-                g_soft_limit_tokens.load(), params.ctx_size / 3);
-     }
+    // WHY: ctx_size/3 при 8096 даёт ~2698 токенов. В символах (×3) это
+    // ~8094 знака — пользователь должен говорить >2 минут непрерывно,
+    // прежде чем накопленный текст отправится в основной цикл и появится
+    // в консоли. Ограничиваем 256 токенами (~768 символов, ~30–40 сек
+    // речи). Это обеспечивает своевременную отправку без чрезмерного
+    // дробления: 768 символов — примерно 2–3 законченных предложения.
+    g_soft_limit_tokens.store(std::min(256, params.ctx_size / 3));
+    if (params.verbose) {
+        printf("[Limits] soft_limit_tokens=%d (capped from ctx_size/3=%d)\n",
+               g_soft_limit_tokens.load(), params.ctx_size / 3);
+    }
 
     // --- 22.32. Запуск фоновых потоков ---
     std::thread input_thread(input_thread_func);
@@ -5302,9 +5319,9 @@ int run(int argc, char** argv) {
     //     состояния хода (stop, reset, call, delete, regen) — чтобы
     //     auto-continue не восстановил устаревший snapshot и не подхватил
     //     pending-реплику из другой «эпохи».
-    //   • Для google/repeat — только clear_snapshot_only (D1, D2): они
-    //     не меняют контекст, только отвечают; речь пользователя,
-    //     накопленная во время HTTP, не должна теряться.
+    //   • google — только clear_snapshot_only (D1): он не меняет контекст,
+    //     только отвечает; речь пользователя, накопленная во время HTTP,
+    //     не должна теряться. repeat — не сбрасывает ничего (D2).
 
     auto make_tts_req = [&](const std::string& text) {
         TtsRequest req;
@@ -5468,13 +5485,42 @@ int run(int argc, char** argv) {
 
     // clear_snapshot_only — сбрасывает только snapshot эпохи хода,
     // не трогая накопленную речь и VAD (И4). Для google/repeat.
+    //
+    // D4: если стирается ЖИВОЙ snapshot прерванного barge-in'ом хода,
+    // продолжение этого хода становится невозможно ни через auto-continue
+    // (23.1), ни через E3 (23.14) — оба опираются на
+    // g_saved_was_interrupted, который мы здесь обнуляем. Единственный
+    // способ соблюсти И2 («<|eot_id|> в KV ⇔ следующий ход — новый user
+    // turn») — закрыть turn ЗДЕСЬ, до стирания маркера: декодируем
+    // bot_suffix в KV на позиции n_past. close_assistant_turn
+    // идемпотентен: если контекст уже закрыт (нормальное завершение
+    // прошлого хода) — это no-op, лишнего decode не будет.
+    //
+    // ВАЖНО: накопленную речь (g_accumulated_text) и VAD-состояние НЕ
+    // трогаем — реплика, сказанная пользователем поверх прерванного
+    // ответа (в т.ч. во время google-HTTP), не теряется. Семантика D1
+    // сохраняется: «не менять диалог» относится к речи, а закрытие
+    // оборванного turn — это починка структуры, а не потеря данных.
     auto clear_snapshot_only = [&]() {
+        bool need_close_turn = false;
         {
             std::lock_guard<std::mutex> lock(g_saved_generation_mutex);
+            need_close_turn = g_saved_was_interrupted;
             g_saved_was_interrupted = false;
             g_saved_embd_inp.clear();
             g_saved_n_past = 0;
             g_saved_timestamp = 0.0;
+        }
+        if (need_close_turn) {
+            // Прерванный turn остаётся в KV незакрытым. Закрываем его
+            // <|eot_id|>, иначе следующий user turn ляжет в KV сразу
+            // после обрывка assistant-ответа без разделителя, и модель
+            // будет достраивать чужую мысль (И2 нарушена до конца
+            // диалога). Блокировку берём здесь: вызывающие (23.9, 23.13)
+            // держат только свои мьютексы, g_llama_rw_mutex свободен.
+            std::shared_lock<std::shared_mutex> rlock(g_llama_rw_mutex);
+            llama_context* active = g_ctx_llama_atomic.load();
+            if (active) close_assistant_turn(active);
         }
         g_pending_continue_request.store(false);
         {
@@ -5548,6 +5594,13 @@ int run(int argc, char** argv) {
         // тишине после barge-in. Восстанавливаем сохранённый снимок
         // embd_inp/n_past — но ТОЛЬКО если он синхронизирован (см. 23.16.1).
         if (g_pending_continue_request.load()) {
+            // WHY: если реплика пользователя уже ждёт в pending_llm,
+            // продолжение отменяем в пользу новой речи. E3 в 23.14
+            // закроет прерванный turn, реплика пойдёт обычным ходом.
+            if (g_pending_llm_request.load()) {
+                g_pending_continue_request.store(false);
+                continue;
+            }
             bool can_continue = false;
             {
                 std::lock_guard<std::mutex> lock(g_saved_generation_mutex);
@@ -5600,12 +5653,27 @@ int run(int argc, char** argv) {
                 }
                 trim(buffer);
                 if (!buffer.empty()) {
+                    // Голосовая реплика, ожидающая отправки, не теряется:
+                    // возвращаем её в аккумулятор — аудио-поток отправит её
+                    // следующим ходом (после клавиатурной).
+                    std::string pending_voice;
+                    {
+                        std::lock_guard<std::mutex> pl(g_pending_llm_mutex);
+                        if (g_pending_llm_request.load() &&
+                            !g_pending_llm_text.empty()) {
+                            pending_voice = g_pending_llm_text;
+                            g_pending_llm_request.store(false);
+                            g_pending_llm_text.clear();
+                        }
+                    }
+                    if (!pending_voice.empty()) {
+                        std::lock_guard<std::mutex> ta(g_text_accumulator_mutex);
+                        if (!g_accumulated_text.empty()) g_accumulated_text += " ";
+                        g_accumulated_text += pending_voice;
+                    }
                     user_typed = buffer;
                     user_typed_this = true;
                     user_input_from_keyboard = true;
-                    std::lock_guard<std::mutex> pl(g_pending_llm_mutex);
-                    g_pending_llm_request.store(false);
-                    g_pending_llm_text.clear();
                 }
             }
         }
@@ -6046,7 +6114,8 @@ int run(int argc, char** argv) {
         // Исключение: regenerate проваливается в 23.14 (генерация).
         // Все команды, меняющие состояние хода, вызывают
         // clear_pending_and_snapshot() — единая точка сброса (И4).
-        // google/repeat вызывают только clear_snapshot_only() (D1, D2).
+        // google — только clear_snapshot_only() (D1);
+        // repeat — не сбрасывает ничего (D2).
         // C4: перед enqueue_tts команды очищают g_last_tts_text, чтобы
         //     «повтори» не озвучил предыдущий ответ.
         //
@@ -6275,30 +6344,53 @@ int run(int argc, char** argv) {
             last_command_time = std::chrono::steady_clock::now();
 
             bool rollback_success = false;
-            if (!past_prev_arr.empty()) {
+            // П2: откат имеет смысл ТОЛЬКО при живом text_heard_prev.
+            // Все ветки 23.16.5 (K-shift, iSWA-truncate, оба fallback)
+            // очищают text_heard_prev и сдвигают/клампят past_prev_arr,
+            // из-за чего граница перестаёт соответствовать началу хода.
+            // Откат по такой границе: (1) молча удаляет из KV последний
+            // обмен, хотя восстановить реплику нечем; (2) при клампе
+            // границы в удалённый кусок оставляет контекст без
+            // <|eot_id|> — И2; (3) оставляет g_regen_pending=true, и
+            // первый токен СЛЕДУЮЩЕГО хода сэмплируется из smpl_regen
+            // (temp+0.5). Пустой text_heard_prev — точный признак
+            // «граница невалидна»: 23.14 кладёт туда только непустые
+            // реплики, очищает — только 23.16.5. При непустом тексте
+            // граница гарантированно настоящая (закрыта eot).
+            // past_prev_arr при отказе НЕ трогаем — граница ещё нужна
+            // команде delete, которая корректна и по сдвинутой границе
+            // (она закрывает turn через D3).
+            if (!past_prev_arr.empty() && !text_heard_prev.empty()) {
                 n_past_prev = past_prev_arr.back();
                 past_prev_arr.pop_back();
                 int rollback_num = static_cast<int>(embd_inp.size()) - n_past_prev;
                 if (rollback_num > 0 && rollback_num <= static_cast<int>(embd_inp.size())) {
-                    embd_inp.erase(embd_inp.end() - rollback_num, embd_inp.end());
-                    n_past = static_cast<int>(embd_inp.size());
-                    n_session_consumed = n_past;
-                    if (!path_session.empty()) {
-                        if (session_tokens.size() > embd_inp.size())
-                            session_tokens.resize(embd_inp.size());
-                    }
+                    // Сначала seq_rm по ЦЕЛЕВОЙ позиции, потом усечение
+                    // embd_inp — тот же порядок, что в антипромптах/seqrep
+                    // (И1). Для Saiga seq_rm всегда успешен, но шаблон
+                    // выровнен под любые модели (iSWA).
+                    bool rm_ok = false;
                     {
                         std::shared_lock<std::shared_mutex> rlock(g_llama_rw_mutex);
                         llama_context* active = g_ctx_llama_atomic.load();
                         if (active) {
-                            llama_memory_seq_rm(llama_get_memory(active), 0,
-                                static_cast<int>(embd_inp.size()), -1);
+                            rm_ok = llama_memory_seq_rm(llama_get_memory(active), 0,
+                                static_cast<int>(embd_inp.size()) - rollback_num, -1);
                         }
                     }
-                    text_heard = text_heard_prev;
-                    trim(text_heard);
-                    rollback_success = true;
-                    g_regen_pending.store(true);
+                    if (rm_ok) {
+                        embd_inp.erase(embd_inp.end() - rollback_num, embd_inp.end());
+                        n_past = static_cast<int>(embd_inp.size());
+                        n_session_consumed = n_past;
+                        if (!path_session.empty()) {
+                            if (session_tokens.size() > embd_inp.size())
+                                session_tokens.resize(embd_inp.size());
+                        }
+                        text_heard = text_heard_prev;
+                        trim(text_heard);
+                        rollback_success = true;
+                        g_regen_pending.store(true);
+                    }
                 }
             }
 
@@ -6373,22 +6465,34 @@ int run(int argc, char** argv) {
                 past_prev_arr.pop_back();
                 int rollback_num = static_cast<int>(embd_inp.size()) - n_past_prev;
                 if (rollback_num > 0 && rollback_num <= static_cast<int>(embd_inp.size())) {
-                    embd_inp.erase(embd_inp.end() - rollback_num, embd_inp.end());
-                    n_past = static_cast<int>(embd_inp.size());
-                    n_session_consumed = n_past;
-                    if (!path_session.empty()) {
-                        if (session_tokens.size() > embd_inp.size())
-                            session_tokens.resize(embd_inp.size());
-                    }
+                    // Сначала seq_rm по ЦЕЛЕВОЙ позиции (И1), потом усечение
+                    // embd_inp. close_assistant_turn — только после усечения:
+                    // он декодирует <|eot_id|> на позиции n_past.
+                    bool rm_ok = false;
                     {
                         std::shared_lock<std::shared_mutex> rlock(g_llama_rw_mutex);
                         llama_context* active = g_ctx_llama_atomic.load();
                         if (active) {
-                            llama_memory_seq_rm(llama_get_memory(active), 0,
-                                static_cast<int>(embd_inp.size()), -1);
-                            // D3: закрываем assistant turn, чтобы модель
-                            // не продолжила с середины удалённого ответа.
-                            close_assistant_turn(active);
+                            rm_ok = llama_memory_seq_rm(llama_get_memory(active), 0,
+                                static_cast<int>(embd_inp.size()) - rollback_num, -1);
+                        }
+                    }
+                    if (rm_ok) {
+                        embd_inp.erase(embd_inp.end() - rollback_num, embd_inp.end());
+                        n_past = static_cast<int>(embd_inp.size());
+                        n_session_consumed = n_past;
+                        if (!path_session.empty()) {
+                            if (session_tokens.size() > embd_inp.size())
+                                session_tokens.resize(embd_inp.size());
+                        }
+                        {
+                            std::shared_lock<std::shared_mutex> rlock(g_llama_rw_mutex);
+                            llama_context* active = g_ctx_llama_atomic.load();
+                            if (active) {
+                                // D3: закрываем assistant turn, чтобы модель
+                                // не продолжила с середины удалённого ответа.
+                                close_assistant_turn(active);
+                            }
                         }
                     }
                     last_command_time = std::chrono::steady_clock::now();
@@ -6800,6 +6904,11 @@ int run(int argc, char** argv) {
         std::string last_output_buffer;
         std::string last_output_needle;
         std::string token_accumulator;
+        // WHY: накопитель ВИДИМОГО потока (после think-фильтра). В отличие
+        // от text_to_speak, он не сбрасывается флашем 23.16.8.8 — антипромпты
+        // ("Адам: ", имя бота, stop_words) проверяются по хвосту за весь ход,
+        // а не по одному токену. Окно — ANTIPROMPT_WINDOW (см. 23.16.8.7).
+        std::string antiprompt_accumulator;
 
         g_interrupt_processed.store(false);
 
@@ -6932,8 +7041,8 @@ int run(int argc, char** argv) {
             // усекается по длине. Иначе при удалении середины файл сессии
             // станет corrupt.
             //
-            // E5: n_discard_local ограничен так, чтобы не удалить последний
-            //     токен embd_inp (<|eot_id|> предыдущего хода).
+            // E5: n_discard_local ограничен запасом в 1 токен, чтобы удаление
+            //     середины не заехало в самый конец записи embd_inp.
             // E4: после iSWA-truncate вызываем close_assistant_turn, чтобы
             //     <|eot_id|> восстановился в KV (иначе модель продолжит
             //     за себя). close_assistant_turn не берёт лок — unique_lock
@@ -7028,7 +7137,8 @@ int run(int argc, char** argv) {
                         n_discard_local = std::max(0, n_past - n_keep - 1);
                     }
 
-                    // E5: не удалять последний токен embd_inp (<|eot_id|>).
+                    // E5: запас в 1 токен с конца — защита от заезда
+                    // удаления в конец записи.
                     {
                         int max_discard = std::max(0,
                             static_cast<int>(embd_inp.size()) - 1 - n_keep);
@@ -7216,9 +7326,11 @@ int run(int argc, char** argv) {
                 continue;
             }
 
-            if (decode_skipped) {
-                empty_iterations = 0;
-            } else {
+            // WHY: empty_iterations сбрасывает только УСПЕШНЫЙ decode.
+            // Сразу после decode_failed embd очищен и следующая итерация
+            // проходит через decode_skipped: стоявший здесь сброс обнулял
+            // счётчик сразу после сбоя, и MAX_EMPTY_ITERATIONS не срабатывало.
+            if (!decode_skipped) {
                 empty_iterations = 0;
                 embd_inp.insert(embd_inp.end(), embd.begin(), embd.end());
                 n_past = static_cast<int>(embd_inp.size());
@@ -7483,12 +7595,11 @@ int run(int argc, char** argv) {
                     // WHY: Фильтрация reasoning-тегов и ИМЕНИ БОТА из консольного вывода.
                     //      Даже если --stop-words сработал, модель могла успеть
                     //      выдать закрывающий тег или свое имя в буфер.
-                    
-                    // >>> ПАТЧ: Принудительное удаление имени бота из начала ответа <<<
-                    // Если модель сгенерировала "Эмма: " в начале, мы это режем.
-                    // Проверяем только если накоплено мало текста (начало фразы).
+                    // Дубль "Эмма: " в начале ответа режем: база сравнения —
+                    // antiprompt_accumulator (23.16.8.7), окно — первые токены.
                     if (tokens_in_reply < 4 && !visible_token.empty()) {
-                        std::string check_buf = text_to_speak + visible_token;
+                        std::string check_buf =
+                            antiprompt_accumulator + visible_token;
                         
                         // Варианты префиксов, которые нужно вырезать
                         std::vector<std::string> bad_prefixes = {
@@ -7514,13 +7625,19 @@ int run(int argc, char** argv) {
                                 }
                                 
                                 if (valid_boundary) {
-                                    // Вычисляем, сколько байт префикса уже в text_to_speak
-                                    size_t prefix_in_text = std::min(text_to_speak.size(), prefix.size());
-                                    
-                                    // Находим последнюю валидную границу UTF-8 в text_to_speak
+                                       // Вычисляем, сколько байт префикса уже
+                                    // накоплено (antiprompt_accumulator
+                                    // зеркалит видимый поток).
+                                    size_t prefix_in_text = std::min(
+                                        antiprompt_accumulator.size(),
+                                        prefix.size());
+
+                                    // Последняя валидная граница UTF-8
+                                    // в накопителе.
                                     size_t utf8_boundary = 0;
                                     while (utf8_boundary < prefix_in_text) {
-                                        unsigned char c = static_cast<unsigned char>(text_to_speak[utf8_boundary]);
+                                        unsigned char c = static_cast<unsigned char>(
+                                            antiprompt_accumulator[utf8_boundary]);
                                         size_t char_len = 1;
                                         if ((c & 0xE0) == 0xC0) char_len = 2;
                                         else if ((c & 0xF0) == 0xE0) char_len = 3;
@@ -7529,13 +7646,19 @@ int run(int argc, char** argv) {
                                         utf8_boundary += char_len;
                                     }
                                     prefix_in_text = utf8_boundary;
-                                    
-                                    // Проверяем, что text_to_speak действительно начинается с части префикса
-                                    if (prefix_in_text == 0 || 
-                                        text_to_speak.compare(0, prefix_in_text, prefix, 0, prefix_in_text) == 0) {
-                                        // Вырезаем префикс из text_to_speak
+
+                                    // Накопитель должен начинаться с части префикса
+                                    if (prefix_in_text == 0 ||
+                                        antiprompt_accumulator.compare(
+                                            0, prefix_in_text, prefix,
+                                            0, prefix_in_text) == 0) {
+                                        // Вырезаем префикс из накопителя —
+                                        // чтобы 23.16.8.7 не принял его за
+                                        // антипромпт и не остановил ответ.
                                         if (prefix_in_text > 0) {
-                                            text_to_speak = text_to_speak.substr(prefix_in_text);
+                                            antiprompt_accumulator =
+                                                antiprompt_accumulator.substr(
+                                                    prefix_in_text);
                                         }
                                         
                                         // Вычисляем, сколько байт нужно убрать из visible_token
@@ -7560,8 +7683,9 @@ int run(int argc, char** argv) {
                                         
                                         if (g_verbose_mode.load()) {
                                             fprintf(stderr, "[BotPrefix] Удалён дубль '%s' "
-                                                    "(text_to_speak=%zu, visible=%zu)\n",
-                                                    prefix.c_str(), text_to_speak.size(), 
+                                                    "(accum=%zu, visible=%zu)\n",
+                                                    prefix.c_str(),
+                                                    antiprompt_accumulator.size(),
                                                     visible_token.size());
                                         }
                                     }
@@ -7625,8 +7749,7 @@ int run(int argc, char** argv) {
                     if (!visible_token.empty()) {
                         std::lock_guard<std::recursive_mutex> lock(g_console_mutex);
                         if (!bot_prefix_printed) {
-                            std::string padded = make_padded_name(current_bot_name);
-                            printf("%s%s%s: ", C_BOT, padded.c_str(), C_RESET);
+                            print_bot_prefix(current_bot_name);
                             bot_prefix_printed = true;
                         }
                         printf("%s", visible_token.c_str());
@@ -7636,6 +7759,12 @@ int run(int argc, char** argv) {
 
                     text_to_speak += visible_token;
                     full_response_text += visible_token;
+                    antiprompt_accumulator += visible_token;
+                    if (antiprompt_accumulator.size() > ANTIPROMPT_WINDOW) {
+                        antiprompt_accumulator =
+                            antiprompt_accumulator.substr(
+                                antiprompt_accumulator.size() - ANTIPROMPT_WINDOW);
+                    }
 
                     // --- 23.16.8.7. Проверка антипромптов ---
                     // G1: ANTIPROMPT_WINDOW (1024) вместо 256.
@@ -7649,7 +7778,14 @@ int run(int argc, char** argv) {
                     {
                         bool antiprompt_hit = false;
                         std::string antiprompt_matched = "";
-                        std::string last_output_buffer_ap = text_to_speak;
+                        // Окно проверки — ПОЛНЫЙ видимый текст хода. К этому
+                        // месту text_to_speak содержит ТОЛЬКО текущий токен:
+                        // 23.16.8.8 в конце КАЖДОЙ итерации переливает его в
+                        // tts_smart_buffer и очищает. Мульти-токенные
+                        // антипромпты («Адам: », «Эмма: », стоп-слова) в окне
+                        // из одного токена не ловились никогда, и откат KV
+                        // (ПАТЧ 2 ниже) не срабатывал.
+                        std::string last_output_buffer_ap = antiprompt_accumulator;
                         if (last_output_buffer_ap.size() > ANTIPROMPT_WINDOW) {
                             last_output_buffer_ap = last_output_buffer_ap.substr(
                                 last_output_buffer_ap.size() - ANTIPROMPT_WINDOW);
@@ -7665,24 +7801,43 @@ int run(int argc, char** argv) {
                                 }
                             }
                         }
-                        if (antiprompt_hit) {
+                         if (antiprompt_hit) {
+                            // Именные антипромпты режем сразу, без
+                            // min_tokens-эскалации: эскалация на начале
+                            // реплики обычно выдаёт ещё один дубль имени.
+                            bool is_name_antiprompt =
+                                (antiprompt_matched == params.person + chat_symb) ||
+                                (antiprompt_matched == current_bot_name + chat_symb);
                             if (params.min_tokens > 0 &&
-                                tokens_in_reply < params.min_tokens) {
+                                tokens_in_reply < params.min_tokens &&
+                                !is_name_antiprompt) {
                                 temp_next = params.temp + 0.3f;
                             } else {
+                                // Антипромпт лежит ЧАСТЬЮ в tts_smart_buffer
+                                // (ранее накопленные токены) и ЧАСТЬЮ в
+                                // text_to_speak (текущий токен). Режем по
+                                // ПОСЛЕДНЕМУ вхождению в объединении — ровно
+                                // там, где сработала проверка хвоста.
+                                std::string combined =
+                                    tts_smart_buffer + text_to_speak;
                                 size_t pos_in_speak =
-                                    text_to_speak.find(antiprompt_matched);
+                                    combined.rfind(antiprompt_matched);
                                 if (pos_in_speak != std::string::npos) {
-                                    text_to_speak =
-                                        text_to_speak.substr(0, pos_in_speak);
-                                    trim_spaces_only(text_to_speak);
+                                    combined = combined.substr(0, pos_in_speak);
+                                    trim_spaces_only(combined);
+                                    tts_smart_buffer = combined;
+                                    text_to_speak.clear();
                                 }
                                 // --- ПАТЧ 2: откат KV и embd_inp ---
                                 // Токенизируем антипромпт тем же способом,
                                 // каким он попал в embd_inp (parse_special=false,
                                 // add_bos=false). Получаем ровно те токены,
                                 // которые надо удалить с конца embd_inp.
-                                std::shared_lock<std::shared_mutex> rlock_ap(g_llama_rw_mutex);
+                                // WHY: отдельный shared_lock НЕ берём — блок
+                                // 23.16.8 уже держит rlock с 23.16.8.x. Повторный
+                                // lock_shared на том же std::shared_mutex из того
+                                // же потока — UB по стандарту (на MSVC случайно
+                                // работает через SRWLOCK, но полагаться нельзя).
                                 llama_context* active_ap = g_ctx_llama_atomic.load();
                                 if (active_ap) {
                                     std::vector<llama_token> ap_tokens =
@@ -7728,7 +7883,7 @@ int run(int argc, char** argv) {
                                         if (suffix_matches) {
                                             // WHY: сначала пробуем seq_rm с целевой
                                             // позицией, и только при успехе меняем
-                                            // embd_inp. Иначе при失败е seq_rm
+                                            // embd_inp. Иначе при неудаче seq_rm
                                             // embd_inp уже усечён, а KV — нет (И1).
                                             int new_n_past =
                                                 static_cast<int>(embd_inp.size()) - rollback;
@@ -7830,8 +7985,15 @@ int run(int argc, char** argv) {
                         if (!to_send.empty() &&
                             g_interrupt_reason.load() == InterruptReason::NONE) {
                             wait_for_tts_idle();
-                            enqueue_tts(make_tts_req(to_send));
-                            update_console_title(current_bot_name, "Speaking...");
+                            // wait_for_tts_idle спит до sleep_before_xtts мс;
+                            // за это время мог прийти barge-in. Без повторной
+                            // проверки чанк ставился в очередь УЖЕ ПОСЛЕ
+                            // начала прерывания — а на последнем токене хода
+                            // он вообще миновал 23.16.1 (закрывается в 23.17).
+                            if (g_interrupt_reason.load() == InterruptReason::NONE) {
+                                enqueue_tts(make_tts_req(to_send));
+                                update_console_title(current_bot_name, "Speaking...");
+                            }
                         }
                         return true;
                     };
@@ -7918,18 +8080,25 @@ int run(int argc, char** argv) {
                                 cut_pos = ei;
                             }
                         }
+
                         if (cut_pos != std::string::npos && cut_pos > 150) {
                             std::string to_send_part =
                                 tts_smart_buffer.substr(0, cut_pos + 1);
                             if (enqueue_tts_chunk(to_send_part)) {
                                 tts_smart_buffer = tts_smart_buffer.substr(cut_pos + 1);
+                                
+                                // WHY: Синхронизируем буферы seqrep с остатком текста.
+                                // Если мы отправили часть текста в TTS, то для детектора повторов
+                                // эта часть "исчезла" из текущего контекста генерации.
+                                // Мы не можем точно знать, сколько токенов ушло, поэтому
+                                // безопасно обнулить needle, чтобы не ловить ложные повторы
+                                // на стыке чанков.
+                                last_output_needle.clear();
                             }
-                            // F2: при разрезе длинного буфера seqrep/loop
-                            // detection не применяются к разрезанному токену —
-                            // токен уходит в TTS, защита от повторов
-                            // проверяется на следующей итерации. Осознанный
-                            // компромисс: разрез длинного буфера важнее
-                            // проверки одного токена.
+                            // F2: при разрезе длинного буфера seqrep/loop detection не применяются 
+                            // к разрезанному токену — токен уходит в TTS, защита от повторов
+                            // проверяется на следующей итерации. Осознанный компромисс: разрез 
+                            // длинного буфера важнее проверки одного токена.
                             continue;
                         }
                     }
@@ -7973,26 +8142,70 @@ int run(int argc, char** argv) {
                                     llama_tokenize_ex(active_ctx,
                                         last_output_needle, false, false);
                                 int rollback_num = static_cast<int>(tokens_to_del.size());
-                                if (rollback_num > 0 &&
-                                    rollback_num <= static_cast<int>(embd_inp.size())) {
-                                    embd_inp.erase(embd_inp.end() - rollback_num,
-                                                   embd_inp.end());
-                                    n_past = static_cast<int>(embd_inp.size());
-                                    n_session_consumed = n_past;
-                                    llama_memory_seq_rm(
-                                        llama_get_memory(active_ctx), 0,
-                                        static_cast<int>(embd_inp.size()), -1);
-                                    if (symbols_to_delete <= utf8_length(text_to_speak)) {
-                                        text_to_speak = utf8_substr(text_to_speak, 0,
-                                            utf8_length(text_to_speak) - symbols_to_delete);
-                                    } else {
-                                        text_to_speak = "";
+                                // WHY (зеркало отката в антипромптах, 23.16.8.7):
+                                // сверяем ретокенизацию needle с фактическим хвостом
+                                // embd_inp. Повтор мог быть собран из других токенов,
+                                // тогда откат разъедет embd_inp и KV (И1). Не совпало
+                                // — откат пропускаем, остаётся temp-подстройка.
+                                bool suffix_matches =
+                                    rollback_num > 0 &&
+                                    rollback_num <= static_cast<int>(embd_inp.size());
+                                if (suffix_matches) {
+                                    size_t off = embd_inp.size() -
+                                                 static_cast<size_t>(rollback_num);
+                                    for (int k = 0; k < rollback_num; ++k) {
+                                        if (embd_inp[off + k] != tokens_to_del[k]) {
+                                            suffix_matches = false;
+                                            break;
+                                        }
                                     }
-                                    last_output_needle = utf8_substr(last_output_needle, 0,
-                                        utf8_length(last_output_needle) - symbols_to_delete);
-                                    last_output_buffer = utf8_substr(last_output_buffer, 0,
-                                        utf8_length(last_output_buffer) - symbols_to_delete);
-                                    temp_next = params.temp + 0.3f;
+                                }
+                                if (suffix_matches) {
+                                    // Сначала seq_rm, потом усечение
+                                    // embd_inp. Если seq_rm не удался — не
+                                    // трогаем ни KV, ни embd_inp (И1).
+                                    int new_n_past =
+                                        static_cast<int>(embd_inp.size()) -
+                                        rollback_num;
+                                    bool rm_ok = llama_memory_seq_rm(
+                                        llama_get_memory(active_ctx), 0,
+                                        new_n_past, -1);
+                                    if (rm_ok) {
+                                        embd_inp.erase(embd_inp.end() - rollback_num,
+                                                       embd_inp.end());
+                                        n_past = new_n_past;
+                                        n_session_consumed = n_past;
+                                        if (session_tokens.size() >
+                                            embd_inp.size()) {
+                                            session_tokens.resize(embd_inp.size());
+                                        }
+                                        // text_to_speak здесь УЖЕ ПУСТ
+                                        // (перелит в tts_smart_buffer в
+                                        // 23.16.8.8). Чистим хвост повтора
+                                        // из tts_smart_buffer, иначе
+                                        // задвоенный текст уйдёт в XTTS.
+                                        std::string combined =
+                                            tts_smart_buffer + text_to_speak;
+                                        int have = utf8_length(combined);
+                                        if (symbols_to_delete <= have) {
+                                            combined = utf8_substr(combined, 0,
+                                                have - symbols_to_delete);
+                                        } else {
+                                            combined.clear();
+                                        }
+                                        trim_spaces_only(combined);
+                                        tts_smart_buffer = combined;
+                                        text_to_speak.clear();
+                                        last_output_needle = utf8_substr(
+                                            last_output_needle, 0,
+                                            utf8_length(last_output_needle) -
+                                                symbols_to_delete);
+                                        last_output_buffer = utf8_substr(
+                                            last_output_buffer, 0,
+                                            utf8_length(last_output_buffer) -
+                                                symbols_to_delete);
+                                        temp_next = params.temp + 0.3f;
+                                    }
                                 }
                             }
                         }
@@ -8004,28 +8217,30 @@ int run(int argc, char** argv) {
                     }
 
                     // --- 23.16.8.10. Loop detection ---
+                    // WHY: Используем antiprompt_accumulator (который зеркалит visible_token),
+                    // а не token_accumulator (сырые токены). Сырые токены содержат байтовые
+                    // артефакты и служебные символы, которые искажают картину повторов.
+                    // Видимый текст — это то, что реально видит пользователь и что пойдет в TTS.
                     loop_check_counter++;
                     bool run_loop_check =
                         (loop_check_counter % LOOP_CHECK_INTERVAL == 0);
-
                     if (run_loop_check) {
                         std::vector<std::string> recent_chars =
-                            utf8_split_chars(token_accumulator);
+                            utf8_split_chars(antiprompt_accumulator);
+                        
                         const size_t RECENT_N = recent_chars.size();
                         if (RECENT_N > 128) {
                             recent_chars.erase(recent_chars.begin(),
-                                               recent_chars.begin() + (RECENT_N - 128));
+                                            recent_chars.begin() + (RECENT_N - 128));
                         }
                         const size_t N = recent_chars.size();
-
                         bool pattern_found = false;
                         std::string pattern_str;
                         size_t pattern_count = 0;
-
                         const size_t max_len = std::min<size_t>(12, N / 3);
                         for (size_t len = 6; len <= max_len; ++len) {
                             for (size_t start = 0;
-                                 start + len * 3 <= N && start <= N / 2; ++start) {
+                                start + len * 3 <= N && start <= N / 2; ++start) {
                                 size_t count = 0;
                                 size_t pos = start;
                                 while (pos + len <= N) {
@@ -8050,7 +8265,6 @@ int run(int argc, char** argv) {
                             }
                             if (pattern_found) break;
                         }
-
                         if (pattern_found) {
                             loop_detection_counter++;
                             tokens_since_last_loop = 0;
@@ -8198,6 +8412,11 @@ int run(int argc, char** argv) {
         }
 
         if (was_interrupted_final) {
+            // Прерывание могло прийти ПОСЛЕ последнего прохода 23.16.1
+            // (между выходом из цикла и этой строкой) — очередь ещё не
+            // почищена. Без этой строки бот доигрывал поставленные чанки
+            // поверх речи пользователя.
+            clear_tts_queue();
             g_cancel_tts_requests.store(false);
             if (!g_tts_muted.load()) {
                 std::string dummy2;
@@ -8229,6 +8448,8 @@ int run(int argc, char** argv) {
                    "Input %.3f s + output %.3f s = total: %.3f s]\n",
                 n_past, n_ctx, input_tokens_count, new_tokens,
                 llama_time_input, llama_time_output, llama_time_total);
+            printf("[Whisper: %d транскрипций за сессию]\n",
+                g_transcription_count.load());
             double input_speed = (llama_time_input > 0.001) ?
                 static_cast<double>(input_tokens_count) / llama_time_input : 0.0;
             double output_speed = (llama_time_output > 0.001) ?
@@ -8368,6 +8589,13 @@ int run(int argc, char** argv) {
 
 #if _WIN32
 int wmain(int argc, const wchar_t** argv_UTF16LE) {
+    // WHY: TALK_LLAMA_VERBOSE=1 включает verbose без аргументов — как в
+    // main() на POSIX. Без этого обещание из секции 25 не работало
+    // на Windows. stdlib.h приходит через common-sdl.h (SDL_stdinc.h).
+    const char* verbose_env = getenv("TALK_LLAMA_VERBOSE");
+    if (verbose_env && (std::string(verbose_env) == "1" ||
+                        std::string(verbose_env) == "true"))
+        g_verbose_mode.store(true);
     console::init(true, true);
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
         std::cerr << "Failed to initialize libcurl" << std::endl;

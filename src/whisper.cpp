@@ -3520,7 +3520,7 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
             return nullptr;
         }
         const size_t memory_size = aheads_masks_nbytes(state->aheads_masks);
-        WHISPER_LOG_INFO("%s: alignment heads masks size = %ld B\n", __func__, memory_size);
+        WHISPER_LOG_INFO("%s: alignment heads masks size = %zu B\n", __func__, memory_size);
     }
 
 #ifdef WHISPER_USE_COREML
@@ -9362,6 +9362,9 @@ const char * whisper_version(void) {
 }
 
 GGML_ATTRIBUTE_FORMAT(2, 3)
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((visibility("hidden")))
+#endif
 void whisper_log_internal(ggml_log_level level, const char * format, ...) {
     va_list args;
     va_start(args, format);
